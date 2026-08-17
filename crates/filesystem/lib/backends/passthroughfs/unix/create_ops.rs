@@ -64,6 +64,10 @@ pub(crate) fn do_create(
         return Err(platform::eacces());
     }
 
+    if fs.deny_matches_name(parent, name.to_bytes()) {
+        return Err(platform::eacces());
+    }
+
     // Snapshot the quota baseline before creating the file, so the new file's
     // bytes are charged as guest growth rather than absorbed into the baseline.
     fs.quota_ensure_baseline();
@@ -173,6 +177,10 @@ pub(crate) fn do_mkdir(
         return Err(platform::eacces());
     }
 
+    if fs.deny_matches_name(parent, name.to_bytes()) {
+        return Err(platform::eacces());
+    }
+
     let parent_fd = inode::get_inode_fd(fs, parent)?;
     let dir_mode = mode & !umask & 0o7777;
 
@@ -231,6 +239,10 @@ pub(crate) fn do_mknod(
     }
 
     if fs.is_reserved_init_name(parent, name.to_bytes()) {
+        return Err(platform::eacces());
+    }
+
+    if fs.deny_matches_name(parent, name.to_bytes()) {
         return Err(platform::eacces());
     }
 
@@ -324,6 +336,10 @@ pub(crate) fn do_symlink(
     }
 
     if fs.is_reserved_init_name(parent, name.to_bytes()) {
+        return Err(platform::eacces());
+    }
+
+    if fs.deny_matches_name(parent, name.to_bytes()) {
         return Err(platform::eacces());
     }
 
@@ -439,6 +455,10 @@ pub(crate) fn do_link(
     }
 
     if fs.is_reserved_init_name(newparent, newname.to_bytes()) {
+        return Err(platform::eacces());
+    }
+
+    if fs.deny_matches_name(newparent, newname.to_bytes()) {
         return Err(platform::eacces());
     }
 

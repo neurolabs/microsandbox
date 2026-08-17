@@ -62,7 +62,7 @@ pub(crate) fn do_readdir(
         #[allow(clippy::readonly_write_lock)]
         let file = data.file.write().unwrap();
         let inject_init = fs.injects_init() && inode == 1;
-        *snapshot_lock = Some(build_snapshot(file.as_raw_fd(), inject_init)?);
+        *snapshot_lock = Some(build_snapshot(fs, inode, file.as_raw_fd(), inject_init)?);
     }
 
     let snapshot = snapshot_lock.as_ref().unwrap();
@@ -90,7 +90,7 @@ pub(crate) fn do_readdir_for_each(
         #[allow(clippy::readonly_write_lock)]
         let file = data.file.write().unwrap();
         let inject_init = fs.injects_init() && inode == 1;
-        *snapshot_lock = Some(build_snapshot(file.as_raw_fd(), inject_init)?);
+        *snapshot_lock = Some(build_snapshot(fs, inode, file.as_raw_fd(), inject_init)?);
     }
 
     let snapshot = snapshot_lock.as_ref().unwrap();
@@ -158,7 +158,7 @@ pub(crate) fn do_readdirplus_for_each(
         #[allow(clippy::readonly_write_lock)]
         let file = data.file.write().unwrap();
         let inject_init = fs.injects_init() && inode == 1;
-        *snapshot_lock = Some(build_snapshot(file.as_raw_fd(), inject_init)?);
+        *snapshot_lock = Some(build_snapshot(fs, inode, file.as_raw_fd(), inject_init)?);
     }
 
     let snapshot = snapshot_lock.as_ref().unwrap();
@@ -291,8 +291,16 @@ fn no_lookup_entry() -> Entry {
 }
 
 /// Build a point-in-time directory snapshot with stable synthetic offsets.
-fn build_snapshot(fd: i32, inject_init: bool) -> io::Result<DirSnapshot> {
+fn build_snapshot(
+    fs: &PassthroughFs,
+    parent: u64,
+    fd: i32,
+    inject_init: bool,
+) -> io::Result<DirSnapshot> {
     let mut entries = read_dir_entries(fd)?;
+
+    // Filter out entries matching the deny list.
+    entries.retain(|entry| !fs.deny_matches_name(parent, &entry.name));
 
     if inject_init
         && !entries

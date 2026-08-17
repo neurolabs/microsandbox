@@ -34,6 +34,7 @@ use crate::{
     AddDirEntry, AddDirEntryPlus, Context, DirEntry, DynFileSystem, Entry, Extensions, FsOptions,
     GetxattrReply, ListxattrReply, OpenOptions, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
     backends::shared::{
+        deny::{self, DenyList},
         handle_table::HandleData,
         init_binary,
         inode_table::{InodeAltKey, InodeData, MultikeyBTreeMap},
@@ -171,6 +172,11 @@ pub struct PassthroughConfig {
     /// `None` means unbounded. When set, guest-attributable growth past this
     /// many bytes is rejected with `ENOSPC`.
     pub quota_bytes: Option<u64>,
+
+    /// Gitignore-style patterns whose matching paths are hidden from the guest.
+    ///
+    /// Empty means no paths are denied.
+    pub deny: Vec<String>,
 }
 
 /// Passthrough filesystem backend.
@@ -218,6 +224,9 @@ pub struct PassthroughFs {
 
     /// Optional guest-write byte budget for this mount's subtree.
     pub(crate) quota: Option<super::quota::DirQuota>,
+
+    /// Matcher for the deny list (empty = allow everything).
+    pub(crate) deny: DenyList,
 }
 
 /// Open directory handle with a lazy point-in-time snapshot.
@@ -300,6 +309,8 @@ impl PassthroughFs {
             .quota_bytes
             .map(|limit| super::quota::DirQuota::new(cfg.root_dir.clone(), limit));
 
+        let deny_patterns = cfg.deny.clone();
+
         Ok(Self {
             cfg,
             root_fd,
@@ -315,6 +326,7 @@ impl PassthroughFs {
             #[cfg(target_os = "linux")]
             proc_self_fd,
             quota,
+            deny: DenyList::new(&deny_patterns),
         })
     }
 }
@@ -399,6 +411,32 @@ impl PassthroughFs {
             CachePolicy::Always => OpenOptions::CACHE_DIR,
         }
     }
+}
+
+impl PassthroughFs {
+    /// Whether `name` in `parent` is denied by the deny list.
+    ///
+    /// Fails open (returns `false`) when the parent-inode anchor chain
+    /// cannot be reconstructed so the mount does not break on partial
+    /// lookup races.
+    fn deny_matches_name(&self, parent: u64, name: &[u8]) -> bool {
+        if !self.deny.has_path_patterns() {
+            return self.deny.matches_basename(name);
+        }
+        // Reconstruct the mount-relative path for path-pattern matching.
+        let mut components = Vec::new();
+        if let Some(parent_components) =
+            crate::backends::passthroughfs::unix::inode::parent_path_components(
+                &self.inodes,
+                parent,
+            )
+        {
+            components = parent_components;
+        }
+        components.push(name.to_vec());
+        self.deny
+            .matches_path(&deny::join_path(&components).as_os_str().as_bytes())
+    }
 
     /// Whether this mount exposes the synthetic init binary.
     pub(crate) fn injects_init(&self) -> bool {
@@ -477,6 +515,7 @@ impl Default for PassthroughConfig {
             inject_init: true,
             bind_identity_map: None,
             quota_bytes: None,
+            deny: Vec::new(),
         }
     }
 }

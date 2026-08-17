@@ -43,6 +43,10 @@ pub(crate) fn do_unlink(
         return Err(platform::eacces());
     }
 
+    if fs.deny_matches_name(parent, name.to_bytes()) {
+        return Err(platform::eacces());
+    }
+
     let parent_fd = inode::get_inode_fd(fs, parent)?;
 
     #[cfg(target_os = "linux")]
@@ -156,6 +160,10 @@ pub(crate) fn do_rmdir(
         return Err(platform::eacces());
     }
 
+    if fs.deny_matches_name(parent, name.to_bytes()) {
+        return Err(platform::eacces());
+    }
+
     let parent_fd = inode::get_inode_fd(fs, parent)?;
 
     #[cfg(target_os = "linux")]
@@ -232,6 +240,13 @@ pub(crate) fn do_rename(
     // Protect init.krun from being renamed or overwritten.
     if fs.is_reserved_init_name(olddir, oldname.to_bytes())
         || fs.is_reserved_init_name(newdir, newname.to_bytes())
+    {
+        return Err(platform::eacces());
+    }
+
+    // Deny rename to/from a denied path.
+    if fs.deny_matches_name(olddir, oldname.to_bytes())
+        || fs.deny_matches_name(newdir, newname.to_bytes())
     {
         return Err(platform::eacces());
     }

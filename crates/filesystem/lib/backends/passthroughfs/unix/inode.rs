@@ -220,6 +220,10 @@ pub(crate) fn vol_path(dev: u64, ino: u64) -> std::ffi::CString {
 pub(crate) fn do_lookup(fs: &PassthroughFs, parent: u64, name: &CStr) -> io::Result<Entry> {
     crate::backends::shared::name_validation::validate_name(name)?;
 
+    if fs.deny_matches_name(parent, name.to_bytes()) {
+        return Err(platform::enoent());
+    }
+
     let parent_fd = get_inode_fd(fs, parent)?;
 
     #[cfg(target_os = "linux")]
@@ -1044,4 +1048,77 @@ pub(crate) fn stat_inode(fs: &PassthroughFs, inode: u64) -> io::Result<stat64> {
             fs.cfg.bind_identity_map.as_ref(),
         )
     }
+}
+
+/// Reconstruct the mount-relative path components for an inode by
+/// walking `anchor_parent` + `anchor_name` from the inode up to root.
+///
+/// Uses read locks so it can be called from any context without requiring
+/// write access. Returns `None` when the anchor chain is broken so the
+/// caller can fail-open (allow access) rather than break the mount.
+#[cfg(target_os = "linux")]
+pub(crate) fn parent_path_components(
+    inodes: &std::sync::RwLock<
+        crate::backends::shared::inode_table::MultikeyBTreeMap<
+            u64,
+            crate::backends::shared::inode_table::InodeAltKey,
+            std::sync::Arc<crate::backends::shared::inode_table::InodeData>,
+        >,
+    >,
+    inode: u64,
+) -> Option<Vec<Vec<u8>>> {
+    let inodes_locked = inodes.read().unwrap();
+    _parent_path_components_locked(&inodes_locked, inode, &mut std::collections::HashSet::new())
+}
+
+#[cfg(target_os = "linux")]
+fn _parent_path_components_locked(
+    inodes: &crate::backends::shared::inode_table::MultikeyBTreeMap<
+        u64,
+        crate::backends::shared::inode_table::InodeAltKey,
+        std::sync::Arc<crate::backends::shared::inode_table::InodeData>,
+    >,
+    inode: u64,
+    seen: &mut std::collections::HashSet<u64>,
+) -> Option<Vec<Vec<u8>>> {
+    if inode == 1 {
+        return Some(Vec::new());
+    }
+    if !seen.insert(inode) {
+        return None;
+    }
+
+    let data = inodes.get(&inode)?;
+    let anchor_parent = data
+        .anchor_parent
+        .load(std::sync::atomic::Ordering::Acquire);
+    if anchor_parent == 0 {
+        return None;
+    }
+
+    let mut components = _parent_path_components_locked(inodes, anchor_parent, seen)?;
+    let anchor_name = data.anchor_name.read().unwrap();
+    if !anchor_name.is_empty() {
+        components.push(anchor_name.clone());
+    }
+    Some(components)
+}
+
+/// Reconstruct the mount-relative path components for an inode by walking
+/// `anchor_parent` + `anchor_name` from the inode up to root.
+#[cfg(target_os = "macos")]
+pub(crate) fn parent_path_components(
+    _inodes: &std::sync::RwLock<
+        crate::backends::shared::inode_table::MultikeyBTreeMap<
+            u64,
+            crate::backends::shared::inode_table::InodeAltKey,
+            std::sync::Arc<crate::backends::shared::inode_table::InodeData>,
+        >,
+    >,
+    _inode: u64,
+) -> Option<Vec<Vec<u8>>> {
+    // macOS inodes do not carry anchor data — the chain cannot be reconstructed.
+    // Return an empty list so the caller denies path-pattern matching and falls
+    // back to basename-only matching, which is the safe fail-open default.
+    Some(Vec::new())
 }

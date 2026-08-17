@@ -49,6 +49,7 @@ pub struct PassthroughFsBuilder {
     inject_init: bool,
     bind_identity_map: Option<BindIdentityMapHandle>,
     quota_bytes: Option<u64>,
+    deny: Vec<String>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -71,6 +72,7 @@ impl PassthroughFsBuilder {
             inject_init: true,
             bind_identity_map: None,
             quota_bytes: None,
+            deny: Vec::new(),
         }
     }
 
@@ -151,6 +153,12 @@ impl PassthroughFsBuilder {
         self
     }
 
+    /// Deny-list of gitignore-style patterns to hide from the guest.
+    pub fn deny(mut self, patterns: impl IntoIterator<Item = String>) -> Self {
+        self.deny.extend(patterns);
+        self
+    }
+
     /// Build the PassthroughFs instance.
     pub fn build(self) -> io::Result<PassthroughFs> {
         let root_dir = self
@@ -170,6 +178,7 @@ impl PassthroughFsBuilder {
             inject_init: self.inject_init,
             bind_identity_map: self.bind_identity_map,
             quota_bytes: self.quota_bytes,
+            deny: self.deny.clone(),
         };
 
         // Open the root directory, contained beneath the anchor when one is set.
@@ -210,6 +219,8 @@ impl PassthroughFsBuilder {
             .quota_bytes
             .map(|limit| super::super::quota::DirQuota::new(cfg.root_dir.clone(), limit));
 
+        let deny_list = crate::backends::shared::deny::DenyList::new(&self.deny);
+
         Ok(PassthroughFs {
             cfg,
             root_fd,
@@ -225,6 +236,7 @@ impl PassthroughFsBuilder {
             #[cfg(target_os = "linux")]
             proc_self_fd,
             quota,
+            deny: deny_list,
         })
     }
 }
