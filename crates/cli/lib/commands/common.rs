@@ -551,6 +551,7 @@ struct CliMountOptions {
     host_permissions: Option<microsandbox::sandbox::HostPermissions>,
     size_mib: Option<u32>,
     quota_mib: Option<u32>,
+    deny: Vec<String>,
     named_kind: Option<VolumeKind>,
     fstype: Option<String>,
     format: Option<DiskImageFormat>,
@@ -562,6 +563,7 @@ struct CliMountOptionSupport {
     policies: bool,
     size: bool,
     quota: bool,
+    deny: bool,
     named_kind: bool,
     fstype: bool,
     format: bool,
@@ -1490,6 +1492,7 @@ pub fn apply_explicit_dir_mount(
         CliMountOptionSupport {
             policies: true,
             quota: true,
+            deny: true,
             ..CliMountOptionSupport::default()
         },
     )?;
@@ -1651,6 +1654,9 @@ fn apply_common_mount_options(mut mount: MountBuilder, options: CliMountOptions)
     }
     if let Some(quota) = options.quota_mib {
         mount = mount.quota(quota);
+    }
+    if !options.deny.is_empty() {
+        mount = mount.deny(options.deny);
     }
     mount
 }
@@ -1848,6 +1854,9 @@ fn parse_cli_mount_options(
                         parsed.quota_mib =
                             Some(ui::parse_size_mib(value).map_err(anyhow::Error::msg)?);
                     }
+                    "deny" if support.deny => {
+                        parsed.deny.push(value.to_string());
+                    }
                     "kind" if support.named_kind => {
                         if seen_named_kind {
                             anyhow::bail!("mount option `kind` specified more than once");
@@ -1878,7 +1887,7 @@ fn parse_cli_mount_options(
                             anyhow::anyhow!("invalid disk image format {value:?}: {e}")
                         })?);
                     }
-                    "stat-virt" | "host-perms" | "size" | "quota" | "kind" | "fstype"
+                    "stat-virt" | "host-perms" | "size" | "quota" | "deny" | "kind" | "fstype"
                     | "format" => {
                         anyhow::bail!("mount option `{key}` is not valid here");
                     }
@@ -3666,6 +3675,65 @@ mod tests {
             }
             other => panic!("expected Bind, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_apply_explicit_dir_mount_deny_single() {
+        let dir = make_temp_dir("msb-mount-dir-deny");
+        let spec = format!("{}:/work:deny=.env", dir.display());
+        let mount = build_explicit(&spec, apply_explicit_dir_mount).await;
+        match mount {
+            VolumeMount::Bind { deny, .. } => assert_eq!(deny, vec![".env".to_string()]),
+            other => panic!("expected Bind, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_explicit_dir_mount_deny_repeatable_preserves_inner_equals() {
+        let dir = make_temp_dir("msb-mount-dir-deny-rep");
+        let spec = format!(
+            "{}:/work:deny=.env,deny=*.log,deny=sub/secret=file",
+            dir.display()
+        );
+        let mount = build_explicit(&spec, apply_explicit_dir_mount).await;
+        match mount {
+            VolumeMount::Bind { deny, .. } => {
+                assert_eq!(
+                    deny,
+                    vec![
+                        ".env".to_string(),
+                        "*.log".to_string(),
+                        "sub/secret=file".to_string()
+                    ]
+                );
+            }
+            other => panic!("expected Bind, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_explicit_dir_mount_deny_default_empty() {
+        let dir = make_temp_dir("msb-mount-dir-deny-none");
+        let spec = format!("{}:/work:ro", dir.display());
+        let mount = build_explicit(&spec, apply_explicit_dir_mount).await;
+        match mount {
+            VolumeMount::Bind { deny, .. } => assert!(deny.is_empty()),
+            other => panic!("expected Bind, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_explicit_file_mount_rejects_deny() {
+        let file = write_temp("fixture-deny");
+        let spec = format!("{}:/fixture:deny=.env", file.display());
+        let err = match apply_explicit_file_mount(SandboxBuilder::new("test"), &spec) {
+            Ok(_) => panic!("expected deny to be rejected for --mount-file"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("`deny` is not valid here"),
+            "expected deny rejection, got {err:?}"
+        );
     }
 
     #[tokio::test]
