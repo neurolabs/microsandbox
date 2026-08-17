@@ -102,6 +102,10 @@ impl PassthroughFs {
             return Ok(init_entry(self.cfg.entry_timeout, self.cfg.attr_timeout));
         }
 
+        if self.deny_matches_name(parent, name) {
+            return Err(linux_error(LINUX_ENOENT));
+        }
+
         let path = self.child_path(parent, name)?;
         self.entry_for_path(path)
     }

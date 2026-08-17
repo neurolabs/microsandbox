@@ -17,6 +17,9 @@ impl PassthroughFs {
         umask: u32,
     ) -> io::Result<(Entry, Option<u64>, OpenOptions)> {
         self.require_writable()?;
+        if self.deny_matches_name(parent, name) {
+            return Err(linux_error(LINUX_EACCES));
+        }
         let path = self.child_path(parent, name)?;
         let parent_path = path.parent().ok_or_else(|| linux_error(LINUX_EINVAL))?;
         let parent_metadata = self.safe_metadata(parent_path)?;
@@ -70,6 +73,9 @@ impl PassthroughFs {
         umask: u32,
     ) -> io::Result<Entry> {
         self.require_writable()?;
+        if self.deny_matches_name(parent, name) {
+            return Err(linux_error(LINUX_EACCES));
+        }
         let path = self.child_path(parent, name)?;
         let parent_path = path.parent().ok_or_else(|| linux_error(LINUX_EINVAL))?;
         let parent_metadata = self.safe_metadata(parent_path)?;
@@ -115,6 +121,10 @@ impl PassthroughFs {
         self.require_writable()?;
         if !self.cfg.stat_virtualization_enabled() {
             return Err(linux_error(LINUX_EOPNOTSUPP));
+        }
+
+        if self.deny_matches_name(parent, name) {
+            return Err(linux_error(LINUX_EACCES));
         }
 
         let path = self.child_path(parent, name)?;
@@ -181,6 +191,10 @@ impl PassthroughFs {
     pub(super) fn do_link(&self, inode: u64, newparent: u64, newname: &CStr) -> io::Result<Entry> {
         self.require_writable()?;
         if self.cfg.inject_init && inode == INIT_INODE {
+            return Err(linux_error(LINUX_EACCES));
+        }
+
+        if self.deny_matches_name(newparent, newname) {
             return Err(linux_error(LINUX_EACCES));
         }
 

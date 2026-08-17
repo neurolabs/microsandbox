@@ -75,6 +75,11 @@ pub struct PassthroughConfig {
     /// `None` means unbounded. When set, guest-attributable growth past this
     /// many bytes is rejected with `ENOSPC`.
     pub quota_bytes: Option<u64>,
+
+    /// Gitignore-style patterns whose matching paths are hidden from the guest.
+    ///
+    /// Empty means no paths are denied.
+    pub deny: Vec<String>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -132,6 +137,8 @@ impl PassthroughFs {
             .quota_bytes
             .map(|limit| super::super::quota::DirQuota::new(root.clone(), limit));
 
+        let deny = super::super::super::shared::deny::DenyList::new(&cfg.deny);
+
         Ok(Self {
             cfg,
             root,
@@ -143,6 +150,7 @@ impl PassthroughFs {
             init_file,
             stat_store,
             quota,
+            deny,
         })
     }
 
@@ -204,6 +212,7 @@ impl Default for PassthroughConfig {
             attr_timeout: Duration::from_secs(5),
             inject_init: true,
             quota_bytes: None,
+            deny: Vec::new(),
         }
     }
 }

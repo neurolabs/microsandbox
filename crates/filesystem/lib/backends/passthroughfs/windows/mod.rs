@@ -152,6 +152,8 @@ pub struct PassthroughFs {
     init_file: Option<Mutex<File>>,
     stat_store: Option<StatStore>,
     quota: Option<super::quota::DirQuota>,
+    /// Matcher for the deny list (empty = allow everything).
+    deny: super::super::shared::deny::DenyList,
 }
 
 #[repr(C, packed)]
@@ -206,6 +208,42 @@ impl PassthroughFs {
         if let Some(quota) = &self.quota {
             quota.ensure_baseline();
         }
+    }
+
+    /// Whether `name` in `parent` is denied by the deny list.
+    ///
+    /// Uses the parent inode's stored host path to reconstruct the
+    /// mount-relative path for path-pattern matching. Fails open (returns
+    /// `false`) when the parent cannot be resolved so the mount does not
+    /// break on partial lookup races.
+    pub(super) fn deny_matches_name(&self, parent: u64, name: &CStr) -> bool {
+        if !self.deny.has_path_patterns() {
+            return self.deny.matches_basename(name.to_bytes());
+        }
+        let Ok(parent_data) = self.inode(parent) else {
+            return false;
+        };
+        // Reconstruct a '/' -separated mount-relative path for gitignore matching.
+        let rel = parent_data
+            .path
+            .strip_prefix(&self.root)
+            .unwrap_or(&parent_data.path);
+        let mut rel_str = String::new();
+        for component in rel.components() {
+            if let Component::Normal(part) = component {
+                if !rel_str.is_empty() {
+                    rel_str.push('/');
+                }
+                rel_str.push_str(&part.to_string_lossy());
+            }
+        }
+        if let Ok(name_str) = std::str::from_utf8(name.to_bytes()) {
+            if !rel_str.is_empty() {
+                rel_str.push('/');
+            }
+            rel_str.push_str(name_str);
+        }
+        self.deny.matches_path(rel_str.as_bytes())
     }
 }
 

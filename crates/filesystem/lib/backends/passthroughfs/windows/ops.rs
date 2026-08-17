@@ -82,6 +82,9 @@ impl DynFileSystem for PassthroughFs {
         _extensions: Extensions,
     ) -> io::Result<Entry> {
         self.require_writable()?;
+        if self.deny_matches_name(parent, name) {
+            return Err(linux_error(LINUX_EACCES));
+        }
         let path = self.child_path(parent, name)?;
         let parent_path = path.parent().ok_or_else(|| linux_error(LINUX_EINVAL))?;
         let parent_metadata = self.safe_metadata(parent_path)?;
@@ -108,6 +111,9 @@ impl DynFileSystem for PassthroughFs {
 
     fn unlink(&self, _ctx: Context, parent: u64, name: &CStr) -> io::Result<()> {
         self.require_writable()?;
+        if self.deny_matches_name(parent, name) {
+            return Err(linux_error(LINUX_EACCES));
+        }
         let path = self.child_path(parent, name)?;
         let metadata = self.safe_metadata(&path)?;
         if metadata.file_type().is_dir() {
@@ -124,6 +130,9 @@ impl DynFileSystem for PassthroughFs {
 
     fn rmdir(&self, _ctx: Context, parent: u64, name: &CStr) -> io::Result<()> {
         self.require_writable()?;
+        if self.deny_matches_name(parent, name) {
+            return Err(linux_error(LINUX_EACCES));
+        }
         let path = self.child_path(parent, name)?;
         let metadata = self.safe_metadata(&path)?;
         if !metadata.file_type().is_dir() {
@@ -150,6 +159,10 @@ impl DynFileSystem for PassthroughFs {
         self.require_writable()?;
         if flags & (RENAME_EXCHANGE | RENAME_WHITEOUT) != 0 {
             return Err(linux_error(LINUX_EOPNOTSUPP));
+        }
+
+        if self.deny_matches_name(olddir, oldname) || self.deny_matches_name(newdir, newname) {
+            return Err(linux_error(LINUX_EACCES));
         }
 
         let old_path = self.child_path(olddir, oldname)?;

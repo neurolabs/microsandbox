@@ -58,6 +58,10 @@ impl PassthroughFs {
                 .map_err(|_| linux_error(LINUX_EINVAL))?;
             validate_component(name)?;
 
+            if self.deny_matches_name(inode, name) {
+                continue;
+            }
+
             let path = entry.path();
             let metadata = self.safe_metadata(&path)?;
             let child = self.intern_path(path);
@@ -150,6 +154,10 @@ impl PassthroughFs {
             let name = CStr::from_bytes_with_nul(name_buffer.as_bytes())
                 .map_err(|_| linux_error(LINUX_EINVAL))?;
             validate_component(name)?;
+
+            if self.deny_matches_name(inode, name) {
+                continue;
+            }
 
             let path = entry.path();
             let metadata = self.safe_metadata(&path)?;
