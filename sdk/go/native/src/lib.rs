@@ -1177,6 +1177,8 @@ struct MountSpec {
     nodev: bool,
     size_mib: Option<u32>,
     quota_mib: Option<u32>,
+    #[serde(default)]
+    deny: Vec<String>,
     /// Per-mount stat-virtualization policy ("strict" | "relaxed" | "off").
     /// Only valid for bind / named mounts.
     stat_virtualization: Option<String>,
@@ -1903,6 +1905,7 @@ fn apply_volume(
     let nodev = m.nodev;
     let size_mib = m.size_mib;
     let quota_mib = m.quota_mib;
+    let deny = m.deny.clone();
     let raw_named_mode = m.named_mode.clone();
     let raw_named_kind = m.named_kind.clone();
 
@@ -1952,6 +1955,9 @@ fn apply_volume(
             let mut b = mb.bind(host);
             if let Some(quota) = quota_mib {
                 b = b.quota(quota);
+            }
+            if !deny.is_empty() {
+                b = b.deny(deny.clone());
             }
             b
         } else if let Some(ref name) = named {
@@ -6840,6 +6846,15 @@ mod tests {
             "got: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn mount_spec_parses_deny_list() {
+        let spec: MountSpec =
+            serde_json::from_str(r#"{"bind":"/host/data","deny":[".env","sub/secret"]}"#).unwrap();
+
+        assert_eq!(spec.bind.as_deref(), Some("/host/data"));
+        assert_eq!(spec.deny, vec![".env", "sub/secret"]);
     }
 
     #[test]

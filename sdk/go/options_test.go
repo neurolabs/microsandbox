@@ -960,6 +960,32 @@ func TestMountNamedPropagatesPolicies(t *testing.T) {
 	}
 }
 
+func TestMountBindPropagatesDeny(t *testing.T) {
+	m := Mount.Bind("/host/data", MountOptions{Deny: []string{".env", "sub/secret"}})
+	if m.Kind() != MountKindBind {
+		t.Errorf("Kind: got %d, want bind", m.Kind())
+	}
+	if len(m.Deny) != 2 || m.Deny[0] != ".env" || m.Deny[1] != "sub/secret" {
+		t.Errorf("Deny: got %v, want [.env sub/secret]", m.Deny)
+	}
+}
+
+func TestMountNonBindFactoriesDoNotCarryDeny(t *testing.T) {
+	nm := Mount.Named("vol", MountOptions{Deny: []string{".env"}})
+	if len(nm.Deny) != 0 {
+		t.Errorf("Named Deny: got %v, want empty", nm.Deny)
+	}
+	// Tmpfs takes TmpfsOptions (no Deny field), so there is nothing to forward.
+	tm := Mount.Tmpfs(TmpfsOptions{SizeMiB: 128})
+	if len(tm.Deny) != 0 {
+		t.Errorf("Tmpfs Deny: got %v, want empty", tm.Deny)
+	}
+	d := Mount.Disk("/host/img", DiskOptions{Format: "raw"})
+	if len(d.Deny) != 0 {
+		t.Errorf("Disk Deny: got %v, want empty", d.Deny)
+	}
+}
+
 func TestStatVirtualizationConstants(t *testing.T) {
 	cases := map[StatVirtualization]string{
 		StatVirtualizationDefault: "",
