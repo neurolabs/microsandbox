@@ -33,7 +33,6 @@ use std::{
 use crate::{
     AddDirEntry, AddDirEntryPlus, Context, DirEntry, DynFileSystem, Entry, Extensions, FsOptions,
     GetxattrReply, ListxattrReply, OpenOptions, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
-    backends::deny::{self, DenyList},
     backends::shared::{
         handle_table::HandleData,
         init_binary,
@@ -42,6 +41,8 @@ use crate::{
     },
     stat64, statvfs64,
 };
+
+use super::deny::{self, DenyList};
 
 //--------------------------------------------------------------------------------------------------
 // Types

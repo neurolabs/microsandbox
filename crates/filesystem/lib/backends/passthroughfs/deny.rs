@@ -6,6 +6,9 @@
 //! the entry name anywhere in the tree (gitignore semantics). Path patterns
 //! (containing `/`, e.g. `dir/secret`, `**/env.secret`) are matched against
 //! the full path relative to the mount root.
+//!
+//! Cross-platform: the matcher lives at the passthrough level so both the
+//! Unix and Windows passthrough backends can use it.
 
 use std::path::{Path, PathBuf};
 

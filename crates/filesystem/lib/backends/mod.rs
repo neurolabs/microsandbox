@@ -3,8 +3,6 @@
 //! Currently provides [`PassthroughFs`](passthroughfs::PassthroughFs), which exposes
 //! a single host directory to the guest VM via virtio-fs.
 
-pub(crate) mod deny;
-
 #[cfg(unix)]
 pub mod dualfs;
 #[cfg(unix)]
