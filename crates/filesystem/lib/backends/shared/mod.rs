@@ -2,6 +2,7 @@
 //!
 //! Contains data structures and utilities shared by the filesystem backends.
 
+pub(crate) mod deny;
 pub(crate) mod dir_snapshot;
 pub(crate) mod handle_table;
 pub(crate) mod init_binary;
