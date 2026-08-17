@@ -1598,6 +1598,7 @@ fn build_vm(
             #[cfg(unix)]
             bind_identity_map: mount_bind_identity_map,
             quota_bytes: parsed.quota_bytes,
+            deny: parsed.deny,
             ..Default::default()
         };
         let backend = PassthroughFs::new(cfg).map_err(|e| {
@@ -2398,6 +2399,7 @@ struct ParsedMountSpec {
     readonly: bool,
     follow_root_symlinks: bool,
     quota_bytes: Option<u64>,
+    deny: Vec<String>,
 }
 
 /// Parse a `--mount` spec into [`ParsedMountSpec`].
@@ -2431,6 +2433,7 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
     let mut readonly = false;
     let mut follow_root_symlinks = false;
     let mut quota_bytes = None;
+    let mut deny: Vec<String> = Vec::new();
     let mut seen_stat_virt = false;
     let mut seen_host_perms = false;
     let mut seen_access = false;
@@ -2538,6 +2541,7 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
                             })?;
                             quota_bytes = Some(mib.saturating_mul(1024 * 1024));
                         }
+                        "deny" => deny.push(value.to_string()),
                         other => return Err(format!("unknown mount option {other:?}")),
                     }
                 }
@@ -2553,6 +2557,7 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
         readonly,
         follow_root_symlinks,
         quota_bytes,
+        deny,
     })
 }
 
@@ -2838,6 +2843,30 @@ mod tests {
             err.contains("`quota` specified more than once"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn test_parse_mount_spec_deny_single() {
+        let p = parse_mount_spec("foo:/host/data:deny=.env").unwrap();
+        assert_eq!(p.deny, vec![".env".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_mount_spec_deny_repeatable() {
+        let p = parse_mount_spec("foo:/host/data:deny=.env,deny=*.log,deny=sub/secret").unwrap();
+        assert_eq!(p.deny, vec![".env", "*.log", "sub/secret"]);
+    }
+
+    #[test]
+    fn test_parse_mount_spec_deny_default_empty() {
+        let p = parse_mount_spec("foo:/host/data:ro").unwrap();
+        assert!(p.deny.is_empty());
+    }
+
+    #[test]
+    fn test_parse_mount_spec_deny_value_with_equals() {
+        let p = parse_mount_spec("foo:/host/data:deny=a=b").unwrap();
+        assert_eq!(p.deny, vec!["a=b".to_string()]);
     }
 
     #[test]
