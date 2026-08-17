@@ -378,6 +378,12 @@ pub enum VolumeMount {
         /// contents. `None` applies the protective default at spawn time; set a
         /// value to override it.
         quota_mib: Option<u32>,
+        /// Host-side deny-list of gitignore-style patterns.
+        ///
+        /// Matching entries are hidden (lookup/getattr/readdir return ENOENT) and
+        /// writes to them are forbidden (EACCES). Enforced by the host filesystem
+        /// backend; patterns are relative to the mount root.
+        deny: Vec<String>,
     },
 
     /// Mount a named volume into the guest.
@@ -1599,8 +1605,9 @@ impl Serialize for VolumeMount {
                 host_permissions,
                 follow_root_symlinks,
                 quota_mib,
+                deny,
             } => {
-                let mut map = serializer.serialize_map(Some(8))?;
+                let mut map = serializer.serialize_map(Some(9))?;
                 map.serialize_entry("type", "Bind")?;
                 map.serialize_entry("host", host)?;
                 map.serialize_entry("guest", guest)?;
@@ -1609,6 +1616,7 @@ impl Serialize for VolumeMount {
                 map.serialize_entry("host_permissions", host_permissions)?;
                 map.serialize_entry("follow_root_symlinks", follow_root_symlinks)?;
                 map.serialize_entry("quota_mib", quota_mib)?;
+                map.serialize_entry("deny", deny)?;
                 map.end()
             }
             Self::Named {
@@ -1690,6 +1698,8 @@ impl<'de> Deserialize<'de> for VolumeMount {
                 follow_root_symlinks: bool,
                 #[serde(default)]
                 quota_mib: Option<u32>,
+                #[serde(default)]
+                deny: Vec<String>,
             },
             Named {
                 name: String,
@@ -1738,6 +1748,7 @@ impl<'de> Deserialize<'de> for VolumeMount {
                 host_permissions,
                 follow_root_symlinks,
                 quota_mib,
+                deny,
             } => Self::Bind {
                 host,
                 guest,
@@ -1746,6 +1757,7 @@ impl<'de> Deserialize<'de> for VolumeMount {
                 host_permissions,
                 follow_root_symlinks,
                 quota_mib,
+                deny,
             },
             VolumeMountHelper::Named {
                 name,
@@ -1803,6 +1815,7 @@ impl fmt::Debug for VolumeMount {
                 host_permissions,
                 follow_root_symlinks,
                 quota_mib,
+                deny,
             } => f
                 .debug_struct("Bind")
                 .field("host", host)
@@ -1812,6 +1825,7 @@ impl fmt::Debug for VolumeMount {
                 .field("host_permissions", host_permissions)
                 .field("follow_root_symlinks", follow_root_symlinks)
                 .field("quota_mib", quota_mib)
+                .field("deny", deny)
                 .finish(),
             Self::Named {
                 name,
@@ -2955,6 +2969,46 @@ mod tests {
             let parsed: SandboxLogLevel = input.parse().unwrap();
             assert_eq!(parsed, expected);
             assert_eq!(parsed.as_str(), input);
+        }
+    }
+
+    #[test]
+    fn volume_mount_bind_deny_roundtrips() {
+        let mount = VolumeMount::Bind {
+            host: PathBuf::from("/host/data"),
+            guest: "/data".to_string(),
+            options: MountOptions::default(),
+            stat_virtualization: StatVirtualization::Strict,
+            host_permissions: HostPermissions::Private,
+            follow_root_symlinks: false,
+            quota_mib: Some(2048),
+            deny: vec!["sub/.env".to_string(), "*.log".to_string()],
+        };
+
+        let json = serde_json::to_string(&mount).unwrap();
+        assert!(json.contains(r#""deny":["sub/.env","*.log"]"#));
+
+        let decoded: VolumeMount = serde_json::from_str(&json).unwrap();
+        match decoded {
+            VolumeMount::Bind {
+                deny, quota_mib, ..
+            } => {
+                assert_eq!(deny, vec!["sub/.env".to_string(), "*.log".to_string()]);
+                assert_eq!(quota_mib, Some(2048));
+            }
+            other => panic!("expected Bind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn volume_mount_bind_deny_defaults_empty() {
+        let decoded: VolumeMount = serde_json::from_str(
+            r#"{"type":"Bind","host":"/host/data","guest":"/data","quota_mib":null}"#,
+        )
+        .unwrap();
+        match decoded {
+            VolumeMount::Bind { deny, .. } => assert!(deny.is_empty()),
+            other => panic!("expected Bind, got {other:?}"),
         }
     }
 }

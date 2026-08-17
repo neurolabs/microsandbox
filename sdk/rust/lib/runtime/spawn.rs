@@ -2254,6 +2254,7 @@ fn push_dir_mount_arg(
     host_permissions: HostPermissions,
     follow_root_symlinks: bool,
     quota_mib: Option<u32>,
+    deny: &[String],
 ) {
     let tag = guest_mount_tag(guest);
     let mut arg = format!("{tag}:{host_display}");
@@ -2266,6 +2267,9 @@ fn push_dir_mount_arg(
     );
     if let Some(mib) = quota_mib {
         opts.push(format!("quota={mib}"));
+    }
+    for p in deny {
+        opts.push(format!("deny={p}"));
     }
     append_option_block(&mut arg, opts);
     mounts.push(arg);
@@ -2291,12 +2295,16 @@ fn push_file_mount_arg(
     options: MountOptions,
     stat_virtualization: StatVirtualization,
     host_permissions: HostPermissions,
+    deny: &[String],
 ) {
     let mut arg = format!("{tag}:{}", file_mount_dir.display());
     let mut opts = mount_option_tokens(options);
     // The staging directory is canonicalized at creation, so it is symlink-free
     // and stays under the default no-follow root protection — no opt-out here.
     append_policy_options(&mut opts, stat_virtualization, host_permissions, false);
+    for p in deny {
+        opts.push(format!("deny={p}"));
+    }
     append_option_block(&mut arg, opts);
     mounts.push(arg);
 }
@@ -2676,6 +2684,7 @@ fn sandbox_cli_args(
                 host_permissions,
                 follow_root_symlinks,
                 quota_mib,
+                deny,
             } => {
                 if let Some((file_mount_dir, filename, tag)) = staged_file_mounts.get(guest) {
                     push_file_mount_arg(
@@ -2685,6 +2694,7 @@ fn sandbox_cli_args(
                         *options,
                         *stat_virtualization,
                         *host_permissions,
+                        deny,
                     );
                     push_file_mounts_spec(&mut file_mounts_val, tag, filename, guest, *options);
                 } else {
@@ -2700,6 +2710,7 @@ fn sandbox_cli_args(
                         *host_permissions,
                         *follow_root_symlinks,
                         Some(quota),
+                        deny,
                     );
                     push_dir_mounts_spec(&mut dir_mounts_val, guest, *options);
                 }
@@ -2755,6 +2766,7 @@ fn sandbox_cli_args(
                             *host_permissions,
                             *follow_root_symlinks,
                             *quota_mib,
+                            &[],
                         );
                         push_dir_mounts_spec(&mut dir_mounts_val, guest, *options);
                     }
@@ -4097,6 +4109,42 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair[0] == "--mount" && pair[1] == expected),
             "missing override-quota --mount arg in {rendered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_cli_args_bind_mount_deny_renders_arg_only() {
+        let config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .volume("/data", |m| {
+                m.bind("/host/data").deny([".env", "sub/secret"])
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let rendered = render_args(&config);
+        let data_tag = super::guest_mount_tag("/data");
+        let expected = format!(
+            "{data_tag}:/host/data:quota={},deny=.env,deny=sub/secret",
+            crate::sandbox::config::DEFAULT_BIND_QUOTA_MIB
+        );
+        assert!(
+            rendered
+                .windows(2)
+                .any(|pair| pair[0] == "--mount" && pair[1] == expected),
+            "missing deny --mount arg in {rendered:?}"
+        );
+
+        // Deny rides only in the --mount arg, never the agentd env spec.
+        let dir_mounts = rendered
+            .iter()
+            .find(|arg| arg.starts_with("MSB_DIR_MOUNTS="))
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !dir_mounts.contains("deny"),
+            "MSB_DIR_MOUNTS must not carry deny, got {dir_mounts:?}"
         );
     }
 
