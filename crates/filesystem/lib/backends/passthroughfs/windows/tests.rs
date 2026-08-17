@@ -101,6 +101,18 @@ fn fs_for(path: &Path) -> PassthroughFs {
     fs
 }
 
+fn fs_for_deny(path: &Path, deny: Vec<String>) -> PassthroughFs {
+    let fs = PassthroughFs::new(PassthroughConfig {
+        root_dir: path.to_path_buf(),
+        inject_init: false,
+        deny,
+        ..Default::default()
+    })
+    .unwrap();
+    fs.init(FsOptions::empty()).unwrap();
+    fs
+}
+
 fn assert_ads_store(fs: &PassthroughFs) {
     let store = fs.stat_store.as_ref().expect("stat store enabled");
     assert!(matches!(
@@ -1090,4 +1102,259 @@ fn no_symlink_root_allows_deep_real_path() {
     std::fs::create_dir_all(&deep).unwrap();
 
     build_no_symlink(deep).expect("deep real path should mount");
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests: deny-list enforcement
+//--------------------------------------------------------------------------------------------------
+
+/// A denied basename is invisible via lookup.
+#[test]
+fn deny_basename_lookup_hidden() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join(".env"), b"secret").unwrap();
+    std::fs::write(temp.path.join("visible.txt"), b"ok").unwrap();
+    let fs = fs_for_deny(&temp.path, vec![".env".to_string()]);
+
+    expect_errno(fs.lookup(context(), ROOT_INODE, c".env"), LINUX_ENOENT);
+
+    // A non-denied file still resolves.
+    fs.lookup(context(), ROOT_INODE, c"visible.txt").unwrap();
+}
+
+/// Creating a denied basename returns EACCES.
+#[test]
+fn deny_basename_create_rejected() {
+    let temp = TempDir::new();
+    let fs = fs_for_deny(&temp.path, vec![".secrets".to_string()]);
+
+    expect_errno(
+        fs.create(
+            context(),
+            ROOT_INODE,
+            c".secrets",
+            S_IFREG | 0o644,
+            false,
+            (LINUX_O_CREAT | LINUX_O_RDWR) as u32,
+            0,
+            Extensions::default(),
+        ),
+        LINUX_EACCES,
+    );
+
+    // A normal create still works.
+    fs.create(
+        context(),
+        ROOT_INODE,
+        c"normal.txt",
+        S_IFREG | 0o644,
+        false,
+        (LINUX_O_CREAT | LINUX_O_RDWR) as u32,
+        0,
+        Extensions::default(),
+    )
+    .unwrap();
+}
+
+/// Creating a denied directory returns EACCES.
+#[test]
+fn deny_mkdir_rejected() {
+    let temp = TempDir::new();
+    let fs = fs_for_deny(&temp.path, vec![".hidden_dir".to_string()]);
+
+    expect_errno(
+        fs.mkdir(
+            context(),
+            ROOT_INODE,
+            c".hidden_dir",
+            S_IFDIR | 0o755,
+            0,
+            Extensions::default(),
+        ),
+        LINUX_EACCES,
+    );
+
+    // A normal mkdir still works.
+    fs.mkdir(
+        context(),
+        ROOT_INODE,
+        c"visible_dir",
+        S_IFDIR | 0o755,
+        0,
+        Extensions::default(),
+    )
+    .unwrap();
+}
+
+/// Renaming into a denied target name returns EACCES.
+#[test]
+fn deny_rename_to_denied_target() {
+    let temp = TempDir::new();
+    let fs = fs_for_deny(&temp.path, vec![".forbidden".to_string()]);
+
+    fs.create(
+        context(),
+        ROOT_INODE,
+        c"source.txt",
+        S_IFREG | 0o644,
+        false,
+        (LINUX_O_CREAT | LINUX_O_RDWR) as u32,
+        0,
+        Extensions::default(),
+    )
+    .unwrap();
+
+    // Rename to a denied name is rejected.
+    expect_errno(
+        fs.rename(
+            context(),
+            ROOT_INODE,
+            c"source.txt",
+            ROOT_INODE,
+            c".forbidden",
+            0,
+        ),
+        LINUX_EACCES,
+    );
+
+    // Rename to a normal name still works.
+    fs.rename(
+        context(),
+        ROOT_INODE,
+        c"source.txt",
+        ROOT_INODE,
+        c"renamed.txt",
+        0,
+    )
+    .unwrap();
+}
+
+/// Unlink of a denied name returns EACCES.
+#[test]
+fn deny_unlink_rejected() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join(".protected"), b"protected").unwrap();
+    let fs = fs_for_deny(&temp.path, vec![".protected".to_string()]);
+
+    expect_errno(
+        fs.unlink(context(), ROOT_INODE, c".protected"),
+        LINUX_EACCES,
+    );
+}
+
+/// Rmdir of a denied directory returns EACCES.
+#[test]
+fn deny_rmdir_rejected() {
+    let temp = TempDir::new();
+    std::fs::create_dir(temp.path.join(".protected_dir")).unwrap();
+    let fs = fs_for_deny(&temp.path, vec![".protected_dir".to_string()]);
+
+    expect_errno(
+        fs.rmdir(context(), ROOT_INODE, c".protected_dir"),
+        LINUX_EACCES,
+    );
+}
+
+/// Denied entries are omitted from readdir.
+#[test]
+fn deny_readdir_omits_entries() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join(".env"), b"hidden").unwrap();
+    std::fs::write(temp.path.join("data.log"), b"hidden").unwrap();
+    std::fs::write(temp.path.join("visible.txt"), b"ok").unwrap();
+    let fs = fs_for_deny(&temp.path, vec![".env".to_string(), "*.log".to_string()]);
+
+    let (handle, _) = fs
+        .opendir(context(), ROOT_INODE, LINUX_O_DIRECTORY as u32)
+        .unwrap();
+    let entries = fs
+        .readdir(context(), ROOT_INODE, handle.unwrap(), 4096, 0)
+        .unwrap();
+
+    assert!(
+        !entries.iter().any(|e| e.name == b".env"),
+        ".env should be hidden from readdir"
+    );
+    assert!(
+        !entries.iter().any(|e| e.name == b"data.log"),
+        "data.log should be hidden from readdir"
+    );
+    assert!(
+        entries.iter().any(|e| e.name == b"visible.txt"),
+        "visible.txt should be in readdir"
+    );
+}
+
+/// A nested path pattern hides the matching path but not its siblings.
+#[test]
+fn deny_path_pattern_nested() {
+    let temp = TempDir::new();
+    std::fs::create_dir(temp.path.join("sub")).unwrap();
+    std::fs::write(temp.path.join("sub").join(".env"), b"secret").unwrap();
+    std::fs::write(temp.path.join("sub").join("visible.txt"), b"ok").unwrap();
+    let fs = fs_for_deny(&temp.path, vec!["sub/.env".to_string()]);
+
+    // The parent directory itself is reachable.
+    let dir = fs.lookup(context(), ROOT_INODE, c"sub").unwrap();
+
+    // The denied nested file is hidden under the parent.
+    expect_errno(fs.lookup(context(), dir.inode, c".env"), LINUX_ENOENT);
+
+    // A sibling in the same directory is visible.
+    fs.lookup(context(), dir.inode, c"visible.txt").unwrap();
+}
+
+/// Non-denied names remain fully read-write.
+#[test]
+fn deny_normal_ops_unchanged() {
+    let temp = TempDir::new();
+    let fs = fs_for_deny(&temp.path, vec![".env".to_string()]);
+
+    // Create, write, and read all work on a non-denied name.
+    let flags = (LINUX_O_CREAT | LINUX_O_RDWR) as u32;
+    let (entry, handle, _) = fs
+        .create(
+            context(),
+            ROOT_INODE,
+            c"writeable.txt",
+            S_IFREG | 0o644,
+            false,
+            flags,
+            0,
+            Extensions::default(),
+        )
+        .unwrap();
+    let handle = handle.unwrap();
+
+    let mut reader = SourceReader {
+        bytes: b"hello deny".to_vec(),
+        pos: 0,
+    };
+    fs.write(
+        context(),
+        entry.inode,
+        handle,
+        &mut reader,
+        10,
+        0,
+        None,
+        false,
+        false,
+        0,
+    )
+    .unwrap();
+
+    let mut writer = CaptureWriter { bytes: Vec::new() };
+    fs.read(context(), entry.inode, handle, &mut writer, 10, 0, None, 0)
+        .unwrap();
+    assert_eq!(writer.bytes, b"hello deny");
+
+    // Unlink still works on a non-denied name.
+    fs.unlink(context(), ROOT_INODE, c"writeable.txt").unwrap();
+
+    // After unlink, lookup returns ENOENT.
+    expect_errno(
+        fs.lookup(context(), ROOT_INODE, c"writeable.txt"),
+        LINUX_ENOENT,
+    );
 }
