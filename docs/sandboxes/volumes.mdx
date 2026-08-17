@@ -375,6 +375,7 @@ Mounts use normal Linux behavior by default: writable, executable, suid-enabled,
 - `noexec` when files on the mount should not be executed directly.
 - `nosuid` when setuid/setgid bits should be ignored.
 - `nodev` when device files should be ignored.
+- `deny=<pattern>` hides host paths matching a gitignore-style pattern from the guest: matching entries are invisible (ENOENT) and writes to them are forbidden (EACCES). Patterns are relative to the mount root and may be names (`.env`, `*.log`) or paths (`sub/secret`). Repeatable to deny several patterns.
 
 `noexec` does not stop interpreters from reading scripts from the mount, for example `sh /app/src/script.sh`.
 
@@ -386,7 +387,7 @@ CLI mount flags use `SOURCE:DEST[:OPTIONS]`. The `:` before `OPTIONS` starts the
 
 | Flag | Source | Options |
 |------|--------|---------|
-| `--mount-dir` | Host directory | `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `stat-virt=strict\|relaxed\|off`, `host-perms=private\|mirror` |
+| `--mount-dir` | Host directory | `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `stat-virt=strict\|relaxed\|off`, `host-perms=private\|mirror`, `deny=<pattern>` (repeatable) |
 | `--mount-file` | Host file | `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `stat-virt=strict\|relaxed\|off`, `host-perms=private\|mirror` |
 | `--mount-named` | Named volume | `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `kind=dir\|disk`, `size=<size>` for `kind=disk`, `quota=<size>` for directory volumes; directory-backed named volumes also support `stat-virt=strict\|relaxed\|off`, `host-perms=private\|mirror` |
 | `--mount-disk` | Host disk image | `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `format=raw\|qcow2\|vmdk`, `fstype=<type>` |
