@@ -256,7 +256,7 @@ pub async fn run(args: InspectArgs) -> anyhow::Result<()> {
                         host_permissions,
                         follow_root_symlinks,
                         quota_mib,
-                        deny: _,
+                        deny,
                     } => {
                         let flags = mount_flags_suffix(*options);
                         let suffix = mount_policy_suffix(
@@ -267,8 +267,13 @@ pub async fn run(args: InspectArgs) -> anyhow::Result<()> {
                         let quota = quota_mib
                             .map(|mib| format!(" [quota={mib}MiB]"))
                             .unwrap_or_default();
+                        let deny = if deny.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [deny={}]", deny.join(", "))
+                        };
                         println!(
-                            "  {guest:<16}\u{2192} {}{flags}{suffix}{quota}",
+                            "  {guest:<16}\u{2192} {}{flags}{suffix}{quota}{deny}",
                             host.display()
                         );
                     }
