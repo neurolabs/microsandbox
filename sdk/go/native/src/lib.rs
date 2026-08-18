@@ -1862,6 +1862,29 @@ fn apply_patch(
     Ok(builder.add_patch(patch))
 }
 
+/// Reject deny patterns that would corrupt the mount wire format.
+///
+/// The mount option block is comma-joined and the spec is colon-split, so a
+/// `,` or `:` in a pattern would either fail the whole spawn or silently
+/// attenuate other mount protections; a newline/NUL would corrupt gitignore
+/// parsing. Reject here so the FFI boundary reports a clear error instead of
+/// the deeper `MountBuilder::build()` validation.
+fn validate_deny_pattern(pattern: &str) -> Result<(), FfiError> {
+    if pattern.is_empty() {
+        return Err(FfiError::invalid_argument("deny pattern must not be empty"));
+    }
+    if pattern.contains(',')
+        || pattern.contains(':')
+        || pattern.contains('\n')
+        || pattern.contains('\0')
+    {
+        return Err(FfiError::invalid_argument(format!(
+            "deny pattern must not contain ',', ':', newline, or NUL: {pattern:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn apply_volume(
     builder: microsandbox::sandbox::SandboxBuilder,
     guest_path: &str,
@@ -1906,6 +1929,9 @@ fn apply_volume(
     let size_mib = m.size_mib;
     let quota_mib = m.quota_mib;
     let deny = m.deny.clone();
+    for pattern in &deny {
+        validate_deny_pattern(pattern)?;
+    }
     let raw_named_mode = m.named_mode.clone();
     let raw_named_kind = m.named_kind.clone();
 
@@ -6858,9 +6884,46 @@ mod tests {
     }
 
     #[test]
-    fn parse_destination_bare_ipv4_becomes_cidr() {
-        let destination =
-            parse_destination(Some("1.1.1.1")).unwrap_or_else(|e| panic!("{}", e.message));
+    fn apply_volume_rejects_deny_with_wire_separator() {
+        for bad in [",", ":", "\n"] {
+            let builder = microsandbox::sandbox::SandboxBuilder::new("test").image("alpine");
+            let spec = MountSpec {
+                bind: Some("/host/data".to_string()),
+                deny: vec![format!("a{bad}b")],
+                ..Default::default()
+            };
+
+            let err = match apply_volume(builder, "/data", &spec) {
+                Ok(_) => panic!("deny pattern {bad:?} should be rejected"),
+                Err(err) => err,
+            };
+            assert!(
+                err.message.contains("must not contain"),
+                "pattern {bad:?} got: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn apply_volume_rejects_empty_deny() {
+        let builder = microsandbox::sandbox::SandboxBuilder::new("test").image("alpine");
+        let spec = MountSpec {
+            bind: Some("/host/data".to_string()),
+            deny: vec![String::new()],
+            ..Default::default()
+        };
+
+        let err = match apply_volume(builder, "/data", &spec) {
+            Ok(_) => panic!("empty deny pattern should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.message.contains("must not be empty"),
+            "got: {}",
+            err.message
+        );
+    }
 
         match destination {
             microsandbox_network::policy::Destination::Cidr(cidr) => {

@@ -2541,7 +2541,10 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
                             })?;
                             quota_bytes = Some(mib.saturating_mul(1024 * 1024));
                         }
-                        "deny" => deny.push(value.to_string()),
+                        "deny" => {
+                            validate_deny_pattern(value)?;
+                            deny.push(value.to_string())
+                        }
                         other => return Err(format!("unknown mount option {other:?}")),
                     }
                 }
@@ -2559,6 +2562,24 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
         quota_bytes,
         deny,
     })
+}
+
+/// Reject deny patterns that would corrupt the mount wire format.
+///
+/// The option block is comma-joined and the spec is colon-split, so a `,` or
+/// `:` in a pattern would either fail the whole spawn or — worse — silently
+/// attenuate other mount protections. A newline/NUL would corrupt gitignore
+/// parsing. Validate here so the runtime never accepts an injectable pattern.
+fn validate_deny_pattern(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("empty deny pattern".to_string());
+    }
+    if value.contains(',') || value.contains(':') || value.contains('\n') || value.contains('\0') {
+        return Err(format!(
+            "deny pattern must not contain ',', ':', newline, or NUL: {value:?}"
+        ));
+    }
+    Ok(())
 }
 
 /// Split `host_path[:opts]`, skipping the drive colon in Windows paths.
@@ -2867,6 +2888,32 @@ mod tests {
     fn test_parse_mount_spec_deny_value_with_equals() {
         let p = parse_mount_spec("foo:/host/data:deny=a=b").unwrap();
         assert_eq!(p.deny, vec!["a=b".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_mount_spec_rejects_deny_with_colon() {
+        // A colon in the option block is consumed by the host/options split, so
+        // it cannot reach the deny handler; the spec still fails loudly rather
+        // than silently dropping the pattern.
+        assert!(parse_mount_spec("foo:/host/data:deny=a:b").is_err());
+    }
+
+    #[test]
+    fn test_parse_mount_spec_rejects_deny_with_newline() {
+        let err = parse_mount_spec("foo:/host/data:deny=bad\npattern").unwrap_err();
+        assert!(
+            err.contains("must not contain"),
+            "expected newline rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_mount_spec_rejects_empty_deny() {
+        let err = parse_mount_spec("foo:/host/data:deny=").unwrap_err();
+        assert!(
+            err.contains("empty deny pattern"),
+            "expected empty-pattern rejection, got: {err}"
+        );
     }
 
     #[test]

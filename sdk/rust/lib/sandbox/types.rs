@@ -450,6 +450,9 @@ impl MountBuilder {
                 ".deny() is only valid for bind mounts".into(),
             ));
         }
+        for pattern in &self.deny {
+            validate_deny_pattern(pattern)?;
+        }
         if self.disk_format.is_some() && !is_disk {
             return Err(crate::MicrosandboxError::InvalidConfig(
                 ".format() is only valid for disk image mounts".into(),
@@ -1210,6 +1213,30 @@ fn validate_host_path_wire_safe(path: &Path, label: &str) -> crate::Microsandbox
     Ok(())
 }
 
+/// Validate a single deny-list pattern for the mount wire format.
+///
+/// Patterns are rendered into the `--mount` option block as `deny=<pattern>`.
+/// The block is comma-joined and the spec is colon-split, so any of those
+/// separators (or a newline/NUL, which would corrupt gitignore parsing) must
+/// be rejected up front rather than silently attenuating other mount options.
+fn validate_deny_pattern(pattern: &str) -> crate::MicrosandboxResult<()> {
+    if pattern.is_empty() {
+        return Err(crate::MicrosandboxError::InvalidConfig(
+            "deny patterns must not be empty".into(),
+        ));
+    }
+    if pattern.contains(',')
+        || pattern.contains(':')
+        || pattern.contains('\n')
+        || pattern.contains('\0')
+    {
+        return Err(crate::MicrosandboxError::InvalidConfig(format!(
+            "deny pattern must not contain ',', ':', newline, or NUL: {pattern:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn has_forbidden_host_path_colon(path: &str) -> bool {
     path.char_indices().any(|(index, c)| {
         c == ':' && {
@@ -1435,6 +1462,34 @@ mod tests {
         assert!(
             err.to_string()
                 .contains(".deny() is only valid for bind mounts")
+        );
+    }
+
+    #[test]
+    fn test_mount_builder_deny_rejects_wire_separators() {
+        for bad in [",", ":", "\n"] {
+            let err = MountBuilder::new("/data")
+                .bind("/host/data")
+                .deny([format!("a{bad}b")])
+                .build()
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("must not contain"),
+                "pattern {bad:?} should be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mount_builder_deny_rejects_empty_pattern() {
+        let err = MountBuilder::new("/data")
+            .bind("/host/data")
+            .deny([""])
+            .build()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("must not be empty"),
+            "empty pattern should be rejected, got: {err}"
         );
     }
 
