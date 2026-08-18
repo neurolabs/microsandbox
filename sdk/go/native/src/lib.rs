@@ -1973,6 +1973,11 @@ fn apply_volume(
             "quota_mib is only valid for bind mounts or named volume provisioning",
         ));
     }
+    if !deny.is_empty() && bind.is_none() {
+        return Err(FfiError::invalid_argument(
+            "deny is only valid for bind mounts",
+        ));
+    }
 
     Ok(builder.volume(guest_path, move |mb| {
         let mut mb = if let Some(ref host) = bind {
@@ -6924,6 +6929,31 @@ mod tests {
             err.message
         );
     }
+
+    #[test]
+    fn apply_volume_rejects_deny_on_named_mount() {
+        let builder = microsandbox::sandbox::SandboxBuilder::new("test").image("alpine");
+        let spec = MountSpec {
+            named: Some("vol".to_string()),
+            deny: vec![".env".to_string()],
+            ..Default::default()
+        };
+
+        let err = match apply_volume(builder, "/data", &spec) {
+            Ok(_) => panic!("deny on a named mount should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.message.contains("deny is only valid for bind mounts"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn parse_destination_bare_ipv4_becomes_cidr() {
+        let destination =
+            parse_destination(Some("1.1.1.1")).unwrap_or_else(|e| panic!("{}", e.message));
 
         match destination {
             microsandbox_network::policy::Destination::Cidr(cidr) => {

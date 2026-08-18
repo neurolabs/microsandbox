@@ -1713,6 +1713,7 @@ func (mountFactory) Named(name string, opts MountOptions) MountConfig {
 		Nodev:              opts.Nodev,
 		StatVirtualization: opts.StatVirtualization,
 		HostPermissions:    opts.HostPermissions,
+		Deny:               opts.Deny,
 	}
 }
 
@@ -1732,6 +1733,7 @@ func (mountFactory) NamedWith(name string, opts MountOptions, namedOpts NamedVol
 		Nodev:              opts.Nodev,
 		StatVirtualization: opts.StatVirtualization,
 		HostPermissions:    opts.HostPermissions,
+		Deny:               opts.Deny,
 	}
 }
 

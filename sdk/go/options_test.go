@@ -970,12 +970,14 @@ func TestMountBindPropagatesDeny(t *testing.T) {
 	}
 }
 
-func TestMountNonBindFactoriesDoNotCarryDeny(t *testing.T) {
+func TestMountNonBindFactoriesCarryDenyForRejection(t *testing.T) {
+	// Named must carry Deny through to the native layer so it is rejected
+	// loudly at apply time instead of silently dropped.
 	nm := Mount.Named("vol", MountOptions{Deny: []string{".env"}})
-	if len(nm.Deny) != 0 {
-		t.Errorf("Named Deny: got %v, want empty", nm.Deny)
+	if len(nm.Deny) != 1 || nm.Deny[0] != ".env" {
+		t.Errorf("Named Deny: got %v, want [.env]", nm.Deny)
 	}
-	// Tmpfs takes TmpfsOptions (no Deny field), so there is nothing to forward.
+	// Tmpfs/Disk take separate options types with no Deny field.
 	tm := Mount.Tmpfs(TmpfsOptions{SizeMiB: 128})
 	if len(tm.Deny) != 0 {
 		t.Errorf("Tmpfs Deny: got %v, want empty", tm.Deny)
