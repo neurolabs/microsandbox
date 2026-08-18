@@ -23,7 +23,7 @@ use crate::{MicrosandboxError, MicrosandboxResult};
 use microsandbox_image::RegistryAuth;
 use microsandbox_types::{
     CloudCreateSandboxRequest, CloudCreateSandboxResponse, CloudSandboxStatus, RootDisk,
-    SandboxRuntimeOptions, TlsConfig,
+    SandboxRuntimeOptions, TlsConfig, VolumeMount,
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -411,6 +411,18 @@ fn reject_dropped_cloud_create_fields(config: &SandboxConfig) -> MicrosandboxRes
         .any(|mount| mount.named_create().is_some())
     {
         return Err(unsupported("named volume inline create"));
+    }
+
+    // The cloud wire format has no deny field, so a non-empty deny list would
+    // silently create a sandbox that exposes the files the caller asked to
+    // hide; deny lists are only enforceable on host bind mounts.
+    if config
+        .spec
+        .mounts
+        .iter()
+        .any(|mount| matches!(mount, VolumeMount::Bind { deny, .. } if !deny.is_empty()))
+    {
+        return Err(unsupported("bind mount deny list"));
     }
 
     if config.snapshot_upper_source.is_some() {
@@ -819,6 +831,23 @@ mod tests {
         });
 
         assert_unsupported_config_field(config, "named volume inline create");
+    }
+
+    #[test]
+    fn cloud_create_request_rejects_bind_mount_deny_list() {
+        let mut config = base_cloud_config();
+        config.spec.mounts.push(VolumeMount::Bind {
+            host: std::path::PathBuf::from("/data"),
+            guest: "/data".into(),
+            options: MountOptions::default(),
+            stat_virtualization: StatVirtualization::Strict,
+            host_permissions: HostPermissions::Private,
+            follow_root_symlinks: false,
+            quota_mib: None,
+            deny: vec![".env".into()],
+        });
+
+        assert_unsupported_config_field(config, "bind mount deny list");
     }
 
     #[test]
