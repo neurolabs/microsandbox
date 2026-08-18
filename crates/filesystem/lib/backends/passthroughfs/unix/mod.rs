@@ -421,6 +421,11 @@ impl PassthroughFs {
     /// cannot be reconstructed so the mount does not break on partial
     /// lookup races.
     fn deny_matches_name(&self, parent: u64, name: &[u8]) -> bool {
+        // The structural `.` and `..` entries must never be denied, otherwise a
+        // `.*` or `*` pattern would break path walks and directory listings.
+        if name == b"." || name == b".." {
+            return false;
+        }
         if !self.deny.has_path_patterns() {
             return self.deny.matches_basename(name);
         }

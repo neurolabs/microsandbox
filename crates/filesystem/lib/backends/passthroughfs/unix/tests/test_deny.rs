@@ -24,6 +24,66 @@ fn test_deny_basename_lookup() {
 }
 
 //--------------------------------------------------------------------------------------------------
+// Tests: structural `.`/`..` entries are never denied
+//--------------------------------------------------------------------------------------------------
+
+/// A `.*` pattern must not strip the structural `.` and `..` entries from
+/// readdir, otherwise path walks break.
+#[test]
+fn test_deny_star_pattern_keeps_dot_and_dotdot() {
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec![".*".to_string()],
+        ..cfg
+    });
+    sb.host_create_file(".env", b"secret");
+    sb.host_create_file("visible.txt", b"ok");
+
+    let handle = sb.fuse_opendir(ROOT_INODE).unwrap();
+    let entries = sb
+        .fs
+        .readdir(sb.ctx(), ROOT_INODE, handle, 4096, 0)
+        .unwrap();
+
+    let names: Vec<&[u8]> = entries.iter().map(|e| &e.name[..]).collect();
+    assert!(
+        names.contains(&b".".as_slice()),
+        "readdir must still contain '.' under a '.*' deny pattern"
+    );
+    assert!(
+        names.contains(&b"..".as_slice()),
+        "readdir must still contain '..' under a '.*' deny pattern"
+    );
+    assert!(
+        !names.contains(&b".env".as_slice()),
+        ".env should be hidden by the '.*' deny pattern"
+    );
+}
+
+/// `lookup(".")` must resolve to the parent directory, not be denied by a
+/// `.*` or `*` pattern.
+#[test]
+fn test_deny_star_pattern_lookup_dot_succeeds() {
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec![".*".to_string()],
+        ..cfg
+    });
+    sb.host_create_dir("sub");
+    sb.host_create_file("sub/data.txt", b"ok");
+
+    // lookup(".") in root and in a subdir must succeed.
+    let root_dot = sb.lookup(ROOT_INODE, ".").unwrap();
+    assert_eq!(root_dot.inode, ROOT_INODE);
+
+    let sub = sb.lookup(ROOT_INODE, "sub").unwrap();
+    let sub_dot = sb.lookup(sub.inode, ".").unwrap();
+    assert_eq!(sub_dot.inode, sub.inode);
+
+    // And a path walk through a subdirectory still works.
+    let data = sb.lookup(sub.inode, "data.txt").unwrap();
+    assert_eq!(data.inode, 4);
+}
+
+//--------------------------------------------------------------------------------------------------
 // Tests: create/mkdir EACCES on denied names
 //--------------------------------------------------------------------------------------------------
 

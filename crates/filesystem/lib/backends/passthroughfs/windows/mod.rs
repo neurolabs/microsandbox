@@ -217,8 +217,14 @@ impl PassthroughFs {
     /// `false`) when the parent cannot be resolved so the mount does not
     /// break on partial lookup races.
     pub(super) fn deny_matches_name(&self, parent: u64, name: &CStr) -> bool {
+        let name_bytes = name.to_bytes();
+        // The structural `.` and `..` entries must never be denied, otherwise a
+        // `.*` or `*` pattern would break path walks and directory listings.
+        if name_bytes == b"." || name_bytes == b".." {
+            return false;
+        }
         if !self.deny.has_path_patterns() {
-            return self.deny.matches_basename(name.to_bytes());
+            return self.deny.matches_basename(name_bytes);
         }
         let Ok(parent_data) = self.inode(parent) else {
             return false;
@@ -237,7 +243,7 @@ impl PassthroughFs {
                 rel_str.push_str(&part.to_string_lossy());
             }
         }
-        if let Ok(name_str) = std::str::from_utf8(name.to_bytes()) {
+        if let Ok(name_str) = std::str::from_utf8(name_bytes) {
             if !rel_str.is_empty() {
                 rel_str.push('/');
             }
