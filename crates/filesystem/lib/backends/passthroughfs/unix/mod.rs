@@ -436,7 +436,7 @@ impl PassthroughFs {
         }
         components.push(name.to_vec());
         self.deny
-            .matches_path(&deny::join_path(&components).as_os_str().as_bytes())
+            .matches_path(deny::join_path(&components).as_os_str().as_bytes())
     }
 
     /// Whether this mount exposes the synthetic init binary.
