@@ -33,8 +33,8 @@ use std::{
 use crate::{
     AddDirEntry, AddDirEntryPlus, Context, DirEntry, DynFileSystem, Entry, Extensions, FsOptions,
     GetxattrReply, ListxattrReply, OpenOptions, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
+    backends::deny::{self, DenyList},
     backends::shared::{
-        deny::{self, DenyList},
         handle_table::HandleData,
         init_binary,
         inode_table::{InodeAltKey, InodeData, MultikeyBTreeMap},

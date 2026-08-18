@@ -153,7 +153,7 @@ pub struct PassthroughFs {
     stat_store: Option<StatStore>,
     quota: Option<super::quota::DirQuota>,
     /// Matcher for the deny list (empty = allow everything).
-    deny: super::super::shared::deny::DenyList,
+    deny: super::super::deny::DenyList,
 }
 
 #[repr(C, packed)]
