@@ -75,34 +75,15 @@ impl DenyList {
     pub(crate) fn matches_path(&self, rel: &[u8]) -> bool {
         self.is_ignored(name_as_path(rel))
     }
-}
 
-//--------------------------------------------------------------------------------------------------
-// Functions
-//--------------------------------------------------------------------------------------------------
-
-impl DenyList {
     fn is_ignored(&self, path: &Path) -> bool {
         matches!(self.matcher.matched(path, false), Match::Ignore(_))
     }
 }
 
-/// Build a `Path` from raw entry-name bytes.
-///
-/// On Unix the bytes are used verbatim (arbitrary non-UTF8 names are legal);
-/// elsewhere they are treated lossily. The bytes must not contain a trailing
-/// NUL.
-fn name_as_path(bytes: &[u8]) -> &Path {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        Path::new(std::ffi::OsStr::from_bytes(bytes))
-    }
-    #[cfg(not(unix))]
-    {
-        Path::new(std::str::from_utf8(bytes).unwrap_or(""))
-    }
-}
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
 
 /// Join entry-name components into a relative `PathBuf`.
 ///
@@ -124,6 +105,23 @@ pub(crate) fn join_path(components: &[Vec<u8>]) -> PathBuf {
             path.push(String::from_utf8_lossy(component).into_owned());
         }
         path
+    }
+}
+
+/// Build a `Path` from raw entry-name bytes.
+///
+/// On Unix the bytes are used verbatim (arbitrary non-UTF8 names are legal);
+/// elsewhere they are treated lossily. The bytes must not contain a trailing
+/// NUL.
+fn name_as_path(bytes: &[u8]) -> &Path {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Path::new(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        Path::new(std::str::from_utf8(bytes).unwrap_or(""))
     }
 }
 
