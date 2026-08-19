@@ -429,9 +429,9 @@ impl PassthroughFs {
 impl PassthroughFs {
     /// Whether `name` in `parent` is denied by the deny list.
     ///
-    /// Fails open (returns `false`) when the parent-inode anchor chain
-    /// cannot be reconstructed so the mount does not break on partial
-    /// lookup races.
+    /// Fails closed (returns `true`) when the parent-inode path cannot be
+    /// reconstructed under active path patterns, so a deny list is never
+    /// silently bypassed on an unresolvable path.
     fn deny_matches_name(&self, parent: u64, name: &[u8]) -> bool {
         // The structural `.` and `..` entries must never be denied, otherwise a
         // `.*` or `*` pattern would break path walks and directory listings.
@@ -442,18 +442,36 @@ impl PassthroughFs {
             return self.deny.matches_basename(name);
         }
         // Reconstruct the mount-relative path for path-pattern matching.
-        let mut components = Vec::new();
-        if let Some(parent_components) =
+        let root = self.deny_root();
+        let Some(parent_components) =
             crate::backends::passthroughfs::unix::inode::parent_path_components(
                 &self.inodes,
                 parent,
+                root,
             )
-        {
-            components = parent_components;
-        }
+        else {
+            // Fail closed: an unresolvable parent path under active path
+            // patterns must deny, never allow.
+            return true;
+        };
+        let mut components = parent_components;
         components.push(name.to_vec());
         self.deny
             .matches_path(deny::join_path(&components).as_os_str().as_bytes())
+    }
+
+    /// Canonical mount root used to strip the root prefix when reconstructing
+    /// a mount-relative path on macOS.
+    #[cfg(target_os = "macos")]
+    fn deny_root(&self) -> &Path {
+        &self.root_path
+    }
+
+    /// Linux reconstructs mount-relative paths from the inode anchor chain,
+    /// so no separate root is needed.
+    #[cfg(target_os = "linux")]
+    fn deny_root(&self) -> &Path {
+        Path::new("/")
     }
 
     /// Whether this mount exposes the synthetic init binary.
