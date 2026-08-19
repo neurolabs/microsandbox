@@ -191,6 +191,11 @@ pub struct PassthroughFs {
     /// Open file descriptor for the root directory.
     pub(crate) root_fd: File,
 
+    /// Canonical host path of the mount root, used to strip the root prefix
+    /// when reconstructing mount-relative paths for deny matching (macOS only).
+    #[cfg(target_os = "macos")]
+    pub(crate) root_path: PathBuf,
+
     /// Inode table with dual-key lookup (FUSE inode + host identity).
     pub(crate) inodes: RwLock<MultikeyBTreeMap<u64, InodeAltKey, Arc<InodeData>>>,
 
@@ -312,9 +317,16 @@ impl PassthroughFs {
 
         let deny_patterns = cfg.deny.clone();
 
+        // Canonical host path of the mount root for deny path-pattern matching.
+        #[cfg(target_os = "macos")]
+        let root_path =
+            platform::path_from_fd(root_fd.as_raw_fd()).unwrap_or_else(|_| cfg.root_dir.clone());
+
         Ok(Self {
             cfg,
             root_fd,
+            #[cfg(target_os = "macos")]
+            root_path,
             inodes: RwLock::new(MultikeyBTreeMap::new()),
             next_inode: AtomicU64::new(3), // 1=root, 2=init
             handles: RwLock::new(BTreeMap::new()),
