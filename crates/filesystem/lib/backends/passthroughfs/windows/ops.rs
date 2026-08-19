@@ -82,7 +82,7 @@ impl DynFileSystem for PassthroughFs {
         _extensions: Extensions,
     ) -> io::Result<Entry> {
         self.require_writable()?;
-        if self.deny_matches_name(parent, name) {
+        if self.deny_matches_name(parent, name, true) {
             return Err(linux_error(LINUX_EACCES));
         }
         let path = self.child_path(parent, name)?;
@@ -111,7 +111,7 @@ impl DynFileSystem for PassthroughFs {
 
     fn unlink(&self, _ctx: Context, parent: u64, name: &CStr) -> io::Result<()> {
         self.require_writable()?;
-        if self.deny_matches_name(parent, name) {
+        if self.deny_matches_name(parent, name, false) {
             return Err(linux_error(LINUX_EACCES));
         }
         let path = self.child_path(parent, name)?;
@@ -130,7 +130,7 @@ impl DynFileSystem for PassthroughFs {
 
     fn rmdir(&self, _ctx: Context, parent: u64, name: &CStr) -> io::Result<()> {
         self.require_writable()?;
-        if self.deny_matches_name(parent, name) {
+        if self.deny_matches_name(parent, name, true) {
             return Err(linux_error(LINUX_EACCES));
         }
         let path = self.child_path(parent, name)?;
@@ -161,12 +161,28 @@ impl DynFileSystem for PassthroughFs {
             return Err(linux_error(LINUX_EOPNOTSUPP));
         }
 
-        if self.deny_matches_name(olddir, oldname) || self.deny_matches_name(newdir, newname) {
+        // A rename replaces the destination entry with the source's type, so
+        // the destination's effective type is the source's. Determine it once
+        // and use it for both deny checks so a dir-only pattern like
+        // `node_modules/` rejects renaming a directory to that name while still
+        // allowing a same-named file. Only needed when a path pattern is
+        // active; a component-only list (no `/`) cannot contain dir-only
+        // patterns.
+        let old_path = self.child_path(olddir, oldname)?;
+        let source_is_dir = if self.deny.has_path_patterns() {
+            self.safe_metadata(&old_path)
+                .map(|m| m.file_type().is_dir())
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if self.deny_matches_name(olddir, oldname, source_is_dir)
+            || self.deny_matches_name(newdir, newname, source_is_dir)
+        {
             return Err(linux_error(LINUX_EACCES));
         }
 
-        let old_path = self.child_path(olddir, oldname)?;
-        self.safe_metadata(&old_path)?;
         let new_path = self.child_path(newdir, newname)?;
         let new_parent = new_path.parent().ok_or_else(|| linux_error(LINUX_EINVAL))?;
         let parent_metadata = self.safe_metadata(new_parent)?;

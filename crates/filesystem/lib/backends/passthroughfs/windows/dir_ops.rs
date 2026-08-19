@@ -58,7 +58,11 @@ impl PassthroughFs {
                 .map_err(|_| linux_error(LINUX_EINVAL))?;
             validate_component(name)?;
 
-            if self.deny_matches_name(inode, name) {
+            if self.deny_matches_name(
+                inode,
+                name,
+                entry.file_type().map(|t| t.is_dir()).unwrap_or(false),
+            ) {
                 continue;
             }
 
@@ -155,7 +159,11 @@ impl PassthroughFs {
                 .map_err(|_| linux_error(LINUX_EINVAL))?;
             validate_component(name)?;
 
-            if self.deny_matches_name(inode, name) {
+            if self.deny_matches_name(
+                inode,
+                name,
+                entry.file_type().map(|t| t.is_dir()).unwrap_or(false),
+            ) {
                 continue;
             }
 

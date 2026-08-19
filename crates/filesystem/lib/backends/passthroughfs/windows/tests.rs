@@ -1,6 +1,7 @@
 //! Tests for the Windows passthrough backend.
 
 use super::*;
+use std::ffi::CStr;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::windows::fs::FileExt;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1122,6 +1123,20 @@ fn deny_basename_lookup_hidden() {
     fs.lookup(context(), ROOT_INODE, c"visible.txt").unwrap();
 }
 
+/// On a case-insensitive filesystem (the Windows default), a denied basename is
+/// also hidden under a differently-cased variant: `.env` must hide `.ENV` and
+/// `.Env`, because the host resolves all of them to the same file. Without this,
+/// a guest could bypass the deny list by requesting a case variant.
+#[test]
+fn deny_basename_hides_case_variant() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join(".env"), b"secret").unwrap();
+    let fs = fs_for_deny(&temp.path, vec![".env".to_string()]);
+
+    expect_errno(fs.lookup(context(), ROOT_INODE, c".ENV"), LINUX_ENOENT);
+    expect_errno(fs.lookup(context(), ROOT_INODE, c".Env"), LINUX_ENOENT);
+}
+
 /// Creating a denied basename returns EACCES.
 #[test]
 fn deny_basename_create_rejected() {
@@ -1302,6 +1317,22 @@ fn deny_path_pattern_nested() {
 
     // A sibling in the same directory is visible.
     fs.lookup(context(), dir.inode, c"visible.txt").unwrap();
+}
+
+/// A non-UTF-8 leaf name is denied (fails closed) under active path patterns,
+/// rather than silently bypassing the deny list because it cannot be decoded.
+#[test]
+fn deny_path_pattern_non_utf8_name_fails_closed() {
+    let temp = TempDir::new();
+    let fs = fs_for_deny(&temp.path, vec!["sub/secret".to_string()]);
+
+    // The parent directory is reachable.
+    let dir = fs.lookup(context(), ROOT_INODE, c"sub").unwrap();
+
+    // A name that is not valid UTF-8 cannot be matched against a path pattern,
+    // so it must be denied rather than allowed through.
+    let name = CStr::from_bytes_with_nul(b"secret\xff\0").unwrap();
+    expect_errno(fs.lookup(context(), dir.inode, name), LINUX_ENOENT);
 }
 
 /// Non-denied names remain fully read-write.

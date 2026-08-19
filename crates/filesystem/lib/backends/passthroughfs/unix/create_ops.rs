@@ -64,7 +64,7 @@ pub(crate) fn do_create(
         return Err(platform::eacces());
     }
 
-    if fs.deny_matches_name(parent, name.to_bytes()) {
+    if fs.deny_matches_name(parent, name.to_bytes(), false) {
         return Err(platform::eacces());
     }
 
@@ -177,7 +177,7 @@ pub(crate) fn do_mkdir(
         return Err(platform::eacces());
     }
 
-    if fs.deny_matches_name(parent, name.to_bytes()) {
+    if fs.deny_matches_name(parent, name.to_bytes(), true) {
         return Err(platform::eacces());
     }
 
@@ -242,7 +242,7 @@ pub(crate) fn do_mknod(
         return Err(platform::eacces());
     }
 
-    if fs.deny_matches_name(parent, name.to_bytes()) {
+    if fs.deny_matches_name(parent, name.to_bytes(), false) {
         return Err(platform::eacces());
     }
 
@@ -339,7 +339,7 @@ pub(crate) fn do_symlink(
         return Err(platform::eacces());
     }
 
-    if fs.deny_matches_name(parent, name.to_bytes()) {
+    if fs.deny_matches_name(parent, name.to_bytes(), false) {
         return Err(platform::eacces());
     }
 
@@ -458,7 +458,7 @@ pub(crate) fn do_link(
         return Err(platform::eacces());
     }
 
-    if fs.deny_matches_name(newparent, newname.to_bytes()) {
+    if fs.deny_matches_name(newparent, newname.to_bytes(), false) {
         return Err(platform::eacces());
     }
 

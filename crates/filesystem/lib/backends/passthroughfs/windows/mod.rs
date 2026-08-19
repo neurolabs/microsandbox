@@ -213,10 +213,15 @@ impl PassthroughFs {
     /// Whether `name` in `parent` is denied by the deny list.
     ///
     /// Uses the parent inode's stored host path to reconstruct the
-    /// mount-relative path for path-pattern matching. Fails open (returns
-    /// `false`) when the parent cannot be resolved so the mount does not
-    /// break on partial lookup races.
-    pub(super) fn deny_matches_name(&self, parent: u64, name: &CStr) -> bool {
+    /// mount-relative path for path-pattern matching. Fails closed (returns
+    /// `true`) when the parent path or the leaf name cannot be resolved under
+    /// active path patterns, so a deny list is never silently bypassed on an
+    /// undecodable name.
+    ///
+    /// `is_dir` reports whether the entry is a directory. Directory-only deny
+    /// patterns (trailing `/`, e.g. `node_modules/`) match directories but not
+    /// same-named files, so callers must pass the entry's actual type.
+    pub(super) fn deny_matches_name(&self, parent: u64, name: &CStr, is_dir: bool) -> bool {
         let name_bytes = name.to_bytes();
         // The structural `.` and `..` entries must never be denied, otherwise a
         // `.*` or `*` pattern would break path walks and directory listings.
@@ -224,10 +229,12 @@ impl PassthroughFs {
             return false;
         }
         if !self.deny.has_path_patterns() {
-            return self.deny.matches_basename(name_bytes);
+            return self.deny.matches_basename(name_bytes, is_dir);
         }
         let Ok(parent_data) = self.inode(parent) else {
-            return false;
+            // Fail closed: an unresolvable parent under active path patterns
+            // must deny, never allow.
+            return true;
         };
         // Reconstruct a '/' -separated mount-relative path for gitignore matching.
         let rel = parent_data
@@ -243,13 +250,16 @@ impl PassthroughFs {
                 rel_str.push_str(&part.to_string_lossy());
             }
         }
-        if let Ok(name_str) = std::str::from_utf8(name_bytes) {
-            if !rel_str.is_empty() {
-                rel_str.push('/');
-            }
-            rel_str.push_str(name_str);
+        let Ok(name_str) = std::str::from_utf8(name_bytes) else {
+            // Fail closed: a name that cannot be decoded to UTF-8 cannot be
+            // matched against a path pattern, so it must deny, never allow.
+            return true;
+        };
+        if !rel_str.is_empty() {
+            rel_str.push('/');
         }
-        self.deny.matches_path(rel_str.as_bytes())
+        rel_str.push_str(name_str);
+        self.deny.matches_path(rel_str.as_bytes(), is_dir)
     }
 }
 

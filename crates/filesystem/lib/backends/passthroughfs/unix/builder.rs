@@ -219,7 +219,7 @@ impl PassthroughFsBuilder {
             .quota_bytes
             .map(|limit| super::super::quota::DirQuota::new(cfg.root_dir.clone(), limit));
 
-        let deny_list = super::super::deny::DenyList::new(&self.deny);
+        let deny_list = super::super::deny::DenyList::new(&cfg.root_dir, &self.deny);
 
         Ok(PassthroughFs {
             cfg,

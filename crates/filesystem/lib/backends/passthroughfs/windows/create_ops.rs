@@ -17,7 +17,7 @@ impl PassthroughFs {
         umask: u32,
     ) -> io::Result<(Entry, Option<u64>, OpenOptions)> {
         self.require_writable()?;
-        if self.deny_matches_name(parent, name) {
+        if self.deny_matches_name(parent, name, false) {
             return Err(linux_error(LINUX_EACCES));
         }
         let path = self.child_path(parent, name)?;
@@ -73,7 +73,7 @@ impl PassthroughFs {
         umask: u32,
     ) -> io::Result<Entry> {
         self.require_writable()?;
-        if self.deny_matches_name(parent, name) {
+        if self.deny_matches_name(parent, name, false) {
             return Err(linux_error(LINUX_EACCES));
         }
         let path = self.child_path(parent, name)?;
@@ -123,7 +123,7 @@ impl PassthroughFs {
             return Err(linux_error(LINUX_EOPNOTSUPP));
         }
 
-        if self.deny_matches_name(parent, name) {
+        if self.deny_matches_name(parent, name, false) {
             return Err(linux_error(LINUX_EACCES));
         }
 
@@ -194,7 +194,7 @@ impl PassthroughFs {
             return Err(linux_error(LINUX_EACCES));
         }
 
-        if self.deny_matches_name(newparent, newname) {
+        if self.deny_matches_name(newparent, newname, false) {
             return Err(linux_error(LINUX_EACCES));
         }
 

@@ -43,7 +43,7 @@ pub(crate) fn do_unlink(
         return Err(platform::eacces());
     }
 
-    if fs.deny_matches_name(parent, name.to_bytes()) {
+    if fs.deny_matches_name(parent, name.to_bytes(), false) {
         return Err(platform::eacces());
     }
 
@@ -160,7 +160,7 @@ pub(crate) fn do_rmdir(
         return Err(platform::eacces());
     }
 
-    if fs.deny_matches_name(parent, name.to_bytes()) {
+    if fs.deny_matches_name(parent, name.to_bytes(), true) {
         return Err(platform::eacces());
     }
 
@@ -244,15 +244,29 @@ pub(crate) fn do_rename(
         return Err(platform::eacces());
     }
 
+    // A rename replaces the destination entry with the source's type, so the
+    // destination's effective type is the source's. Determine it once (without
+    // following a symlink) and use it for both deny checks so a dir-only
+    // pattern like `node_modules/` rejects renaming a directory to that name
+    // while still allowing a same-named file. Only needed when a path pattern
+    // is active; a component-only list (no `/`) cannot contain dir-only
+    // patterns.
+    let old_fd = inode::get_inode_fd(fs, olddir)?;
+    let new_fd = inode::get_inode_fd(fs, newdir)?;
+    let source_is_dir = if fs.deny.has_path_patterns() {
+        platform::fstatat_nofollow(old_fd.raw(), oldname)
+            .map(|st| platform::mode_file_type(st.st_mode) == platform::MODE_DIR)
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
     // Deny rename to/from a denied path.
-    if fs.deny_matches_name(olddir, oldname.to_bytes())
-        || fs.deny_matches_name(newdir, newname.to_bytes())
+    if fs.deny_matches_name(olddir, oldname.to_bytes(), source_is_dir)
+        || fs.deny_matches_name(newdir, newname.to_bytes(), source_is_dir)
     {
         return Err(platform::eacces());
     }
-
-    let old_fd = inode::get_inode_fd(fs, olddir)?;
-    let new_fd = inode::get_inode_fd(fs, newdir)?;
 
     #[cfg(target_os = "linux")]
     {

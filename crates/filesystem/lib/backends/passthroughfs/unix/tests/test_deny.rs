@@ -24,6 +24,32 @@ fn test_deny_basename_lookup() {
 }
 
 //--------------------------------------------------------------------------------------------------
+// Tests: case-sensitivity follows the host filesystem
+//--------------------------------------------------------------------------------------------------
+
+/// On a case-sensitive filesystem (the default for the Linux test temp dir),
+/// deny matching stays byte-exact: `.env` does not hide a differently-cased
+/// `.ENV`, because the host would treat those as distinct files. Over-folding
+/// here would wrongly hide legitimate distinct files.
+#[test]
+fn test_deny_case_variant_not_hidden_on_case_sensitive_fs() {
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec![".env".to_string()],
+        ..cfg
+    });
+    sb.host_create_file(".ENV", b"case variant");
+
+    // On a case-sensitive root the differently-cased name is a distinct file
+    // and is served. On a case-insensitive host the probe folds and this lookup
+    // would be ENOENT; that branch is covered by the Windows test suite.
+    let entry = sb.lookup_root(".ENV");
+    assert!(
+        entry.is_ok(),
+        "case-sensitive host must not fold a denied basename over a distinct file"
+    );
+}
+
+//--------------------------------------------------------------------------------------------------
 // Tests: structural `.`/`..` entries are never denied
 //--------------------------------------------------------------------------------------------------
 
@@ -330,8 +356,155 @@ fn test_deny_path_pattern_create() {
 }
 
 //--------------------------------------------------------------------------------------------------
-// Tests: rename from a denied source name
+// Tests: dir-only patterns (trailing `/`, e.g. `node_modules/`)
 //--------------------------------------------------------------------------------------------------
+
+/// A dir-only pattern hides a directory on lookup.
+#[test]
+fn test_deny_dir_only_lookup_hides_directory() {
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec!["node_modules/".to_string()],
+        ..cfg
+    });
+    sb.host_create_dir("node_modules");
+    sb.host_create_dir("visible_dir");
+
+    // A directory named node_modules is hidden.
+    TestSandbox::assert_errno(sb.lookup_root("node_modules"), LINUX_ENOENT);
+    assert_ne!(sb.lookup_root("visible_dir").unwrap().inode, 0);
+}
+
+/// A dir-only pattern does not hide a same-named file on lookup.
+#[test]
+fn test_deny_dir_only_lookup_serves_same_named_file() {
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec!["node_modules/".to_string()],
+        ..cfg
+    });
+    sb.host_create_file("node_modules", b"not a dir");
+
+    // A file named node_modules is served (gitignore 'foo/' does not match files).
+    let entry = sb.lookup_root("node_modules").unwrap();
+    assert_ne!(entry.inode, 0);
+}
+
+/// A dir-only pattern allows creating a same-named file but rejects mkdir.
+#[test]
+fn test_deny_dir_only_mkdir_rejected_but_file_create_allowed() {
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec!["node_modules/".to_string()],
+        ..cfg
+    });
+
+    // mkdir of a denied directory name is rejected.
+    TestSandbox::assert_errno(sb.fuse_mkdir_root("node_modules"), LINUX_EACCES);
+
+    // A same-named file create is allowed (gitignore 'foo/' does not match files).
+    let (entry, _handle) = sb.fuse_create_root("node_modules").unwrap();
+    assert_ne!(entry.inode, 0);
+
+    // And a different directory name is allowed.
+    sb.fuse_mkdir_root("other_dir").unwrap();
+}
+
+/// A dir-only pattern omits the directory from readdir but keeps a same-named file.
+#[test]
+fn test_deny_dir_only_readdir_keeps_same_named_file() {
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec!["node_modules/".to_string()],
+        ..cfg
+    });
+    sb.host_create_dir("node_modules");
+    sb.host_create_dir("visible_dir");
+    sb.host_create_file("visible.txt", b"ok");
+
+    let handle = sb.fuse_opendir(ROOT_INODE).unwrap();
+    let entries = sb
+        .fs
+        .readdir(sb.ctx(), ROOT_INODE, handle, 4096, 0)
+        .unwrap();
+    let names: Vec<&[u8]> = entries.iter().map(|e| &e.name[..]).collect();
+
+    assert!(
+        !names.contains(&b"node_modules".as_slice()),
+        "directory node_modules should be hidden from readdir by 'node_modules/'"
+    );
+    assert!(names.contains(&b"visible_dir".as_slice()));
+    assert!(names.contains(&b"visible.txt".as_slice()));
+}
+
+/// A dir-only pattern rejects renaming a directory to the denied name but
+/// allows renaming a same-named file there.
+#[test]
+fn test_deny_dir_only_rename_dir_rejected_file_allowed() {
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec!["node_modules/".to_string()],
+        ..cfg
+    });
+
+    // A source directory cannot be renamed to the denied name.
+    sb.fuse_mkdir_root("src_dir").unwrap();
+    TestSandbox::assert_errno(
+        sb.fs.rename(
+            sb.ctx(),
+            ROOT_INODE,
+            &TestSandbox::cstr("src_dir"),
+            ROOT_INODE,
+            &TestSandbox::cstr("node_modules"),
+            0,
+        ),
+        LINUX_EACCES,
+    );
+
+    // A source file CAN be renamed to the denied name (it becomes a file, not a dir).
+    let (_entry, _handle) = sb.fuse_create_root("src_file").unwrap();
+    sb.fs
+        .rename(
+            sb.ctx(),
+            ROOT_INODE,
+            &TestSandbox::cstr("src_file"),
+            ROOT_INODE,
+            &TestSandbox::cstr("node_modules"),
+            0,
+        )
+        .unwrap();
+    // It is now a file named node_modules and remains visible.
+    let entry = sb.lookup_root("node_modules").unwrap();
+    assert_ne!(entry.inode, 0);
+}
+
+/// A dir-only pattern rejects rmdir of the denied directory.
+#[test]
+fn test_deny_dir_only_rmdir_rejected() {
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec!["node_modules/".to_string()],
+        ..cfg
+    });
+
+    sb.host_create_dir("node_modules");
+    TestSandbox::assert_errno(
+        sb.fs
+            .rmdir(sb.ctx(), ROOT_INODE, &TestSandbox::cstr("node_modules")),
+        LINUX_EACCES,
+    );
+}
+
+/// A dir-only pattern allows unlink of a same-named file (gitignore 'foo/'
+/// does not match files).
+#[test]
+fn test_deny_dir_only_unlink_same_named_file_allowed() {
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec!["node_modules/".to_string()],
+        ..cfg
+    });
+
+    // A file named node_modules (not a directory) can be removed.
+    let (_entry, _handle) = sb.fuse_create_root("node_modules").unwrap();
+    sb.fs
+        .unlink(sb.ctx(), ROOT_INODE, &TestSandbox::cstr("node_modules"))
+        .unwrap();
+    TestSandbox::assert_errno(sb.lookup_root("node_modules"), LINUX_ENOENT);
+}
 
 /// Renaming a denied source name away is rejected.
 #[test]

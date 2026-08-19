@@ -317,6 +317,8 @@ impl PassthroughFs {
 
         let deny_patterns = cfg.deny.clone();
 
+        let deny = DenyList::new(&cfg.root_dir, &deny_patterns);
+
         // Canonical host path of the mount root for deny path-pattern matching.
         #[cfg(target_os = "macos")]
         let root_path =
@@ -339,7 +341,7 @@ impl PassthroughFs {
             #[cfg(target_os = "linux")]
             proc_self_fd,
             quota,
-            deny: DenyList::new(&deny_patterns),
+            deny,
         })
     }
 }
@@ -429,17 +431,21 @@ impl PassthroughFs {
 impl PassthroughFs {
     /// Whether `name` in `parent` is denied by the deny list.
     ///
+    /// `is_dir` reports whether the entry is a directory. Directory-only deny
+    /// patterns (trailing `/`, e.g. `node_modules/`) match directories but not
+    /// same-named files, so callers must pass the entry's actual type.
+    ///
     /// Fails closed (returns `true`) when the parent-inode path cannot be
     /// reconstructed under active path patterns, so a deny list is never
     /// silently bypassed on an unresolvable path.
-    fn deny_matches_name(&self, parent: u64, name: &[u8]) -> bool {
+    fn deny_matches_name(&self, parent: u64, name: &[u8], is_dir: bool) -> bool {
         // The structural `.` and `..` entries must never be denied, otherwise a
         // `.*` or `*` pattern would break path walks and directory listings.
         if name == b"." || name == b".." {
             return false;
         }
         if !self.deny.has_path_patterns() {
-            return self.deny.matches_basename(name);
+            return self.deny.matches_basename(name, is_dir);
         }
         // Reconstruct the mount-relative path for path-pattern matching.
         let root = self.deny_root();
@@ -457,7 +463,7 @@ impl PassthroughFs {
         let mut components = parent_components;
         components.push(name.to_vec());
         self.deny
-            .matches_path(deny::join_path(&components).as_os_str().as_bytes())
+            .matches_path(deny::join_path(&components).as_os_str().as_bytes(), is_dir)
     }
 
     /// Canonical mount root used to strip the root prefix when reconstructing

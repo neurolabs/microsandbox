@@ -220,11 +220,24 @@ pub(crate) fn vol_path(dev: u64, ino: u64) -> std::ffi::CString {
 pub(crate) fn do_lookup(fs: &PassthroughFs, parent: u64, name: &CStr) -> io::Result<Entry> {
     crate::backends::shared::name_validation::validate_name(name)?;
 
-    if fs.deny_matches_name(parent, name.to_bytes()) {
+    // Determine the child's type (without following a symlink) so a dir-only
+    // path pattern like `node_modules/` hides the directory but not a
+    // same-named file. Only needed when a path pattern is active; a
+    // component-only list (no `/`) cannot contain dir-only patterns. If the
+    // child cannot be stat'ed, treat it as a non-dir and let the lookup below
+    // surface the real error.
+    let parent_fd = get_inode_fd(fs, parent)?;
+    let is_dir = if fs.deny.has_path_patterns() {
+        platform::fstatat_nofollow(parent_fd.raw(), name)
+            .map(|st| platform::mode_file_type(st.st_mode) == platform::MODE_DIR)
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    if fs.deny_matches_name(parent, name.to_bytes(), is_dir) {
         return Err(platform::enoent());
     }
-
-    let parent_fd = get_inode_fd(fs, parent)?;
 
     #[cfg(target_os = "linux")]
     return do_lookup_linux(fs, parent, parent_fd.raw(), name);
