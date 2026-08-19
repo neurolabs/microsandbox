@@ -1055,7 +1055,8 @@ pub(crate) fn stat_inode(fs: &PassthroughFs, inode: u64) -> io::Result<stat64> {
 ///
 /// Uses read locks so it can be called from any context without requiring
 /// write access. Returns `None` when the anchor chain is broken so the
-/// caller can fail-open (allow access) rather than break the mount.
+/// caller can fail closed. The `_root` argument is unused on Linux (the
+/// anchor chain is already mount-relative).
 #[cfg(target_os = "linux")]
 pub(crate) fn parent_path_components(
     inodes: &std::sync::RwLock<
@@ -1066,6 +1067,7 @@ pub(crate) fn parent_path_components(
         >,
     >,
     inode: u64,
+    _root: &std::path::Path,
 ) -> Option<Vec<Vec<u8>>> {
     let inodes_locked = inodes.read().unwrap();
     _parent_path_components_locked(&inodes_locked, inode, &mut std::collections::HashSet::new())
@@ -1104,21 +1106,43 @@ fn _parent_path_components_locked(
     Some(components)
 }
 
-/// Reconstruct the mount-relative path components for an inode by walking
-/// `anchor_parent` + `anchor_name` from the inode up to root.
+/// Reconstruct the mount-relative path components for an inode on macOS by
+/// resolving its real host path via `/.vol/<dev>/<ino>` + `F_GETPATH`, then
+/// stripping the canonical mount root.
+///
+/// Returns `None` when the inode is absent from the table or its host path
+/// cannot be resolved (e.g. after unlink), so the caller can fail closed.
 #[cfg(target_os = "macos")]
 pub(crate) fn parent_path_components(
-    _inodes: &std::sync::RwLock<
+    inodes: &std::sync::RwLock<
         crate::backends::shared::inode_table::MultikeyBTreeMap<
             u64,
             crate::backends::shared::inode_table::InodeAltKey,
             std::sync::Arc<crate::backends::shared::inode_table::InodeData>,
         >,
     >,
-    _inode: u64,
+    inode: u64,
+    root: &std::path::Path,
 ) -> Option<Vec<Vec<u8>>> {
-    // macOS inodes do not carry anchor data — the chain cannot be reconstructed.
-    // Return an empty list so the caller denies path-pattern matching and falls
-    // back to basename-only matching, which is the safe fail-open default.
-    Some(Vec::new())
+    use std::os::unix::ffi::OsStrExt;
+
+    let dev;
+    let ino;
+    {
+        let inodes_locked = inodes.read().unwrap();
+        let data = inodes_locked.get(&inode)?;
+        dev = data.dev;
+        ino = data.ino;
+    }
+
+    let host = crate::backends::shared::platform::path_from_vol(dev, ino).ok()?;
+    let rel = host.strip_prefix(root).ok()?;
+
+    let mut components = Vec::new();
+    for part in rel.components() {
+        if let std::path::Component::Normal(part) = part {
+            components.push(part.as_bytes().to_vec());
+        }
+    }
+    Some(components)
 }
