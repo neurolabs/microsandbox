@@ -21,6 +21,9 @@
 
 use std::{io, os::fd::RawFd};
 
+#[cfg(target_os = "macos")]
+use std::os::unix::ffi::OsStringExt;
+
 use crate::{SetattrValid, stat64};
 
 //--------------------------------------------------------------------------------------------------
@@ -495,6 +498,40 @@ pub(crate) fn stat_dev(st: &stat64) -> u64 {
 #[cfg(target_os = "macos")]
 pub(crate) fn stat_dev(st: &stat64) -> u64 {
     st.st_dev as u64
+}
+
+/// Resolve the real host path of an open file descriptor (macOS only).
+///
+/// Uses `fcntl(F_GETPATH)`, which returns the canonical absolute path for
+/// the open file. Returns an error if the fd does not refer to a path.
+#[cfg(target_os = "macos")]
+pub(crate) fn path_from_fd(fd: RawFd) -> io::Result<std::path::PathBuf> {
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    let ret = unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr() as *mut libc::c_char) };
+    if ret < 0 {
+        return Err(linux_error(io::Error::last_os_error()));
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    buf.truncate(len);
+    Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(buf)))
+}
+
+/// Resolve the real host path of an inode by `dev`/`ino` via `/.vol` (macOS only).
+///
+/// `/.vol/<dev>/<ino>` addresses a file by identity and is stable across
+/// renames. Returns an error when the file no longer exists under that
+/// identity (e.g. after unlink).
+#[cfg(target_os = "macos")]
+pub(crate) fn path_from_vol(dev: u64, ino: u64) -> io::Result<std::path::PathBuf> {
+    let vol = std::ffi::CString::new(format!("/.vol/{dev}/{ino}"))
+        .expect("formatted /.vol path never contains interior nul");
+    let fd = unsafe { libc::open(vol.as_ptr(), libc::O_RDONLY) };
+    if fd < 0 {
+        return Err(linux_error(io::Error::last_os_error()));
+    }
+    let result = path_from_fd(fd);
+    unsafe { libc::close(fd) };
+    result
 }
 
 /// Read the target of a symlink opened by file descriptor (Linux only).
