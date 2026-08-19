@@ -4,6 +4,8 @@ mod test_config;
 mod test_corrupt_xattr;
 mod test_create_ops;
 mod test_deny;
+#[cfg(target_os = "macos")]
+mod test_deny_macos;
 mod test_dir_ops;
 mod test_file_ops;
 mod test_flag_translation;
