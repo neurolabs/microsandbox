@@ -375,7 +375,7 @@ Mounts use normal Linux behavior by default: writable, executable, suid-enabled,
 - `noexec` when files on the mount should not be executed directly.
 - `nosuid` when setuid/setgid bits should be ignored.
 - `nodev` when device files should be ignored.
-- `deny=<pattern>` hides host paths matching a gitignore-style pattern from the guest: matching entries are invisible (ENOENT) and writes to them are forbidden (EACCES). Patterns are relative to the mount root and may be names (`.env`, `*.log`) or paths (`sub/secret`). Repeatable to deny several patterns.
+- `deny=<pattern>` hides host paths matching a gitignore-style pattern from the guest: matching entries are invisible (ENOENT) and writes to them are forbidden (EACCES). Patterns are relative to the mount root and may be names (`.env`, `*.log`) or paths (`sub/secret`). Repeatable to deny several patterns. Name and path patterns are enforced on every host platform (Linux, macOS, and Windows).
 
 `noexec` does not stop interpreters from reading scripts from the mount, for example `sh /app/src/script.sh`.
 
