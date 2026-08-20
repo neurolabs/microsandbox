@@ -286,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn path_pattern_does_not_match_basename() {
+    fn path_pattern_does_not_match_bare_component() {
         let list = deny(&["dir/secret"]);
         assert!(!list.matches_path(b"secret", false));
     }

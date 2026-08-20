@@ -104,9 +104,9 @@ impl PassthroughFs {
 
         // Determine the child's type so a dir-only deny pattern like
         // `node_modules/` hides the directory but not a same-named file. Only
-        // needed when a path pattern is active; a component-only list (no `/`)
-        // cannot contain dir-only patterns. If the child cannot be stat'ed,
-        // treat it as a non-dir and let the lookup below surface the real error.
+        // needed when a dir-only pattern is active. If the child cannot be
+        // stat'ed, treat it as a non-dir and let the lookup below surface the
+        // real error.
         let path = self.child_path(parent, name)?;
         let is_dir = if self.deny.has_dir_only_patterns() {
             self.safe_metadata(&path)
