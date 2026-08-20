@@ -1467,7 +1467,7 @@ mod tests {
 
     #[test]
     fn test_mount_builder_deny_rejects_wire_separators() {
-        for bad in [",", ":", "\n"] {
+        for bad in [",", ":", "\n", "\0"] {
             let err = MountBuilder::new("/data")
                 .bind("/host/data")
                 .deny([format!("a{bad}b")])

@@ -248,9 +248,7 @@ pub(crate) fn do_rename(
     // destination's effective type is the source's. Determine it once (without
     // following a symlink) and use it for both deny checks so a dir-only
     // pattern like `node_modules/` rejects renaming a directory to that name
-    // while still allowing a same-named file. Only needed when a path pattern
-    // is active; a component-only list (no `/`) cannot contain dir-only
-    // patterns.
+    // while still allowing a same-named file.
     let old_fd = inode::get_inode_fd(fs, olddir)?;
     let new_fd = inode::get_inode_fd(fs, newdir)?;
     let source_is_dir = if fs.deny.has_path_patterns() {
@@ -266,6 +264,20 @@ pub(crate) fn do_rename(
         || fs.deny_matches_name(newdir, newname.to_bytes(), source_is_dir)
     {
         return Err(platform::eacces());
+    }
+
+    // A rename whose destination already exists as a *directory* denied by a
+    // dir-only pattern (e.g. `node_modules/`) would otherwise fall through to
+    // the syscall and surface a raw EISDIR/ENOTDIR, leaking the hidden entry's
+    // existence and type. A source file never matches a dir-only pattern, so
+    // the source-type check above cannot catch this; reject it explicitly.
+    if fs.deny.has_path_patterns() {
+        let dest_is_dir = platform::fstatat_nofollow(new_fd.raw(), newname)
+            .map(|st| platform::mode_file_type(st.st_mode) == platform::MODE_DIR)
+            .unwrap_or(false);
+        if dest_is_dir && fs.deny_matches_name(newdir, newname.to_bytes(), true) {
+            return Err(platform::eacces());
+        }
     }
 
     #[cfg(target_os = "linux")]

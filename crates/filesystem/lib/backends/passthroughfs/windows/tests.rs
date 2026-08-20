@@ -1244,6 +1244,68 @@ fn deny_rename_to_denied_target() {
     .unwrap();
 }
 
+/// Renaming a file over an already-hidden directory returns EACCES (parity
+/// with the unix dir-only rename-over-hidden-dir test), rather than leaking
+/// the hidden directory's existence through a raw EISDIR.
+#[test]
+fn deny_rename_file_over_hidden_dir_rejected() {
+    let temp = TempDir::new();
+    std::fs::create_dir(temp.path.join("node_modules")).unwrap();
+    let fs = fs_for_deny(&temp.path, vec!["node_modules/".to_string()]);
+
+    fs.create(
+        context(),
+        ROOT_INODE,
+        c"source.txt",
+        S_IFREG | 0o644,
+        false,
+        (LINUX_O_CREAT | LINUX_O_RDWR) as u32,
+        0,
+        Extensions::default(),
+    )
+    .unwrap();
+
+    // A file source never matches `node_modules/`, so only the destination
+    // type check can reject this; it must surface EACCES, not EISDIR.
+    expect_errno(
+        fs.rename(
+            context(),
+            ROOT_INODE,
+            c"source.txt",
+            ROOT_INODE,
+            c"node_modules",
+            0,
+        ),
+        LINUX_EACCES,
+    );
+}
+
+/// Renaming a directory onto an already-hidden file returns EACCES (parity
+/// with the unix test). A basename pattern matches both files and directories,
+/// so the source-type check catches this rather than leaking the hidden file
+/// through a raw ENOTDIR.
+#[test]
+fn deny_rename_dir_over_hidden_file_rejected() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join(".env"), b"secret").unwrap();
+    let fs = fs_for_deny(&temp.path, vec![".env".to_string()]);
+
+    fs.mkdir(
+        context(),
+        ROOT_INODE,
+        c"src_dir",
+        S_IFDIR | 0o755,
+        0,
+        Extensions::default(),
+    )
+    .unwrap();
+
+    expect_errno(
+        fs.rename(context(), ROOT_INODE, c"src_dir", ROOT_INODE, c".env", 0),
+        LINUX_EACCES,
+    );
+}
+
 /// Unlink of a denied name returns EACCES.
 #[test]
 fn deny_unlink_rejected() {
@@ -1317,6 +1379,58 @@ fn deny_path_pattern_nested() {
 
     // A sibling in the same directory is visible.
     fs.lookup(context(), dir.inode, c"visible.txt").unwrap();
+}
+
+/// A recursive path pattern hides nested matches at any depth (parity with the
+/// unix `**/env.secret` test).
+#[test]
+fn deny_recursive_path_pattern_nested() {
+    let temp = TempDir::new();
+    std::fs::create_dir_all(temp.path.join("a").join("b")).unwrap();
+    std::fs::write(temp.path.join("a").join("b").join("env.secret"), b"secret").unwrap();
+    let fs = fs_for_deny(&temp.path, vec!["**/env.secret".to_string()]);
+
+    let a = fs.lookup(context(), ROOT_INODE, c"a").unwrap();
+    let b = fs.lookup(context(), a.inode, c"b").unwrap();
+    expect_errno(fs.lookup(context(), b.inode, c"env.secret"), LINUX_ENOENT);
+}
+
+/// Path patterns gate create within a hidden subtree (parity with the unix
+/// `sub/.secret` create test).
+#[test]
+fn deny_path_pattern_create_rejected_in_hidden_subtree() {
+    let temp = TempDir::new();
+    std::fs::create_dir(temp.path.join("sub")).unwrap();
+    let fs = fs_for_deny(&temp.path, vec!["sub/.secret".to_string()]);
+
+    let dir = fs.lookup(context(), ROOT_INODE, c"sub").unwrap();
+    let flags = (LINUX_O_CREAT | LINUX_O_RDWR) as u32;
+    expect_errno(
+        fs.create(
+            context(),
+            dir.inode,
+            c".secret",
+            S_IFREG | 0o644,
+            false,
+            flags,
+            0,
+            Extensions::default(),
+        ),
+        LINUX_EACCES,
+    );
+
+    // A sibling create in the same directory is unaffected.
+    fs.create(
+        context(),
+        dir.inode,
+        c"normal.txt",
+        S_IFREG | 0o644,
+        false,
+        flags,
+        0,
+        Extensions::default(),
+    )
+    .unwrap();
 }
 
 /// A non-UTF-8 leaf name is denied (fails closed) under active path patterns,

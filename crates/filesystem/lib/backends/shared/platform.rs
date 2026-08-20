@@ -516,6 +516,17 @@ pub(crate) fn path_from_fd(fd: RawFd) -> io::Result<std::path::PathBuf> {
     Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(buf)))
 }
 
+/// Build a `/.vol/<dev>/<ino>` identity path as a `CString` (macOS only).
+///
+/// `/.vol/<dev>/<ino>` addresses a file by identity and is stable across
+/// renames. This is the single source for the `/.vol` path format used across
+/// the passthrough backends.
+#[cfg(target_os = "macos")]
+pub(crate) fn vol_path(dev: u64, ino: u64) -> std::ffi::CString {
+    std::ffi::CString::new(format!("/.vol/{dev}/{ino}"))
+        .expect("formatted /.vol path never contains interior nul")
+}
+
 /// Resolve the real host path of an inode by `dev`/`ino` via `/.vol` (macOS only).
 ///
 /// `/.vol/<dev>/<ino>` addresses a file by identity and is stable across
@@ -523,8 +534,7 @@ pub(crate) fn path_from_fd(fd: RawFd) -> io::Result<std::path::PathBuf> {
 /// identity (e.g. after unlink).
 #[cfg(target_os = "macos")]
 pub(crate) fn path_from_vol(dev: u64, ino: u64) -> io::Result<std::path::PathBuf> {
-    let vol = std::ffi::CString::new(format!("/.vol/{dev}/{ino}"))
-        .expect("formatted /.vol path never contains interior nul");
+    let vol = vol_path(dev, ino);
     let fd = unsafe { libc::open(vol.as_ptr(), libc::O_RDONLY) };
     if fd < 0 {
         return Err(linux_error(io::Error::last_os_error()));

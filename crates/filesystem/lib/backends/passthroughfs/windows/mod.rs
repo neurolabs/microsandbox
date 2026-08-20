@@ -212,15 +212,14 @@ impl PassthroughFs {
 
     /// Whether `name` in `parent` is denied by the deny list.
     ///
-    /// Uses the parent inode's stored host path to reconstruct the
-    /// mount-relative path for path-pattern matching. Fails closed (returns
-    /// `true`) when the parent path or the leaf name cannot be resolved under
-    /// active path patterns, so a deny list is never silently bypassed on an
-    /// undecodable name.
+    /// Whether `name` in `parent` is denied by the deny list.
     ///
-    /// `is_dir` reports whether the entry is a directory. Directory-only deny
-    /// patterns (trailing `/`, e.g. `node_modules/`) match directories but not
-    /// same-named files, so callers must pass the entry's actual type.
+    /// Fails closed (returns `true`) when the parent-inode path cannot be
+    /// reconstructed under active path patterns, so a deny list is never
+    /// silently bypassed on an unresolvable path.
+    ///
+    /// `is_dir` defines whether the entry is a directory, enabling support for
+    /// dir-only deny patterns.
     pub(super) fn deny_matches_name(&self, parent: u64, name: &CStr, is_dir: bool) -> bool {
         let name_bytes = name.to_bytes();
         // The structural `.` and `..` entries must never be denied, otherwise a
@@ -236,7 +235,7 @@ impl PassthroughFs {
             // must deny, never allow.
             return true;
         };
-        // Reconstruct a '/' -separated mount-relative path for gitignore matching.
+
         let rel = parent_data
             .path
             .strip_prefix(&self.root)

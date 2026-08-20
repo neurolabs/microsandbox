@@ -299,10 +299,7 @@ fn build_snapshot(
 ) -> io::Result<DirSnapshot> {
     let mut entries = read_dir_entries(fd)?;
 
-    // Filter out entries matching the deny list. The dirent's `d_type`
-    // (already populated from the kernel) carries the entry's own type without
-    // following symlinks, so a dir-only pattern like `node_modules/` hides the
-    // directory but not a same-named file.
+    // Filter out entries matching the deny list.
     entries.retain(|entry| {
         let is_dir = entry.file_type == platform::DIRENT_DIR;
         !fs.deny_matches_name(parent, &entry.name, is_dir)
@@ -326,6 +323,20 @@ fn build_snapshot(
     }
 
     Ok(DirSnapshot { entries })
+}
+
+/// Resolve the dirent type of `name` within directory `dirfd`. If the
+/// filesystem did not supply one (`DT_UNKNOWN`), use `fstatat` without
+/// following symlinks so a dir-only deny pattern still hides directories.
+fn resolve_dirent_type(dirfd: i32, d_type: u32, name: &[u8]) -> u32 {
+    if d_type != libc::DT_UNKNOWN as u32 {
+        return d_type;
+    }
+    std::ffi::CString::new(name)
+        .ok()
+        .and_then(|c| platform::fstatat_nofollow(dirfd, &c).ok())
+        .map(|st| platform::dirent_type_from_mode(platform::mode_file_type(st.st_mode)))
+        .unwrap_or(libc::DT_UNKNOWN as u32)
 }
 
 /// Read all directory entries from a file descriptor on Linux.
@@ -364,19 +375,8 @@ fn read_dir_entries(fd: i32) -> io::Result<Vec<PassthroughDirEntry>> {
                 .unwrap_or(name_slice.len());
 
             // When the filesystem did not supply a dirent type, resolve it via
-            // `fstatat` so a dir-only deny pattern still hides directories.
-            // A directory-only pattern must never silently miss because of an
-            // unknown `d_type`.
-            let file_type = if d_type == libc::DT_UNKNOWN as u32 {
-                let name = &name_slice[..name_len];
-                std::ffi::CString::new(name)
-                    .ok()
-                    .and_then(|c| platform::fstatat_nofollow(fd, &c).ok())
-                    .map(|st| platform::dirent_type_from_mode(platform::mode_file_type(st.st_mode)))
-                    .unwrap_or(libc::DT_UNKNOWN as u32)
-            } else {
-                d_type
-            };
+            // `fstatat` to support dir-only deny patterns.
+            let file_type = resolve_dirent_type(fd, d_type, &name_slice[..name_len]);
 
             entries.push(PassthroughDirEntry {
                 inode: d_ino,
@@ -432,16 +432,8 @@ fn read_dir_entries(fd: i32) -> io::Result<Vec<PassthroughDirEntry>> {
             unsafe { std::slice::from_raw_parts(entry.d_name.as_ptr() as *const u8, name_len) };
 
         // When the filesystem did not supply a dirent type, resolve it via
-        // `fstatat` so a dir-only deny pattern still hides directories.
-        let file_type = if entry.d_type == libc::DT_UNKNOWN {
-            std::ffi::CString::new(name)
-                .ok()
-                .and_then(|c| platform::fstatat_nofollow(libc::dirfd(dirp), &c).ok())
-                .map(|st| platform::dirent_type_from_mode(platform::mode_file_type(st.st_mode)))
-                .unwrap_or(libc::DT_UNKNOWN as u32)
-        } else {
-            entry.d_type as u32
-        };
+        // `fstatat` to support dir-only deny patterns.
+        let file_type = resolve_dirent_type(libc::dirfd(dirp), entry.d_type as u32, name);
 
         entries.push(PassthroughDirEntry {
             inode: entry.d_ino,

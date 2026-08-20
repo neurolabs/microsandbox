@@ -27,7 +27,11 @@ use ignore::{Match, gitignore::Gitignore, gitignore::GitignoreBuilder};
 /// The prefix must contain ASCII letters so a case-flipped sibling name can be
 /// formed. A process-unique numeric suffix keeps concurrent builders from
 /// colliding.
-const CASE_PROBE_PREFIX: &str = "MsbCaseProbe";
+const CASE_PROBE_PREFIX: &str = "MsBCaSePrObE";
+/// Probe file prefix lowercased, used to validate case-insensitivity.
+fn case_validation_prefix() -> String {
+    CASE_PROBE_PREFIX.to_ascii_lowercase()
+}
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -75,7 +79,7 @@ impl DenyList {
             has_path_patterns |= pattern.contains('/');
             let _ = builder.add_line(None, pattern);
         }
-        let _ = builder.case_insensitive(filesystem_is_case_insensitive(root));
+        let _ = builder.case_insensitive(mount_is_case_insensitive(root));
         let matcher = builder.build().unwrap_or_else(|_| Gitignore::empty());
         Self {
             matcher,
@@ -122,24 +126,31 @@ impl DenyList {
 /// the process, so concurrent builders on the same mount root do not collide.
 static CASE_PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Detect whether the filesystem holding `root` is case-insensitive.
+/// Detect whether the filesystem holding `root` respectively the folder 'root'
+/// is case-insensitive.
+///
+/// Almost all Linux/Unix filesystems: sensitive.
+/// APFS / HFS+: insensitive by default, can be formatted case-sensitive.
+/// FAT: insensitive.
+/// NTFS: insensitive by default, can be configured per directory.
+///
+/// We don't detect case sensitivity per directory, but per mount.
 ///
 /// Uses git's `core.ignorecase` probe: create a probe file with a known
-/// mixed-case name, then check whether a case-flipped variant of that name
+/// mixed-case name, then check whether a case variant of that name
 /// resolves to the same file. If it does, the filesystem folds case and deny
-/// patterns must be matched case-insensitively. The probe file is removed
-/// before returning.
+/// patterns must be matched case-insensitively.
 ///
-/// The deny list is a confidentiality boundary, so a failed probe defaults to
-/// `true` (case-insensitive) rather than `false`: over-matching only hides a
-/// few differently-cased names that almost never coexist, whereas under-matching
-/// on a case-insensitive host would let a pattern like `.env` be bypassed by
-/// requesting `.ENV`. This is fail-closed for the secrecy property.
-fn filesystem_is_case_insensitive(root: &Path) -> bool {
+/// A failed probe defaults to `true` (case-insensitive) rather than `false`:
+/// over-matching only hides a few differently-cased names that almost never
+/// coexist, whereas under-matching on a case-insensitive host would let a
+/// pattern like `.env` be bypassed by requesting `.ENV`.
+fn mount_is_case_insensitive(root: &Path) -> bool {
     let seq = CASE_PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let name = format!("{CASE_PROBE_PREFIX}-{}-{seq}", std::process::id());
-    let probe = root.join(&name);
-    let flipped = root.join(case_flip_ascii(&name));
+    let probe_name = format!("{CASE_PROBE_PREFIX}-{}-{seq}", std::process::id());
+    let validation_name = format!("{}-{}-{seq}", case_validation_prefix(), std::process::id());
+    let probe = root.join(&probe_name);
+    let validation = root.join(&validation_name);
 
     let result = (|| -> std::io::Result<bool> {
         let mut file = std::fs::OpenOptions::new()
@@ -149,28 +160,12 @@ fn filesystem_is_case_insensitive(root: &Path) -> bool {
         std::io::Write::write_all(&mut file, b"probe")?;
         // If the case-flipped name resolves, the same file was found by a
         // differently-cased name, so the filesystem is case-insensitive.
-        let insensitive = std::fs::symlink_metadata(&flipped).is_ok();
+        let insensitive = std::fs::symlink_metadata(&validation).is_ok();
         std::fs::remove_file(&probe)?;
         Ok(insensitive)
     })();
 
     result.unwrap_or(true)
-}
-
-/// Flip the ASCII letter case of every byte in `s`; non-ASCII bytes are left
-/// unchanged. Used to build the case-variant probe name.
-fn case_flip_ascii(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_uppercase() {
-                c.to_ascii_lowercase()
-            } else if c.is_ascii_lowercase() {
-                c.to_ascii_uppercase()
-            } else {
-                c
-            }
-        })
-        .collect()
 }
 
 /// Join entry-name components into a relative `PathBuf`.
@@ -231,21 +226,12 @@ mod tests {
     }
 
     #[test]
-    fn case_flip_ascii_flips_ascii_only() {
-        assert_eq!(case_flip_ascii("MsbCaseProbe-1"), "mSBcASEpROBE-1");
-        assert_eq!(case_flip_ascii("no-ascii-123"), "NO-ASCII-123");
-        assert_eq!(case_flip_ascii("héllo"), "HéLLO");
-    }
-
-    #[test]
-    fn probe_reports_case_sensitive_on_temp_fs() {
-        // The default temp filesystem on every supported platform is
-        // case-sensitive (Linux, macOS APFS default is a test-site concern; on
-        // case-insensitive hosts this assertion is skipped by comparing to the
-        // real behavior). We at least assert the probe leaves no residue.
+    fn mount_is_case_insensitive_cleans_up_fs() {
+        // neither for unix nor for windows we can assert the check deterministically.
+        // Therefore, we only assert the probe leaves no residue.
         let root = std::env::temp_dir().join(format!("msb-deny-probe-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        let _ = filesystem_is_case_insensitive(&root);
+        let _ = mount_is_case_insensitive(&root);
         let empty = std::fs::read_dir(&root).unwrap().count();
         assert_eq!(empty, 0);
         let _ = std::fs::remove_dir_all(&root);
@@ -261,11 +247,13 @@ mod tests {
     #[test]
     fn basename_pattern_matches_anywhere() {
         let list = deny(&[".env", "*.log"]);
-        assert!(list.has_path_patterns() == false);
+        assert!(!list.has_path_patterns());
         assert!(list.matches_basename(b".env", false));
         assert!(list.matches_basename(b"debug.log", false));
         assert!(!list.matches_basename(b"env", false));
-        assert!(!list.matches_basename(b"keep.txt", false));
+        assert!(!list.matches_basename(b"keep.log.txt", false));
+        assert!(list.matches_path(b"dir/.env", false));
+        assert!(list.matches_path(b"dir/debug.log", false));
     }
 
     #[test]
@@ -285,9 +273,17 @@ mod tests {
     }
 
     #[test]
+    fn bracket_pattern_matches() {
+        let list = deny(&["[a-z]"]);
+        assert!(list.matches_basename(b"a", false));
+        assert!(list.matches_basename(b"z", false));
+        assert!(!list.matches_basename(b"0", false));
+    }
+
+    #[test]
     fn invalid_pattern_is_skipped() {
-        let list = deny(&["[unclosed"]);
-        assert!(!list.matches_basename(b"anything", false));
+        let list = deny(&["[a-z"]);
+        assert!(!list.matches_basename(b"a", false));
     }
 
     #[test]
@@ -306,5 +302,13 @@ mod tests {
         assert!(list.matches_path(b"sub/node_modules", true));
         assert!(!list.matches_path(b"sub/node_modules", false));
         assert!(!list.matches_path(b"sub/node_modules.js", false));
+    }
+
+    #[test]
+    fn negation_enables_allowlist_mode() {
+        let list = deny(&["*", "!keep.txt"]);
+        assert!(list.matches_basename(b"other.txt", false));
+        assert!(!list.matches_basename(b"keep.txt", false));
+        assert!(list.matches_basename(b".env", false));
     }
 }

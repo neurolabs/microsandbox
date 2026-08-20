@@ -161,13 +161,11 @@ impl DynFileSystem for PassthroughFs {
             return Err(linux_error(LINUX_EOPNOTSUPP));
         }
 
-        // A rename replaces the destination entry with the source's type, so
-        // the destination's effective type is the source's. Determine it once
-        // and use it for both deny checks so a dir-only pattern like
-        // `node_modules/` rejects renaming a directory to that name while still
-        // allowing a same-named file. Only needed when a path pattern is
-        // active; a component-only list (no `/`) cannot contain dir-only
-        // patterns.
+        // A rename replaces the destination entry with the source's type, so the
+        // destination's effective type is the source's. Determine it once (without
+        // following a symlink) and use it for both deny checks so a dir-only
+        // pattern like `node_modules/` rejects renaming a directory to that name
+        // while still allowing a same-named file.
         let old_path = self.child_path(olddir, oldname)?;
         let source_is_dir = if self.deny.has_path_patterns() {
             self.safe_metadata(&old_path)
@@ -181,6 +179,20 @@ impl DynFileSystem for PassthroughFs {
             || self.deny_matches_name(newdir, newname, source_is_dir)
         {
             return Err(linux_error(LINUX_EACCES));
+        }
+
+        // A rename whose destination already exists as a *directory* denied by
+        // a dir-only pattern would otherwise surface a raw EISDIR/ENOTDIR and
+        // leak the hidden entry's existence and type. Reject it explicitly.
+        if self.deny.has_path_patterns() {
+            let new_path = self.child_path(newdir, newname)?;
+            let dest_is_dir = self
+                .safe_metadata(&new_path)
+                .map(|m| m.file_type().is_dir())
+                .unwrap_or(false);
+            if dest_is_dir && self.deny_matches_name(newdir, newname, true) {
+                return Err(linux_error(LINUX_EACCES));
+            }
         }
 
         let new_path = self.child_path(newdir, newname)?;

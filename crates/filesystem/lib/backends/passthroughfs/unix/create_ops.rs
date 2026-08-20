@@ -490,13 +490,13 @@ pub(crate) fn do_link(
     {
         let inodes = fs.inodes.read().unwrap();
         let data = inodes.get(&inode).ok_or_else(platform::ebadf)?;
-        let src_path = format!("/.vol/{}/{}\0", data.dev, data.ino);
+        let src_path = platform::vol_path(data.dev, data.ino);
         let newparent_fd = inode::get_inode_fd(fs, newparent)?;
 
         let ret = unsafe {
             libc::linkat(
                 libc::AT_FDCWD,
-                src_path.as_ptr() as *const libc::c_char,
+                src_path.as_ptr(),
                 newparent_fd.raw(),
                 newname.as_ptr(),
                 0,
@@ -570,13 +570,13 @@ pub(crate) fn do_readlink(fs: &PassthroughFs, _ctx: Context, ino: u64) -> io::Re
 
         let inodes = fs.inodes.read().unwrap();
         let data = inodes.get(&ino).ok_or_else(platform::ebadf)?;
-        let path = format!("/.vol/{}/{}\0", data.dev, data.ino);
+        let path = platform::vol_path(data.dev, data.ino);
 
         let mut buf = vec![0u8; libc::PATH_MAX as usize];
         let ret = unsafe {
             libc::readlinkat(
                 libc::AT_FDCWD,
-                path.as_ptr() as *const libc::c_char,
+                path.as_ptr(),
                 buf.as_mut_ptr() as *mut libc::c_char,
                 buf.len(),
             )

@@ -204,13 +204,9 @@ fn open_macos_inode_reopen(path: *const libc::c_char, flags: i32) -> io::Result<
     ))
 }
 
+/// Build a `/.vol/<dev>/<ino>` identity path as a `CString` (macOS only).
 #[cfg(target_os = "macos")]
-pub(crate) fn vol_path(dev: u64, ino: u64) -> std::ffi::CString {
-    use std::ffi::CString;
-
-    CString::new(format!("/.vol/{dev}/{ino}"))
-        .expect("formatted /.vol path never contains interior nul")
-}
+pub(crate) use crate::backends::shared::platform::vol_path;
 
 /// Look up a child name in a parent directory and return an [`Entry`].
 ///
@@ -220,12 +216,8 @@ pub(crate) fn vol_path(dev: u64, ino: u64) -> std::ffi::CString {
 pub(crate) fn do_lookup(fs: &PassthroughFs, parent: u64, name: &CStr) -> io::Result<Entry> {
     crate::backends::shared::name_validation::validate_name(name)?;
 
-    // Determine the child's type (without following a symlink) so a dir-only
-    // path pattern like `node_modules/` hides the directory but not a
-    // same-named file. Only needed when a path pattern is active; a
-    // component-only list (no `/`) cannot contain dir-only patterns. If the
-    // child cannot be stat'ed, treat it as a non-dir and let the lookup below
-    // surface the real error.
+    // Determine the child's type (without following a symlink) to support
+    // dir-only deny patterns.
     let parent_fd = get_inode_fd(fs, parent)?;
     let is_dir = if fs.deny.has_path_patterns() {
         platform::fstatat_nofollow(parent_fd.raw(), name)
@@ -1096,6 +1088,7 @@ fn _parent_path_components_locked(
     inode: u64,
     seen: &mut std::collections::HashSet<u64>,
 ) -> Option<Vec<Vec<u8>>> {
+    // Inode 1 is the mount root; its mount-relative path is empty.
     if inode == 1 {
         return Some(Vec::new());
     }

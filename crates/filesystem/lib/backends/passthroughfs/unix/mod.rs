@@ -431,9 +431,8 @@ impl PassthroughFs {
 impl PassthroughFs {
     /// Whether `name` in `parent` is denied by the deny list.
     ///
-    /// `is_dir` reports whether the entry is a directory. Directory-only deny
-    /// patterns (trailing `/`, e.g. `node_modules/`) match directories but not
-    /// same-named files, so callers must pass the entry's actual type.
+    /// `is_dir` defines whether the entry is a directory, enabling support for
+    /// dir-only deny patterns.
     ///
     /// Fails closed (returns `true`) when the parent-inode path cannot be
     /// reconstructed under active path patterns, so a deny list is never
@@ -447,7 +446,6 @@ impl PassthroughFs {
         if !self.deny.has_path_patterns() {
             return self.deny.matches_basename(name, is_dir);
         }
-        // Reconstruct the mount-relative path for path-pattern matching.
         let root = self.deny_root();
         let Some(parent_components) =
             crate::backends::passthroughfs::unix::inode::parent_path_components(
@@ -456,8 +454,7 @@ impl PassthroughFs {
                 root,
             )
         else {
-            // Fail closed: an unresolvable parent path under active path
-            // patterns must deny, never allow.
+            // Fail closed
             return true;
         };
         let mut components = parent_components;

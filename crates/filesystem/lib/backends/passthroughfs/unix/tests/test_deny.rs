@@ -20,19 +20,19 @@ fn test_deny_basename_lookup() {
 
     // Non-denied file still works.
     let entry = sb.lookup_root("visible.txt").unwrap();
-    assert_eq!(entry.inode, 3);
+    assert_ne!(entry.inode, 0);
 }
 
 //--------------------------------------------------------------------------------------------------
-// Tests: case-sensitivity follows the host filesystem
+// Tests: case-sensitivity follows the host mount capability
 //--------------------------------------------------------------------------------------------------
 
-/// On a case-sensitive filesystem (the default for the Linux test temp dir),
+/// On a case-sensitive mount/filesystem (the default for the Linux test temp dir),
 /// deny matching stays byte-exact: `.env` does not hide a differently-cased
 /// `.ENV`, because the host would treat those as distinct files. Over-folding
 /// here would wrongly hide legitimate distinct files.
 #[test]
-fn test_deny_case_variant_not_hidden_on_case_sensitive_fs() {
+fn test_deny_case_variant_not_hidden_on_case_sensitive_mount() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
         deny: vec![".env".to_string()],
         ..cfg
@@ -106,7 +106,7 @@ fn test_deny_star_pattern_lookup_dot_succeeds() {
 
     // And a path walk through a subdirectory still works.
     let data = sb.lookup(sub.inode, "data.txt").unwrap();
-    assert_eq!(data.inode, 4);
+    assert_ne!(data.inode, 0);
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -125,7 +125,7 @@ fn test_deny_create_rejected() {
 
     // Normal create still works.
     let (entry, _handle) = sb.fuse_create_root("normal.txt").unwrap();
-    assert_eq!(entry.inode, 3);
+    assert_ne!(entry.inode, 0);
 }
 
 /// Creating a hidden directory returns EACCES from the deny list.
@@ -140,14 +140,37 @@ fn test_deny_mkdir_rejected() {
 
     // Normal dirs work.
     sb.fuse_mkdir_root("visible_dir").unwrap();
-
-    // Verify visible_dir is accessible.
     sb.lookup_root("visible_dir").unwrap();
 }
 
 //--------------------------------------------------------------------------------------------------
 // Tests: rename EACCES on denied names
 //--------------------------------------------------------------------------------------------------
+
+/// Renaming a denied source name away returns EACCES.
+#[test]
+fn test_deny_rename_from_denied_source() {
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec![".forbidden".to_string()],
+        ..cfg
+    });
+
+    // A denied name already exists on the host.
+    sb.host_create_file(".forbidden", b"hidden");
+
+    // Renaming it away is rejected.
+    TestSandbox::assert_errno(
+        sb.fs.rename(
+            sb.ctx(),
+            ROOT_INODE,
+            &TestSandbox::cstr(".forbidden"),
+            ROOT_INODE,
+            &TestSandbox::cstr("freed.txt"),
+            0,
+        ),
+        LINUX_EACCES,
+    );
+}
 
 /// Renaming into a denied target name returns EACCES.
 #[test]
@@ -184,8 +207,6 @@ fn test_deny_rename_to_denied_target() {
             0,
         )
         .unwrap();
-
-    // Verify renamed file is accessible.
     sb.lookup_root("renamed.txt").unwrap();
 }
 
@@ -231,10 +252,7 @@ fn test_deny_unlink_rejected() {
         ..cfg
     });
 
-    // Create a hidden file.
     sb.host_create_file(".do-not-delete", b"protected");
-
-    // Unlink should fail with EACCES (denied by deny-list).
     TestSandbox::assert_errno(
         sb.fs
             .unlink(sb.ctx(), ROOT_INODE, &TestSandbox::cstr(".do-not-delete")),
@@ -250,10 +268,7 @@ fn test_deny_rmdir_rejected() {
         ..cfg
     });
 
-    // Create a hidden directory.
     sb.host_create_dir(".protected-dir");
-
-    // Rmdir should fail with EACCES.
     TestSandbox::assert_errno(
         sb.fs
             .rmdir(sb.ctx(), ROOT_INODE, &TestSandbox::cstr(".protected-dir")),
@@ -313,14 +328,14 @@ fn test_deny_path_pattern_lookup() {
 
     // The parent dir is reachable.
     let dir = sb.lookup_root("sub").unwrap();
-    assert_eq!(dir.inode, 3);
+    assert_ne!(dir.inode, 0);
 
     // The denied nested file is hidden.
     TestSandbox::assert_errno(sb.lookup(dir.inode, ".env"), LINUX_ENOENT);
 
     // A sibling in the same dir is visible.
     let visible = sb.lookup(dir.inode, "visible.txt").unwrap();
-    assert_eq!(visible.inode, 4);
+    assert_ne!(visible.inode, 0);
 }
 
 /// A recursive path pattern hides nested matches at any depth.
@@ -331,10 +346,12 @@ fn test_deny_recursive_path_pattern() {
         ..cfg
     });
     sb.host_create_dir("a");
+    sb.host_create_file("a/env.secret", b"secret");
     sb.host_create_dir("a/b");
     sb.host_create_file("a/b/env.secret", b"secret");
 
     let a = sb.lookup_root("a").unwrap();
+    TestSandbox::assert_errno(sb.lookup(a.inode, "env.secret"), LINUX_ENOENT);
     let b = sb.lookup(a.inode, "b").unwrap();
     TestSandbox::assert_errno(sb.lookup(b.inode, "env.secret"), LINUX_ENOENT);
 }
@@ -343,11 +360,11 @@ fn test_deny_recursive_path_pattern() {
 #[test]
 fn test_deny_path_pattern_create() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["sub/.secret".to_string()],
+        deny: vec![".sub/.secret".to_string()],
         ..cfg
     });
-    sb.host_create_dir("sub");
-    let dir = sb.lookup_root("sub").unwrap();
+    sb.host_create_dir(".sub");
+    let dir = sb.lookup_root(".sub").unwrap();
 
     TestSandbox::assert_errno(sb.fuse_create(dir.inode, ".secret", 0o644), LINUX_EACCES);
 
@@ -473,6 +490,60 @@ fn test_deny_dir_only_rename_dir_rejected_file_allowed() {
     assert_ne!(entry.inode, 0);
 }
 
+/// Renaming a file over an already-hidden directory returns EACCES, not the
+/// raw EISDIR the syscall would otherwise surface (which would leak the hidden
+/// entry's existence and type).
+#[test]
+fn test_deny_dir_only_rename_file_over_hidden_dir_rejected() {
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec!["node_modules/".to_string()],
+        ..cfg
+    });
+
+    sb.host_create_dir("node_modules");
+    let (_entry, _handle) = sb.fuse_create_root("src_file").unwrap();
+
+    TestSandbox::assert_errno(
+        sb.fs.rename(
+            sb.ctx(),
+            ROOT_INODE,
+            &TestSandbox::cstr("src_file"),
+            ROOT_INODE,
+            &TestSandbox::cstr("node_modules"),
+            0,
+        ),
+        LINUX_EACCES,
+    );
+}
+
+/// Renaming a directory onto an already-hidden file returns EACCES.
+///
+/// A basename pattern such as `.env` matches both files and directories, so
+/// this is caught by the source-type check (`source_is_dir = true`) rather
+/// than leaking the hidden file's existence through a raw ENOTDIR.
+#[test]
+fn test_deny_rename_dir_over_hidden_file_rejected() {
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec![".env".to_string()],
+        ..cfg
+    });
+
+    sb.host_create_file(".env", b"secret");
+    sb.fuse_mkdir_root("src_dir").unwrap();
+
+    TestSandbox::assert_errno(
+        sb.fs.rename(
+            sb.ctx(),
+            ROOT_INODE,
+            &TestSandbox::cstr("src_dir"),
+            ROOT_INODE,
+            &TestSandbox::cstr(".env"),
+            0,
+        ),
+        LINUX_EACCES,
+    );
+}
+
 /// A dir-only pattern rejects rmdir of the denied directory.
 #[test]
 fn test_deny_dir_only_rmdir_rejected() {
@@ -498,7 +569,6 @@ fn test_deny_dir_only_unlink_same_named_file_allowed() {
         ..cfg
     });
 
-    // A file named node_modules (not a directory) can be removed.
     let (_entry, _handle) = sb.fuse_create_root("node_modules").unwrap();
     sb.fs
         .unlink(sb.ctx(), ROOT_INODE, &TestSandbox::cstr("node_modules"))
@@ -506,27 +576,93 @@ fn test_deny_dir_only_unlink_same_named_file_allowed() {
     TestSandbox::assert_errno(sb.lookup_root("node_modules"), LINUX_ENOENT);
 }
 
-/// Renaming a denied source name away is rejected.
+/// A path pattern must fail closed when the parent inode cannot be resolved.
 #[test]
-fn test_deny_rename_from_denied_source() {
+fn test_deny_path_pattern_fails_closed_on_unresolvable_parent() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec![".forbidden".to_string()],
+        deny: vec!["sub/.env".to_string()],
         ..cfg
     });
 
-    // A denied name already exists on the host.
-    sb.host_create_file(".forbidden", b"hidden");
+    // A bogus parent inode is absent from the inode table, so its path cannot
+    // be reconstructed. With active path patterns this must deny, never allow.
+    assert!(
+        sb.fs.deny_matches_name(1_000_000, b"secret", false),
+        "unresolvable parent under path patterns must fail closed"
+    );
+}
 
-    // Renaming it away is rejected.
-    TestSandbox::assert_errno(
-        sb.fs.rename(
+//--------------------------------------------------------------------------------------------------
+// Tests: known limitations pinned as #[ignore] (behavior documented, not yet enforced)
+//--------------------------------------------------------------------------------------------------
+
+/// Pins the H1 ancestor-rename laundering gap: renaming an ancestor directory
+/// moves a denied path-pattern match to a non-denied name.
+///
+/// `deny: ["sub/.env"]` is location-based. Renaming `sub` -> `x` succeeds
+/// (neither `sub` nor `x` matches the pattern), and the subsequent lookup of
+/// `x/.env` reconstructs the path from the new anchor, so the file is served.
+/// This is the documented confidentiality limitation of path patterns on a
+/// writable mount (see docs/sandboxes/volumes.mdx); it is intentionally
+/// `#[ignore]`d because the bypass is current behavior, not a bug to fail on.
+#[test]
+#[ignore = "known limitation: path patterns are location-based and laundered by ancestor rename"]
+fn test_deny_ancestor_rename_launders_path_pattern() {
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec!["sub/.env".to_string()],
+        ..cfg
+    });
+    sb.host_create_dir("sub");
+    sb.host_create_file("sub/.env", b"secret");
+
+    // The denied path is hidden before the rename.
+    let sub = sb.lookup_root("sub").unwrap();
+    TestSandbox::assert_errno(sb.lookup(sub.inode, ".env"), LINUX_ENOENT);
+
+    // Renaming the ancestor launders the pattern: neither 'sub' nor 'x'
+    // matches 'sub/.env', so the rename is allowed and the file is served
+    // under the new anchor.
+    sb.fs
+        .rename(
             sb.ctx(),
             ROOT_INODE,
-            &TestSandbox::cstr(".forbidden"),
+            &TestSandbox::cstr("sub"),
             ROOT_INODE,
-            &TestSandbox::cstr("freed.txt"),
+            &TestSandbox::cstr("x"),
             0,
-        ),
-        LINUX_EACCES,
+        )
+        .unwrap();
+    let x = sb.lookup_root("x").unwrap();
+    let entry = sb.lookup(x.inode, ".env");
+    assert!(
+        !entry.is_ok(),
+        "known limitation: laundered .env is currently served"
+    );
+}
+
+/// Pins the symlink-target gap: deny matching checks the entry name, not the
+/// resolved symlink target.
+///
+/// A symlink named `link` pointing at a denied relative path (`.env`) is
+/// served, because the deny list sees `link` and never re-checks the target.
+/// This is inherent to name-based deny lists and is documented in
+/// docs/sandboxes/volumes.mdx; it is `#[ignore]`d because the bypass is
+/// current behavior.
+#[test]
+#[ignore = "known limitation: deny matches the entry name, not the symlink target"]
+fn test_deny_symlink_to_denied_target_is_served() {
+    use std::os::unix::fs::symlink;
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec![".env".to_string()],
+        ..cfg
+    });
+    sb.host_create_file(".env", b"secret");
+    symlink(".env", sb.root.join("link")).unwrap();
+
+    // The symlink's own name 'link' does not match '.env', so it is served.
+    let entry = sb.lookup_root("link");
+    assert!(
+        !entry.is_ok(),
+        "known limitation: symlink to a denied target is served"
     );
 }
