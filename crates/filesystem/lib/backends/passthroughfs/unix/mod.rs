@@ -443,7 +443,7 @@ impl PassthroughFs {
         if name == b"." || name == b".." {
             return false;
         }
-        if !self.deny.has_path_patterns() {
+        if !self.deny.needs_path_reconstruction() {
             return self.deny.matches_basename(name, is_dir);
         }
         let root = self.deny_root();

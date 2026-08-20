@@ -167,7 +167,7 @@ impl DynFileSystem for PassthroughFs {
         // pattern like `node_modules/` rejects renaming a directory to that name
         // while still allowing a same-named file.
         let old_path = self.child_path(olddir, oldname)?;
-        let source_is_dir = if self.deny.has_path_patterns() {
+        let source_is_dir = if self.deny.has_dir_only_patterns() {
             self.safe_metadata(&old_path)
                 .map(|m| m.file_type().is_dir())
                 .unwrap_or(false)
@@ -184,7 +184,7 @@ impl DynFileSystem for PassthroughFs {
         // A rename whose destination already exists as a *directory* denied by
         // a dir-only pattern would otherwise surface a raw EISDIR/ENOTDIR and
         // leak the hidden entry's existence and type. Reject it explicitly.
-        if self.deny.has_path_patterns() {
+        if self.deny.has_dir_only_patterns() {
             let new_path = self.child_path(newdir, newname)?;
             let dest_is_dir = self
                 .safe_metadata(&new_path)

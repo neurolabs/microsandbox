@@ -50,12 +50,18 @@ fn case_validation_prefix() -> String {
 #[derive(Debug)]
 pub(crate) struct DenyList {
     matcher: Gitignore,
-    /// Whether any pattern is a path pattern (contains `/`).
+    /// Whether any pattern needs the full mount-relative path (has an interior
+    /// `/`, i.e. a separator that is not merely a trailing dir-only marker).
     ///
-    /// When `false`, every pattern matches only a single component name
-    /// anywhere in the tree, so entries can be checked without reconstructing
-    /// the parent path.
-    has_path_patterns: bool,
+    /// When `false`, every pattern matches a single component name anywhere in
+    /// the tree, so entries can be checked without reconstructing the parent
+    /// path.
+    needs_path_reconstruction: bool,
+    /// Whether any pattern is directory-only (ends with `/`, e.g. `node_modules/`).
+    ///
+    /// Only dir-only patterns depend on the entry's type, so callers must learn
+    /// `is_dir` when this is `true`.
+    has_dir_only_patterns: bool,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -74,38 +80,49 @@ impl DenyList {
     /// nothing.
     pub(crate) fn new(root: &Path, patterns: &[String]) -> Self {
         let mut builder = GitignoreBuilder::new(Path::new("/"));
-        let mut has_path_patterns = false;
+        let mut needs_path_reconstruction = false;
+        let mut has_dir_only_patterns = false;
         for pattern in patterns {
-            has_path_patterns |= pattern.contains('/');
+            needs_path_reconstruction |= pattern.trim_end_matches('/').contains('/');
+            has_dir_only_patterns |= pattern.ends_with('/');
             let _ = builder.add_line(None, pattern);
         }
         let _ = builder.case_insensitive(mount_is_case_insensitive(root));
         let matcher = builder.build().unwrap_or_else(|_| Gitignore::empty());
         Self {
             matcher,
-            has_path_patterns,
+            needs_path_reconstruction,
+            has_dir_only_patterns,
         }
     }
 
-    /// Whether any pattern is a path pattern (contains `/`).
-    pub(crate) fn has_path_patterns(&self) -> bool {
-        self.has_path_patterns
+    /// Whether any pattern needs the full mount-relative path (interior `/`).
+    pub(crate) fn needs_path_reconstruction(&self) -> bool {
+        self.needs_path_reconstruction
+    }
+
+    /// Whether any pattern is directory-only (trailing `/`).
+    pub(crate) fn has_dir_only_patterns(&self) -> bool {
+        self.has_dir_only_patterns
     }
 
     /// Whether the single entry `name` matches the deny list.
     ///
-    /// Only meaningful when [`Self::has_path_patterns`] is `false`; path
-    /// patterns cannot match a bare component name.
+    /// Only meaningful when [`Self::needs_path_reconstruction`] is `false`; a
+    /// path pattern cannot match a bare component name. `name` is a single
+    /// component, matched at any depth (gitignore component semantics).
     ///
-    /// `is_dir` reports whether the entry is a directory. Directory-only
-    /// patterns (with a trailing `/`, e.g. `node_modules/`) match directories
-    /// but not same-named files, mirroring gitignore semantics.
+    /// `is_dir` reports whether the entry is a directory; only dir-only
+    /// patterns (trailing `/`) depend on it.
     pub(crate) fn matches_basename(&self, name: &[u8], is_dir: bool) -> bool {
+        debug_assert!(!self.needs_path_reconstruction);
         self.is_ignored(name_as_path(name), is_dir)
     }
 
-    /// Whether the full relative path `rel` (relative to the mount root)
+    /// Whether the full mount-relative path `rel` (relative to the mount root)
     /// matches the deny list.
+    ///
+    /// Used when [`Self::needs_path_reconstruction`] is `true`.
     ///
     /// `is_dir` reports whether the entry is a directory; see
     /// [`Self::matches_basename`].
@@ -247,7 +264,8 @@ mod tests {
     #[test]
     fn basename_pattern_matches_anywhere() {
         let list = deny(&[".env", "*.log"]);
-        assert!(!list.has_path_patterns());
+        assert!(!list.needs_path_reconstruction());
+        assert!(!list.has_dir_only_patterns());
         assert!(list.matches_basename(b".env", false));
         assert!(list.matches_basename(b"debug.log", false));
         assert!(!list.matches_basename(b"env", false));
@@ -259,7 +277,8 @@ mod tests {
     #[test]
     fn path_pattern_matches_full_path() {
         let list = deny(&["dir/secret", "**/env.secret"]);
-        assert!(list.has_path_patterns());
+        assert!(list.needs_path_reconstruction());
+        assert!(!list.has_dir_only_patterns());
         assert!(list.matches_path(b"dir/secret", false));
         assert!(list.matches_path(b"a/b/c/env.secret", false));
         assert!(!list.matches_path(b"dir/other", false));
@@ -269,7 +288,7 @@ mod tests {
     #[test]
     fn path_pattern_does_not_match_basename() {
         let list = deny(&["dir/secret"]);
-        assert!(!list.matches_basename(b"secret", false));
+        assert!(!list.matches_path(b"secret", false));
     }
 
     #[test]
@@ -289,7 +308,10 @@ mod tests {
     #[test]
     fn dir_only_path_pattern_matches_directory_but_not_file() {
         let list = deny(&["node_modules/"]);
-        assert!(list.has_path_patterns());
+        assert!(!list.needs_path_reconstruction());
+        assert!(list.has_dir_only_patterns());
+        assert!(list.matches_basename(b"node_modules", true));
+        assert!(!list.matches_basename(b"node_modules", false));
         assert!(list.matches_path(b"node_modules", true));
         assert!(!list.matches_path(b"node_modules", false));
         assert!(!list.matches_path(b"node_modules.js", false));
@@ -298,7 +320,8 @@ mod tests {
     #[test]
     fn dir_only_nested_path_pattern_matches_directory_but_not_file() {
         let list = deny(&["sub/node_modules/"]);
-        assert!(list.has_path_patterns());
+        assert!(list.needs_path_reconstruction());
+        assert!(list.has_dir_only_patterns());
         assert!(list.matches_path(b"sub/node_modules", true));
         assert!(!list.matches_path(b"sub/node_modules", false));
         assert!(!list.matches_path(b"sub/node_modules.js", false));

@@ -219,7 +219,7 @@ pub(crate) fn do_lookup(fs: &PassthroughFs, parent: u64, name: &CStr) -> io::Res
     // Determine the child's type (without following a symlink) to support
     // dir-only deny patterns.
     let parent_fd = get_inode_fd(fs, parent)?;
-    let is_dir = if fs.deny.has_path_patterns() {
+    let is_dir = if fs.deny.has_dir_only_patterns() {
         platform::fstatat_nofollow(parent_fd.raw(), name)
             .map(|st| platform::mode_file_type(st.st_mode) == platform::MODE_DIR)
             .unwrap_or(false)

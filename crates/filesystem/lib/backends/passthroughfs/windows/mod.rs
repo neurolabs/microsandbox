@@ -227,7 +227,7 @@ impl PassthroughFs {
         if name_bytes == b"." || name_bytes == b".." {
             return false;
         }
-        if !self.deny.has_path_patterns() {
+        if !self.deny.needs_path_reconstruction() {
             return self.deny.matches_basename(name_bytes, is_dir);
         }
         let Ok(parent_data) = self.inode(parent) else {

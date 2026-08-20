@@ -251,7 +251,7 @@ pub(crate) fn do_rename(
     // while still allowing a same-named file.
     let old_fd = inode::get_inode_fd(fs, olddir)?;
     let new_fd = inode::get_inode_fd(fs, newdir)?;
-    let source_is_dir = if fs.deny.has_path_patterns() {
+    let source_is_dir = if fs.deny.has_dir_only_patterns() {
         platform::fstatat_nofollow(old_fd.raw(), oldname)
             .map(|st| platform::mode_file_type(st.st_mode) == platform::MODE_DIR)
             .unwrap_or(false)
@@ -271,7 +271,7 @@ pub(crate) fn do_rename(
     // the syscall and surface a raw EISDIR/ENOTDIR, leaking the hidden entry's
     // existence and type. A source file never matches a dir-only pattern, so
     // the source-type check above cannot catch this; reject it explicitly.
-    if fs.deny.has_path_patterns() {
+    if fs.deny.has_dir_only_patterns() {
         let dest_is_dir = platform::fstatat_nofollow(new_fd.raw(), newname)
             .map(|st| platform::mode_file_type(st.st_mode) == platform::MODE_DIR)
             .unwrap_or(false);

@@ -108,7 +108,7 @@ impl PassthroughFs {
         // cannot contain dir-only patterns. If the child cannot be stat'ed,
         // treat it as a non-dir and let the lookup below surface the real error.
         let path = self.child_path(parent, name)?;
-        let is_dir = if self.deny.has_path_patterns() {
+        let is_dir = if self.deny.has_dir_only_patterns() {
             self.safe_metadata(&path)
                 .map(|m| m.file_type().is_dir())
                 .unwrap_or(false)
