@@ -328,6 +328,30 @@ mod tests {
     }
 
     #[test]
+    fn interior_slash_pattern_needs_path_reconstruction() {
+        let list = deny(&["sub/.env"]);
+        assert!(list.needs_path_reconstruction());
+        assert!(!list.has_dir_only_patterns());
+    }
+
+    #[test]
+    fn trailing_slash_dir_only_uses_basename_fast_path() {
+        let list = deny(&["node_modules/"]);
+        assert!(!list.needs_path_reconstruction());
+        assert!(list.has_dir_only_patterns());
+        assert!(list.matches_basename(b"node_modules", true));
+        assert!(!list.matches_basename(b"node_modules", false));
+        assert!(!list.matches_basename(b"node_modules.js", false));
+    }
+
+    #[test]
+    fn mixed_component_and_path_patterns_set_both_flags() {
+        let list = deny(&["node_modules/", "sub/.env"]);
+        assert!(list.needs_path_reconstruction());
+        assert!(list.has_dir_only_patterns());
+    }
+
+    #[test]
     fn negation_enables_allowlist_mode() {
         let list = deny(&["*", "!keep.txt"]);
         assert!(list.matches_basename(b"other.txt", false));
