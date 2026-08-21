@@ -307,6 +307,7 @@ class DiskImageFormat(StrEnum):
     RAW = "raw"
     VMDK = "vmdk"
 
+
 class VolumeKind(StrEnum):
     DIRECTORY = "dir"
     DISK = "disk"
@@ -375,6 +376,7 @@ class SnapshotFormat(StrEnum):
 class SnapshotScope(StrEnum):
     DISK = "disk"
     RESUMABLE = "resumable"
+
 
 class RlimitResource(StrEnum):
     CPU = "cpu"
@@ -697,6 +699,7 @@ class MountConfig:
     noexec: bool = False
     nosuid: bool = False
     nodev: bool = False
+    deny: list[str] | None = None
     disk: str | None = None
     format: DiskImageFormat | None = None
     fstype: str | None = None
@@ -756,6 +759,8 @@ class MountConfig:
             d["bind"] = self.bind
             if self.quota_mib is not None:
                 d["quota_mib"] = self.quota_mib
+            if self.deny:
+                d["deny"] = list(self.deny)
         elif self.kind == MountKind.NAMED:
             if self.named is None:
                 raise ValueError("MountConfig kind=NAMED requires named=...")
@@ -794,6 +799,9 @@ class MountConfig:
                 f"stat_virtualization/host_permissions are only valid for "
                 f"BIND/NAMED mounts (got kind={self.kind.value})"
             )
+
+        if self.deny and self.kind != MountKind.BIND:
+            raise ValueError(f"deny is only valid for BIND mounts (got kind={self.kind.value})")
         return d
 
 
@@ -867,7 +875,6 @@ class RootDisk:
         derived from the file extension unless given (vmdk is not supported)."""
         return RootDiskConfig(kind=RootDiskKind.DISK_IMAGE, path=path, format=format, fstype=fstype)
 
-
     @staticmethod
     def flat(
         size_mib: int | None = None,
@@ -882,6 +889,7 @@ class RootDisk:
             fstype=fstype,
             clone=clone,
         )
+
 
 @dataclass(frozen=True, slots=True)
 class ImageSource:
@@ -1518,6 +1526,7 @@ class TokenBucket:
     ``refill_time_ms``. ``one_time_burst`` grants extra startup tokens that
     are spent before the regular budget and never refill.
     """
+
     size: int
     """Bucket capacity in tokens: bytes for bandwidth, frames for ops."""
     refill_time_ms: int
@@ -1539,6 +1548,7 @@ class RateLimiter:
     Caps bandwidth (bytes) and packet rate (frames) independently; a
     missing bucket leaves that dimension unlimited.
     """
+
     bandwidth: TokenBucket | None = None
     """Bandwidth bucket. One token is one byte of frame data."""
     ops: TokenBucket | None = None

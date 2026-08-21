@@ -619,6 +619,7 @@ class Volume:
         noexec: bool = False,
         nosuid: bool = False,
         nodev: bool = False,
+        deny: list[str] | None = None,
     ) -> MountConfig: ...
     @staticmethod
     def named(
