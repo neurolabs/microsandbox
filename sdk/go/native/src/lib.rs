@@ -1869,6 +1869,10 @@ fn apply_patch(
 /// attenuate other mount protections; a newline/NUL would corrupt gitignore
 /// parsing. Reject here so the FFI boundary reports a clear error instead of
 /// the deeper `MountBuilder::build()` validation.
+///
+/// Keep this in sync with the identical validators in
+/// `crates/runtime/lib/vm.rs` (`validate_deny_pattern`) and
+/// `sdk/rust/lib/sandbox/types.rs`.
 fn validate_deny_pattern(pattern: &str) -> Result<(), FfiError> {
     if pattern.is_empty() {
         return Err(FfiError::invalid_argument("deny pattern must not be empty"));

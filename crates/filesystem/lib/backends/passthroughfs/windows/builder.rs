@@ -137,7 +137,7 @@ impl PassthroughFs {
             .quota_bytes
             .map(|limit| super::super::quota::DirQuota::new(root.clone(), limit));
 
-        let deny = super::super::deny::DenyList::new(&root, &cfg.deny);
+        let deny = super::super::deny::DenyList::new(&root, &cfg.deny, cfg.readonly);
 
         Ok(Self {
             cfg,

@@ -2570,6 +2570,9 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
 /// `:` in a pattern would either fail the whole spawn or — worse — silently
 /// attenuate other mount protections. A newline/NUL would corrupt gitignore
 /// parsing. Validate here so the runtime never accepts an injectable pattern.
+///
+/// Keep this in sync with the identical validators in
+/// `sdk/rust/lib/sandbox/types.rs` and `sdk/go/native/src/lib.rs`.
 fn validate_deny_pattern(value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err("empty deny pattern".to_string());

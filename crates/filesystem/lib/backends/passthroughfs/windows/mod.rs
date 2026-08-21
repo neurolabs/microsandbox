@@ -212,8 +212,6 @@ impl PassthroughFs {
 
     /// Whether `name` in `parent` is denied by the deny list.
     ///
-    /// Whether `name` in `parent` is denied by the deny list.
-    ///
     /// Fails closed (returns `true`) when the parent-inode path cannot be
     /// reconstructed under active path patterns, so a deny list is never
     /// silently bypassed on an unresolvable path.
@@ -236,10 +234,11 @@ impl PassthroughFs {
             return true;
         };
 
-        let rel = parent_data
-            .path
-            .strip_prefix(&self.root)
-            .unwrap_or(&parent_data.path);
+        let Some(rel) = parent_data.path.strip_prefix(&self.root) else {
+            // Fail closed: a parent path outside the mount root cannot be
+            // matched against a path pattern, so it must deny, never allow.
+            return true;
+        };
         let mut rel_str = String::new();
         for component in rel.components() {
             if let Component::Normal(part) = component {

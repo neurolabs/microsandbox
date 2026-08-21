@@ -1219,6 +1219,10 @@ fn validate_host_path_wire_safe(path: &Path, label: &str) -> crate::Microsandbox
 /// The block is comma-joined and the spec is colon-split, so any of those
 /// separators (or a newline/NUL, which would corrupt gitignore parsing) must
 /// be rejected up front rather than silently attenuating other mount options.
+///
+/// Keep this in sync with the identical validators in
+/// `crates/runtime/lib/vm.rs` (`validate_deny_pattern`) and
+/// `sdk/go/native/src/lib.rs`.
 fn validate_deny_pattern(pattern: &str) -> crate::MicrosandboxResult<()> {
     if pattern.is_empty() {
         return Err(crate::MicrosandboxError::InvalidConfig(

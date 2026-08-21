@@ -1123,10 +1123,11 @@ fn deny_basename_lookup_hidden() {
     fs.lookup(context(), ROOT_INODE, c"visible.txt").unwrap();
 }
 
-/// On a case-insensitive filesystem (the Windows default), a denied basename is
-/// also hidden under a differently-cased variant: `.env` must hide `.ENV` and
-/// `.Env`, because the host resolves all of them to the same file. Without this,
-/// a guest could bypass the deny list by requesting a case variant.
+/// On a case-insensitive filesystem (NTFS, the Windows default), a denied
+/// basename is also hidden under a differently-cased variant: `.env` must hide
+/// `.ENV` and `.Env`, because the host resolves all of them to the same file.
+/// Without this, a guest could bypass the deny list by requesting a case
+/// variant. This test assumes the temp dir is on case-insensitive NTFS.
 #[test]
 fn deny_basename_hides_case_variant() {
     let temp = TempDir::new();
@@ -1433,20 +1434,67 @@ fn deny_path_pattern_create_rejected_in_hidden_subtree() {
     .unwrap();
 }
 
-/// A non-UTF-8 leaf name is denied (fails closed) under active path patterns,
-/// rather than silently bypassing the deny list because it cannot be decoded.
+/// A non-UTF-8 leaf name is rejected by name validation before the deny list
+/// is consulted: `validate_component` (`windows/mod.rs`) returns `EINVAL` for
+/// names that cannot be decoded, which runs ahead of any deny matching.
 #[test]
-fn deny_path_pattern_non_utf8_name_fails_closed() {
+fn deny_path_pattern_non_utf8_name_is_invalid() {
     let temp = TempDir::new();
     let fs = fs_for_deny(&temp.path, vec!["sub/secret".to_string()]);
 
     // The parent directory is reachable.
     let dir = fs.lookup(context(), ROOT_INODE, c"sub").unwrap();
 
-    // A name that is not valid UTF-8 cannot be matched against a path pattern,
-    // so it must be denied rather than allowed through.
+    // A name that is not valid UTF-8 fails component validation with EINVAL,
+    // before the deny list is consulted.
     let name = CStr::from_bytes_with_nul(b"secret\xff\0").unwrap();
-    expect_errno(fs.lookup(context(), dir.inode, name), LINUX_ENOENT);
+    expect_errno(fs.lookup(context(), dir.inode, name), LINUX_EINVAL);
+}
+
+/// Every name-taking op validates the component before consulting the deny
+/// list, so a non-UTF-8 name fails with EINVAL rather than EACCES (parity with
+/// lookup). NTFS is UTF-16, so such a name is invalid input on Windows; the
+/// deny check still runs for valid names and returns EACCES.
+#[test]
+fn deny_non_utf8_name_is_invalid_on_all_ops() {
+    let temp = TempDir::new();
+    let fs = fs_for_deny(&temp.path, vec!["sub/secret".to_string()]);
+
+    // The parent directory is reachable.
+    let dir = fs.lookup(context(), ROOT_INODE, c"sub").unwrap();
+
+    // A name that is not valid UTF-8 cannot be matched against a path pattern;
+    // it must fail validation with EINVAL before the deny check runs.
+    let name = CStr::from_bytes_with_nul(b"secret\xff\0").unwrap();
+
+    // create validates before the deny check.
+    let flags = (LINUX_O_CREAT | LINUX_O_RDWR) as u32;
+    expect_errno(
+        fs.create(
+            context(),
+            dir.inode,
+            name,
+            S_IFREG | 0o644,
+            false,
+            flags,
+            0,
+            Extensions::default(),
+        ),
+        LINUX_EINVAL,
+    );
+
+    // unlink validates before the deny check.
+    expect_errno(fs.unlink(context(), dir.inode, name), LINUX_EINVAL);
+
+    // rename validates both names before the deny check.
+    expect_errno(
+        fs.rename(context(), dir.inode, c"ok.txt", dir.inode, name, 0),
+        LINUX_EINVAL,
+    );
+    expect_errno(
+        fs.rename(context(), dir.inode, name, dir.inode, c"ok.txt", 0),
+        LINUX_EINVAL,
+    );
 }
 
 /// Non-denied names remain fully read-write.

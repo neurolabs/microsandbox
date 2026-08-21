@@ -10,26 +10,12 @@
 //!     .build()?
 //! ```
 
-use std::{
-    collections::BTreeMap,
-    io,
-    os::fd::AsRawFd,
-    path::PathBuf,
-    sync::{
-        RwLock,
-        atomic::{AtomicBool, AtomicU64},
-    },
-    time::Duration,
-};
-#[cfg(target_os = "linux")]
-use std::{fs::File, os::fd::FromRawFd};
+use std::{io, path::PathBuf, time::Duration};
 
 use super::{
-    BindIdentityMapHandle, CachePolicy, HostPermissions, PassthroughFs, StatVirtualization,
+    BindIdentityMapHandle, CachePolicy, HostPermissions, PassthroughConfig, PassthroughFs,
+    StatVirtualization,
 };
-#[cfg(target_os = "linux")]
-use crate::backends::shared::platform;
-use crate::backends::shared::{init_binary, inode_table::MultikeyBTreeMap, stat_override};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -165,8 +151,8 @@ impl PassthroughFsBuilder {
             .root_dir
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "root_dir not set"))?;
 
-        let cfg_probe = super::PassthroughConfig {
-            root_dir: root_dir.clone(),
+        let cfg = PassthroughConfig {
+            root_dir,
             no_symlink_root: self.no_symlink_root,
             stat_virtualization: self.stat_virtualization,
             host_permissions: self.host_permissions,
@@ -178,65 +164,9 @@ impl PassthroughFsBuilder {
             inject_init: self.inject_init,
             bind_identity_map: self.bind_identity_map,
             quota_bytes: self.quota_bytes,
-            deny: self.deny.clone(),
+            deny: self.deny,
         };
 
-        // Open the root directory, contained beneath the anchor when one is set.
-        let root_fd = super::open_root(&cfg_probe)?;
-
-        // Probe xattr support if strict mode is enabled.
-        if cfg_probe.strict_enabled() && cfg_probe.xattr_enabled() {
-            let supported = stat_override::probe_xattr_support(root_fd.as_raw_fd())?;
-            if !supported {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "xattr not supported on root filesystem and stat_virtualization is Strict",
-                ));
-            }
-        }
-
-        // Create the init binary file.
-        let init_file = init_binary::create_init_file()?;
-
-        // Probe openat2 / RESOLVE_BENEATH availability (Linux 5.6+).
-        #[cfg(target_os = "linux")]
-        let has_openat2 = AtomicBool::new(platform::probe_openat2());
-
-        // Open /proc/self/fd on Linux for efficient path resolution.
-        #[cfg(target_os = "linux")]
-        let proc_self_fd = {
-            let path = std::ffi::CString::new("/proc/self/fd").unwrap();
-            let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-            if fd < 0 {
-                return Err(platform::linux_error(io::Error::last_os_error()));
-            }
-            unsafe { File::from_raw_fd(fd) }
-        };
-
-        let cfg = cfg_probe;
-
-        let quota = cfg
-            .quota_bytes
-            .map(|limit| super::super::quota::DirQuota::new(cfg.root_dir.clone(), limit));
-
-        let deny_list = super::super::deny::DenyList::new(&cfg.root_dir, &self.deny);
-
-        Ok(PassthroughFs {
-            cfg,
-            root_fd,
-            inodes: RwLock::new(MultikeyBTreeMap::new()),
-            next_inode: AtomicU64::new(3), // 1=root, 2=init
-            handles: RwLock::new(BTreeMap::new()),
-            dir_handles: RwLock::new(BTreeMap::new()),
-            next_handle: AtomicU64::new(1), // 0=init handle
-            writeback: AtomicBool::new(false),
-            init_file,
-            #[cfg(target_os = "linux")]
-            has_openat2,
-            #[cfg(target_os = "linux")]
-            proc_self_fd,
-            quota,
-            deny: deny_list,
-        })
+        PassthroughFs::new(cfg)
     }
 }

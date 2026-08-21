@@ -2269,7 +2269,10 @@ fn push_dir_mount_arg(
         opts.push(format!("quota={mib}"));
     }
     for p in deny {
-        opts.push(format!("deny={p}"));
+        // Trim the pattern so a value like `" .env"` renders as `deny=.env`
+        // rather than a literal-space pattern `deny= .env`, matching the CLI
+        // and runtime, which trim option tokens on parse.
+        opts.push(format!("deny={}", p.trim()));
     }
     append_option_block(&mut arg, opts);
     mounts.push(arg);
@@ -2303,7 +2306,10 @@ fn push_file_mount_arg(
     // and stays under the default no-follow root protection — no opt-out here.
     append_policy_options(&mut opts, stat_virtualization, host_permissions, false);
     for p in deny {
-        opts.push(format!("deny={p}"));
+        // Trim the pattern so a value like `" .env"` renders as `deny=.env`
+        // rather than a literal-space pattern `deny= .env`, matching the CLI
+        // and runtime, which trim option tokens on parse.
+        opts.push(format!("deny={}", p.trim()));
     }
     append_option_block(&mut arg, opts);
     mounts.push(arg);

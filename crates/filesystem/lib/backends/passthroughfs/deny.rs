@@ -9,6 +9,12 @@
 //!
 //! Cross-platform: the matcher lives at the passthrough level so both the
 //! Unix and Windows passthrough backends can use it.
+//!
+//! Deny is enforced only at name-taking entry points (lookup, create, mkdir,
+//! unlink, rename, readdir, ...). Inode-scoped operations that reuse an already
+//! resolved inode (`open` for write, `setattr`, `write`) are deliberately not
+//! deny-checked: lookup returns `ENOENT` for a denied name, so the guest can
+//! never obtain the inode of a hidden entry in the first place.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -78,7 +84,12 @@ impl DenyList {
     /// Patterns are parsed with gitignore semantics. Invalid patterns are
     /// skipped; a fully invalid or empty list yields a matcher that denies
     /// nothing.
-    pub(crate) fn new(root: &Path, patterns: &[String]) -> Self {
+    ///
+    /// `readonly` reports whether the mount is read-only. On read-only mounts
+    /// the case-sensitivity probe write cannot run (it fails with `EROFS`), so
+    /// case-sensitivity is instead inferred from the filesystem type; see
+    /// [`mount_is_case_insensitive`].
+    pub(crate) fn new(root: &Path, patterns: &[String], readonly: bool) -> Self {
         let mut builder = GitignoreBuilder::new(Path::new("/"));
         let mut needs_path_reconstruction = false;
         let mut has_dir_only_patterns = false;
@@ -87,7 +98,11 @@ impl DenyList {
             has_dir_only_patterns |= pattern.ends_with('/');
             let _ = builder.add_line(None, pattern);
         }
-        let _ = builder.case_insensitive(mount_is_case_insensitive(root));
+        // Skip the host-side case-insensitivity probe for the common empty-list
+        // case, so deny-less mounts avoid creating a probe file in the root.
+        if !patterns.is_empty() {
+            let _ = builder.case_insensitive(mount_is_case_insensitive(root, readonly));
+        }
         let matcher = builder.build().unwrap_or_else(|_| Gitignore::empty());
         Self {
             matcher,
@@ -114,6 +129,13 @@ impl DenyList {
     ///
     /// `is_dir` reports whether the entry is a directory; only dir-only
     /// patterns (trailing `/`) depend on it.
+    ///
+    /// Caller contract: the caller must confirm [`Self::needs_path_reconstruction`]
+    /// is `false` before calling this (the `debug_assert!` enforces it in debug
+    /// builds). A path pattern (interior `/`) can only be matched against the
+    /// full mount-relative path, so silently calling this with path patterns
+    /// would let a matching path slip through — the deny check must fall back
+    /// to [`Self::matches_path`] instead.
     pub(crate) fn matches_basename(&self, name: &[u8], is_dir: bool) -> bool {
         debug_assert!(!self.needs_path_reconstruction);
         self.is_ignored(name_as_path(name), is_dir)
@@ -153,16 +175,22 @@ static CASE_PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
 ///
 /// We don't detect case sensitivity per directory, but per mount.
 ///
-/// Uses git's `core.ignorecase` probe: create a probe file with a known
-/// mixed-case name, then check whether a case variant of that name
-/// resolves to the same file. If it does, the filesystem folds case and deny
-/// patterns must be matched case-insensitively.
+/// On writable mounts this uses git's `core.ignorecase` probe: create a probe
+/// file with a known mixed-case name, then check whether a case variant of
+/// that name resolves to the same file. If it does, the filesystem folds case
+/// and deny patterns must be matched case-insensitively. The probe requires a
+/// write, so on read-only mounts (`readonly` set) it cannot run; there,
+/// case-sensitivity is instead inferred from the filesystem type ([`ro_fs_is_case_sensitive`]).
 ///
 /// A failed probe defaults to `true` (case-insensitive) rather than `false`:
 /// over-matching only hides a few differently-cased names that almost never
 /// coexist, whereas under-matching on a case-insensitive host would let a
 /// pattern like `.env` be bypassed by requesting `.ENV`.
-fn mount_is_case_insensitive(root: &Path) -> bool {
+fn mount_is_case_insensitive(root: &Path, readonly: bool) -> bool {
+    if readonly {
+        return !ro_fs_is_case_sensitive(root);
+    }
+
     let seq = CASE_PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
     let probe_name = format!("{CASE_PROBE_PREFIX}-{}-{seq}", std::process::id());
     let validation_name = format!("{}-{}-{seq}", case_validation_prefix(), std::process::id());
@@ -183,6 +211,52 @@ fn mount_is_case_insensitive(root: &Path) -> bool {
     })();
 
     result.unwrap_or(true)
+}
+
+/// Whether a read-only mount root sits on a filesystem known to be
+/// case-sensitive.
+///
+/// On read-only mounts the case-sensitivity probe cannot create its marker
+/// file, so case-sensitivity is inferred instead. Only positive proof of
+/// case-sensitivity permits byte-exact matching; unknown or ambiguous
+/// filesystem types report `false` (assume case-insensitive) so a deny list
+/// over-matches rather than letting a case-variant name bypass a pattern.
+#[cfg(target_os = "linux")]
+fn ro_fs_is_case_sensitive(root: &Path) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let Ok(dir) = std::fs::File::open(root) else {
+        return false;
+    };
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs(dir.as_raw_fd(), &mut st) } != 0 {
+        return false;
+    }
+    // Known case-sensitive filesystem magic numbers (ext2/3/4, xfs, btrfs,
+    // tmpfs, reiserfs, jfs, f2fs, bcachefs, nilfs2, ocfs2). Everything else
+    // (overlayfs, vfat/exfat/ntfs, remote/fuseblk/cifs/nfs, unknown, future
+    // types) is treated as case-insensitive.
+    matches!(
+        st.f_type as u32,
+        0x0000_EF53 // ext2/3/4
+            | 0x5846_5342 // xfs
+            | 0x9123_683E // btrfs
+            | 0x0102_1994 // tmpfs
+            | 0x5265_4973 // reiserfs
+            | 0x3153_464A // jfs
+            | 0xF2F5_2010 // f2fs
+            | 0xCA45_1A4E // bcachefs
+            | 0x0000_3434 // nilfs2
+            | 0x7461_636F // ocfs2
+    )
+}
+
+/// Non-Linux hosts do not expose case-sensitivity via `statfs` (macOS APFS is
+/// case-insensitive by default and its mode is not queryable here; Windows NTFS
+/// is case-insensitive), so a read-only mount is assumed case-insensitive.
+#[cfg(not(target_os = "linux"))]
+fn ro_fs_is_case_sensitive(_root: &Path) -> bool {
+    false
 }
 
 /// Join entry-name components into a relative `PathBuf`.
@@ -237,7 +311,7 @@ mod tests {
         let owned: Vec<String> = patterns.iter().map(|s| s.to_string()).collect();
         let root = std::env::temp_dir().join(format!("msb-deny-test-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        let list = DenyList::new(&root, &owned);
+        let list = DenyList::new(&root, &owned, false);
         let _ = std::fs::remove_dir_all(&root);
         list
     }
@@ -248,9 +322,36 @@ mod tests {
         // Therefore, we only assert the probe leaves no residue.
         let root = std::env::temp_dir().join(format!("msb-deny-probe-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        let _ = mount_is_case_insensitive(&root);
+        let _ = mount_is_case_insensitive(&root, false);
         let empty = std::fs::read_dir(&root).unwrap().count();
         assert_eq!(empty, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn readonly_mount_detects_case_sensitivity_without_probe() {
+        // A read-only mount infers case-sensitivity from the filesystem type
+        // (via `statfs`) and must never create the probe file.
+        let root = std::env::temp_dir().join(format!("msb-deny-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let list = DenyList::new(&root, &[".env".to_string()], true);
+        let residue = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("MsBCaSePrObE"))
+            .count();
+        assert_eq!(
+            residue, 0,
+            "a read-only mount must not probe the filesystem"
+        );
+
+        // The deny list's effective case-sensitivity must match the detection:
+        // on a case-sensitive host `.ENV` stays visible, on a case-insensitive
+        // host it is hidden by the `.env` pattern.
+        let case_sensitive = ro_fs_is_case_sensitive(&root);
+        assert_eq!(list.matches_basename(b".ENV", false), !case_sensitive);
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

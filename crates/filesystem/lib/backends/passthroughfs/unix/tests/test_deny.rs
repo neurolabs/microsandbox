@@ -372,6 +372,42 @@ fn test_deny_path_pattern_create() {
     sb.fuse_create(dir.inode, "normal.txt", 0o644).unwrap();
 }
 
+/// A path pattern fires on a rename whose destination is the denied path.
+///
+/// This pins the location-based semantics of path patterns: `sub/.env` hides a
+/// file *at* `sub/.env`, so renaming a visible file onto that path is rejected
+/// with `EACCES`. (The converse — renaming a denied file *off* the path makes
+/// it served — is pinned separately as the known ancestor-rename laundering
+/// limitation.)
+#[test]
+fn test_deny_path_pattern_rename_onto_denied_path_is_rejected() {
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec!["sub/.env".to_string()],
+        ..cfg
+    });
+    sb.host_create_dir("sub");
+    sb.fuse_create_root("src").unwrap();
+
+    // The destination `sub/.env` matches the denied path, so the rename is
+    // rejected before any host move happens.
+    let sub = sb.lookup_root("sub").unwrap();
+    TestSandbox::assert_errno(
+        sb.fs.rename(
+            sb.ctx(),
+            ROOT_INODE,
+            &TestSandbox::cstr("src"),
+            sub.inode,
+            &TestSandbox::cstr(".env"),
+            0,
+        ),
+        LINUX_EACCES,
+    );
+
+    // The source is untouched and the denied destination is still absent.
+    sb.lookup_root("src").unwrap();
+    TestSandbox::assert_errno(sb.lookup(sub.inode, ".env"), LINUX_ENOENT);
+}
+
 //--------------------------------------------------------------------------------------------------
 // Tests: dir-only patterns (trailing `/`, e.g. `node_modules/`)
 //--------------------------------------------------------------------------------------------------
