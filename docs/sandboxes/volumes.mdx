@@ -393,6 +393,14 @@ Matching is by **path, not by inode**. A host-created hard link to a denied file
 
 **Negations** (gitignore `!`) are supported, so a broad deny plus explicit allows can act as an allowlist: `deny=*` with `deny=!keep.txt` hides everything except `keep.txt`.
 
+**Performance.** Deny checking adds work to name-taking operations (lookup, create, readdir, ...), and how much depends on the pattern kinds in the list:
+
+- **Name-only patterns** (`.env`, `*.log`) are the cheapest. Each entry is matched by its single component name; no extra filesystem calls are made beyond the operation itself.
+- **Directory-only patterns** (`node_modules/`) must know whether an entry is a directory to hide it but not a same-named file, so they add a type lookup per operation (an `fstatat` on Unix lookups and per readdir entry when the filesystem does not supply a dirent type, a metadata query per readdir entry on Windows). Skip them unless you need to hide a directory while leaving a same-named file visible.
+- **Path patterns** (`sub/secret`, `**/env.secret`) must match against the entry's full mount-relative path, which is reconstructed per operation. On Linux this is an in-memory walk of the inode table (no extra syscalls); on macOS it resolves the parent path through `/.vol`/`F_GETPATH`, which is real per-operation syscall work, most visible on directories with many entries. During `readdir` the parent path is resolved once per directory and reused for all entries. Use name-only patterns when you do not need to match across directories.
+
+In practice the overhead matters most for `readdir`-heavy and lookup-heavy workloads on very large directories with a long path-pattern list. Name-only patterns keep the deny fast path.
+
 ### CLI syntax and flags
 
 CLI mount flags use `SOURCE:DEST[:OPTIONS]`. The `:` before `OPTIONS` starts the option block, and commas separate options inside that block.

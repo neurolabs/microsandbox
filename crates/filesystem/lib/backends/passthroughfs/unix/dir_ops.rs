@@ -299,10 +299,29 @@ fn build_snapshot(
 ) -> io::Result<DirSnapshot> {
     let mut entries = read_dir_entries(fd)?;
 
+    // When a path pattern (interior `/`) is active, resolve the parent's
+    // mount-relative components once so they aren't reconstructed (an inode
+    // table walk on Linux, an `F_GETPATH` syscall on macOS) for every entry in
+    // the directory. Fail closed: an unresolvable parent path under active path
+    // patterns denies the whole directory, matching the per-name behavior.
+    let parent_components = if fs.deny.needs_path_reconstruction() {
+        let root = fs.deny_root();
+        match inode::parent_path_components(&fs.inodes, parent, root) {
+            Some(components) => Some(components),
+            None => {
+                return Ok(DirSnapshot {
+                    entries: Vec::new(),
+                });
+            }
+        }
+    } else {
+        None
+    };
+
     // Filter out entries matching the deny list.
     entries.retain(|entry| {
         let is_dir = entry.file_type == platform::DIRENT_DIR;
-        !fs.deny_matches_name(parent, &entry.name, is_dir)
+        !fs.deny_matches_name_in_dir(parent_components.as_deref(), &entry.name, is_dir)
     });
 
     if inject_init

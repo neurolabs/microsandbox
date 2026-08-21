@@ -457,7 +457,35 @@ impl PassthroughFs {
             // Fail closed
             return true;
         };
-        let mut components = parent_components;
+        self.deny_matches_name_in_dir(Some(&parent_components), name, is_dir)
+    }
+
+    /// Whether `name` under a parent whose mount-relative components are
+    /// already known is denied by the deny list.
+    ///
+    /// Lets callers that check many names in the same directory (readdir) reuse
+    /// the parent's resolved components instead of reconstructing them (an
+    /// inode-table walk on Linux, an `F_GETPATH` syscall on macOS) once per
+    /// entry.
+    ///
+    /// `parent_components` is the parent's mount-relative components as produced
+    /// by [`inode::parent_path_components`], used only when a path pattern is
+    /// active. The caller is responsible for the parent-path resolution and its
+    /// fail-closed handling.
+    fn deny_matches_name_in_dir(
+        &self,
+        parent_components: Option<&[Vec<u8>]>,
+        name: &[u8],
+        is_dir: bool,
+    ) -> bool {
+        // The structural `.` and `..` entries must never be denied.
+        if name == b"." || name == b".." {
+            return false;
+        }
+        if !self.deny.needs_path_reconstruction() {
+            return self.deny.matches_basename(name, is_dir);
+        }
+        let mut components = parent_components.unwrap_or_default().to_vec();
         components.push(name.to_vec());
         self.deny
             .matches_path(deny::join_path(&components).as_os_str().as_bytes(), is_dir)

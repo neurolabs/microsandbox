@@ -58,11 +58,12 @@ impl PassthroughFs {
                 .map_err(|_| linux_error(LINUX_EINVAL))?;
             validate_component(name)?;
 
-            if self.deny_matches_name(
-                inode,
-                name,
-                entry.file_type().map(|t| t.is_dir()).unwrap_or(false),
-            ) {
+            let deny_is_dir = if self.deny.has_dir_only_patterns() {
+                entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+            } else {
+                false
+            };
+            if self.deny_matches_name(inode, name, deny_is_dir) {
                 continue;
             }
 
@@ -159,11 +160,12 @@ impl PassthroughFs {
                 .map_err(|_| linux_error(LINUX_EINVAL))?;
             validate_component(name)?;
 
-            if self.deny_matches_name(
-                inode,
-                name,
-                entry.file_type().map(|t| t.is_dir()).unwrap_or(false),
-            ) {
+            let deny_is_dir = if self.deny.has_dir_only_patterns() {
+                entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+            } else {
+                false
+            };
+            if self.deny_matches_name(inode, name, deny_is_dir) {
                 continue;
             }
 
