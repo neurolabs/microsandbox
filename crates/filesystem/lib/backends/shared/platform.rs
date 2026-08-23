@@ -351,6 +351,11 @@ pub(crate) fn eacces() -> io::Error {
     io::Error::from_raw_os_error(LINUX_EACCES)
 }
 
+/// Create an `io::Error` with Linux `EBUSY`.
+pub(crate) fn ebusy() -> io::Error {
+    io::Error::from_raw_os_error(LINUX_EBUSY)
+}
+
 /// Create an `io::Error` with Linux `EPERM`.
 pub(crate) fn eperm() -> io::Error {
     io::Error::from_raw_os_error(LINUX_EPERM)

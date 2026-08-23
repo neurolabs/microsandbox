@@ -768,6 +768,18 @@ fn linux_error(errno: i32) -> io::Error {
     io::Error::from_raw_os_error(errno)
 }
 
+/// A stable per-volume file identity, when the filesystem exposes one.
+///
+/// Combines the volume serial number and the volume-unique file index. Returns
+/// `None` when the filesystem does not report a file index (so callers can skip
+/// identity-based race checks rather than fail).
+fn file_identity(metadata: &std::fs::Metadata) -> Option<(u32, u64)> {
+    match (metadata.volume_serial_number(), metadata.file_index()) {
+        (Some(volume), Some(index)) => Some((volume, index)),
+        _ => None,
+    }
+}
+
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
