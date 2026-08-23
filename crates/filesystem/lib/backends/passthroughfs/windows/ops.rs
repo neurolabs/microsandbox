@@ -219,14 +219,18 @@ impl DynFileSystem for PassthroughFs {
             }
 
             // The source path must still refer to the same file before moving it.
-            // Only retry on a definitive identity mismatch: when the filesystem
+            // Only retry on a definitive identity mismatch. When the filesystem
             // reports no file identity (FAT32/exFAT, some network volumes) the
-            // check is best-effort and must not fail the rename.
-            match (
-                file_identity(&source_meta),
-                file_identity(&self.safe_metadata(&old_path)?),
-            ) {
+            // source's type at move time cannot be verified, so with dir-only
+            // deny patterns the security-relevant type decision must fail closed
+            // rather than allow a swapped-in directory to be renamed to a
+            // dir-only-denied destination.
+            let after_identity = file_identity(&self.safe_metadata(&old_path)?);
+            match (file_identity(&source_meta), after_identity) {
                 (Some(before), Some(after)) if before != after => continue,
+                (None, _) | (_, None) if self.deny.has_dir_only_patterns() => {
+                    return Err(linux_error(LINUX_EBUSY));
+                }
                 _ => {}
             }
 
