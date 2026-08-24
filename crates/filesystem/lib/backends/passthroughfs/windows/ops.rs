@@ -239,6 +239,13 @@ impl DynFileSystem for PassthroughFs {
             // renames between non-denied paths, and renames of a same-named file
             // away from a dir-only pattern, are unaffected: FAT/exFAT keeps nearly
             // full rename support except for the narrow destination-collision case.
+            // The window between this re-check and the path-based rename below is
+            // irreducible: nothing pins the source through the move, so a fast
+            // enough external writer can still swap a directory past this final
+            // check. That residual risk is accepted, matching the Linux and macOS
+            // backends, where no rename-conditional-on-inode operation exists and
+            // the same window cannot be closed at all (upstream virtiofsd accepts
+            // the same race).
             let after_identity = file_identity(&self.safe_metadata(&old_path)?);
             let dir_denied = !source_is_dir
                 && self.deny.has_dir_only_patterns()
