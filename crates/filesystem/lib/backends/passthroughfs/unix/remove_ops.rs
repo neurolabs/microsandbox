@@ -297,9 +297,34 @@ pub(crate) fn do_rename(
             };
             unsafe { libc::close(source_probe_fd) };
 
+            // Resolve each parent's mount-relative path once per attempt and
+            // reuse it across the deny checks below: path patterns need it for
+            // every match, and one resolution walks the inode anchor chain,
+            // which dominates the cost of a deny check. Component-only patterns
+            // skip resolution entirely (basename fast path). An unresolvable
+            // parent fails closed, mirroring `deny_matches_name`.
+            let (old_comps, new_comps) = if fs.deny.needs_path_reconstruction() {
+                let old_comps = inode::parent_path_components(&fs.inodes, olddir, fs.deny_root())
+                    .ok_or_else(platform::eacces)?;
+                // Same-directory renames are the dominant case; resolve once.
+                let new_comps = if newdir == olddir {
+                    old_comps.clone()
+                } else {
+                    inode::parent_path_components(&fs.inodes, newdir, fs.deny_root())
+                        .ok_or_else(platform::eacces)?
+                };
+                (Some(old_comps), Some(new_comps))
+            } else {
+                (None, None)
+            };
+
             // Authoritative deny decision against the pinned source type.
-            if fs.deny_matches_name(olddir, oldname.to_bytes(), source_is_dir)
-                || fs.deny_matches_name(newdir, newname.to_bytes(), source_is_dir)
+            if fs.deny_matches_name_in_dir(old_comps.as_deref(), oldname.to_bytes(), source_is_dir)
+                || fs.deny_matches_name_in_dir(
+                    new_comps.as_deref(),
+                    newname.to_bytes(),
+                    source_is_dir,
+                )
             {
                 return Err(platform::eacces());
             }
@@ -307,7 +332,20 @@ pub(crate) fn do_rename(
                 let dest_is_dir = platform::fstatat_nofollow(new_fd.raw(), newname)
                     .map(|st| platform::mode_file_type(st.st_mode) == platform::MODE_DIR)
                     .unwrap_or(false);
-                if dest_is_dir && fs.deny_matches_name(newdir, newname.to_bytes(), true) {
+                if dest_is_dir
+                    && fs.deny_matches_name_in_dir(new_comps.as_deref(), newname.to_bytes(), true)
+                {
+                    return Err(platform::eacces());
+                }
+                // RENAME_EXCHANGE also moves the destination onto the *source*
+                // name, so the reverse direction needs the destination's type:
+                // exchanging a file at a dir-only-denied name with a directory at
+                // an allowed name would otherwise land the directory at the
+                // denied name.
+                if flags & RENAME_EXCHANGE != 0
+                    && dest_is_dir
+                    && fs.deny_matches_name_in_dir(old_comps.as_deref(), oldname.to_bytes(), true)
+                {
                     return Err(platform::eacces());
                 }
             }
@@ -438,9 +476,35 @@ pub(crate) fn do_rename(
             let source_is_dir = fs.deny.has_dir_only_patterns()
                 && platform::mode_file_type(source_st.st_mode) == platform::MODE_DIR;
 
+            // Resolve each parent's mount-relative path once per attempt and
+            // reuse it across the deny checks below: path patterns need it for
+            // every match, and one resolution runs F_GETPATH through the
+            // `/.vol/<dev>/<ino>` path, which dominates the cost of a deny
+            // check. Component-only patterns skip resolution entirely (basename
+            // fast path). An unresolvable parent fails closed, mirroring
+            // `deny_matches_name`.
+            let (old_comps, new_comps) = if fs.deny.needs_path_reconstruction() {
+                let old_comps = inode::parent_path_components(&fs.inodes, olddir, fs.deny_root())
+                    .ok_or_else(platform::eacces)?;
+                // Same-directory renames are the dominant case; resolve once.
+                let new_comps = if newdir == olddir {
+                    old_comps.clone()
+                } else {
+                    inode::parent_path_components(&fs.inodes, newdir, fs.deny_root())
+                        .ok_or_else(platform::eacces)?
+                };
+                (Some(old_comps), Some(new_comps))
+            } else {
+                (None, None)
+            };
+
             // Authoritative deny decision against the freshly-captured source type.
-            if fs.deny_matches_name(olddir, oldname.to_bytes(), source_is_dir)
-                || fs.deny_matches_name(newdir, newname.to_bytes(), source_is_dir)
+            if fs.deny_matches_name_in_dir(old_comps.as_deref(), oldname.to_bytes(), source_is_dir)
+                || fs.deny_matches_name_in_dir(
+                    new_comps.as_deref(),
+                    newname.to_bytes(),
+                    source_is_dir,
+                )
             {
                 return Err(platform::eacces());
             }
@@ -448,7 +512,21 @@ pub(crate) fn do_rename(
                 let dest_is_dir = platform::fstatat_nofollow(new_fd.raw(), newname)
                     .map(|st| platform::mode_file_type(st.st_mode) == platform::MODE_DIR)
                     .unwrap_or(false);
-                if dest_is_dir && fs.deny_matches_name(newdir, newname.to_bytes(), true) {
+                if dest_is_dir
+                    && fs.deny_matches_name_in_dir(new_comps.as_deref(), newname.to_bytes(), true)
+                {
+                    return Err(platform::eacces());
+                }
+                // RENAME_EXCHANGE also moves the destination onto the *source*
+                // name, so the reverse direction needs the destination's type:
+                // exchanging a file at a dir-only-denied name with a directory at
+                // an allowed name would otherwise land the directory at the
+                // denied name. Linux RENAME_EXCHANGE = 2; `flags` is translated
+                // to macOS renameatx_np flags below.
+                if flags & 2 != 0
+                    && dest_is_dir
+                    && fs.deny_matches_name_in_dir(old_comps.as_deref(), oldname.to_bytes(), true)
+                {
                     return Err(platform::eacces());
                 }
             }

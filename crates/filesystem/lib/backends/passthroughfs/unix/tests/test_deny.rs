@@ -552,6 +552,67 @@ fn test_deny_dir_only_rename_file_over_hidden_dir_rejected() {
     );
 }
 
+/// RENAME_EXCHANGE also moves the destination onto the *source* name, so a
+/// file exchanged with an allowed directory would land the directory at a
+/// dir-only-denied source name. The reverse direction must be rejected.
+#[test]
+fn test_deny_dir_only_rename_exchange_dir_onto_denied_name_rejected() {
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec!["node_modules/".to_string()],
+        ..cfg
+    });
+
+    // A file named `node_modules` is allowed under 'node_modules/'; a dir at
+    // an allowed name is allowed. Exchanging them must not be.
+    let (_entry, _handle) = sb.fuse_create_root("node_modules").unwrap();
+    sb.fuse_mkdir_root("staging").unwrap();
+
+    TestSandbox::assert_errno(
+        sb.fs.rename(
+            sb.ctx(),
+            ROOT_INODE,
+            &TestSandbox::cstr("node_modules"),
+            ROOT_INODE,
+            &TestSandbox::cstr("staging"),
+            2, // RENAME_EXCHANGE
+        ),
+        LINUX_EACCES,
+    );
+
+    // The layout is unchanged: the file is still visible, the dir stayed put.
+    let entry = sb.lookup_root("node_modules").unwrap();
+    assert_ne!(entry.inode, 0);
+    sb.lookup_root("staging").unwrap();
+}
+
+/// RENAME_EXCHANGE of two files keeps files on both sides, so a dir-only
+/// pattern does not apply even when one name matches it.
+#[test]
+fn test_deny_dir_only_rename_exchange_two_files_allowed() {
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec!["node_modules/".to_string()],
+        ..cfg
+    });
+
+    let (_entry, _handle) = sb.fuse_create_root("node_modules").unwrap();
+    let (_entry2, _handle2) = sb.fuse_create_root("allowed.txt").unwrap();
+
+    sb.fs
+        .rename(
+            sb.ctx(),
+            ROOT_INODE,
+            &TestSandbox::cstr("node_modules"),
+            ROOT_INODE,
+            &TestSandbox::cstr("allowed.txt"),
+            2, // RENAME_EXCHANGE
+        )
+        .unwrap();
+
+    // Both names still resolve: node_modules holds a file, which stays visible.
+    sb.lookup_root("node_modules").unwrap();
+    sb.lookup_root("allowed.txt").unwrap();
+}
+
 /// Renaming a directory onto an already-hidden file returns EACCES.
 ///
 /// A basename pattern such as `.env` matches both files and directories, so
