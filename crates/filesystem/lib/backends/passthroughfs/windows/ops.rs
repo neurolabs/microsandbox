@@ -219,21 +219,30 @@ impl DynFileSystem for PassthroughFs {
             }
 
             // The source path must still refer to the same file before moving it.
-            // Only retry on a definitive identity mismatch. When the filesystem
-            // reports no file identity (FAT32/exFAT, some network volumes) the
-            // source's type at move time cannot be verified. That is only a
-            // problem when the source or destination actually collides with a
-            // dir-only deny pattern, because there the file-vs-directory
-            // distinction decides allow vs deny and a stale file decision could
-            // let a swapped-in directory through. Refuse just that case rather
-            // than block every rename on an identity-less filesystem.
+            // Only retry on a definitive identity mismatch. A dir-only pattern
+            // distinguishes files from directories, so a file named `node_modules`
+            // is legitimately renamable while a directory is denied. The stale-type
+            // risk is therefore only real when a directory could land at a
+            // dir-only-denied *destination* after a file was decided; the
+            // source-side collision is already enforced by the deny check above (a
+            // denied directory is rejected outright). Refuse just that destination
+            // case, and only when the source was decided to be a file (the decision
+            // a swap could invalidate). `is_dir` only affects matching under
+            // dir-only patterns, so gate on that too and skip the redundant pass
+            // otherwise.
+            // When the filesystem reports no file identity (FAT32/exFAT, some
+            // network volumes) the source's type at move time cannot be verified.
+            // On such filesystems this guard makes a rename fail closed (EBUSY)
+            // only when the destination collides with a dir-only pattern and the
+            // source was decided to be a file, because that is the one case a swap
+            // could turn into a directory landing at a denied name. Ordinary
+            // renames between non-denied paths, and renames of a same-named file
+            // away from a dir-only pattern, are unaffected: FAT/exFAT keeps nearly
+            // full rename support except for the narrow destination-collision case.
             let after_identity = file_identity(&self.safe_metadata(&old_path)?);
-            // `is_dir` only affects matching under dir-only patterns, so without
-            // them a path already allowed as a file is also allowed as a
-            // directory; skip the redundant matching passes entirely.
-            let dir_denied = self.deny.has_dir_only_patterns()
-                && (self.deny_matches_name(olddir, oldname, true)
-                    || self.deny_matches_name(newdir, newname, true));
+            let dir_denied = !source_is_dir
+                && self.deny.has_dir_only_patterns()
+                && self.deny_matches_name(newdir, newname, true);
             match (file_identity(&source_meta), after_identity) {
                 (Some(before), Some(after)) if before != after => continue,
                 (None, _) | (_, None) if dir_denied => {
