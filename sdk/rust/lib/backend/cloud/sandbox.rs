@@ -78,7 +78,7 @@ impl SandboxBackend for CloudBackend {
         start: bool,
     ) -> BoxFuture<'a, MicrosandboxResult<Sandbox>> {
         Box::pin(async move {
-            let req = CloudCreateBody::try_from(config.clone())?;
+            let (req, config) = cloud_create_body_and_config(config)?;
             let cloud = CloudBackend::create_sandbox(self, &req, start).await?;
             if start {
                 ensure_cloud_sandbox_ready(&cloud)?;
@@ -95,7 +95,7 @@ impl SandboxBackend for CloudBackend {
         // Cloud has no notion of "detached" — the sandbox lifecycle is owned
         // by msb-cloud, not by this process. Reuse the eager-start path.
         Box::pin(async move {
-            let req = CloudCreateBody::try_from(config.clone())?;
+            let (req, config) = cloud_create_body_and_config(config)?;
             let cloud = CloudBackend::create_sandbox(self, &req, true).await?;
             ensure_cloud_sandbox_ready(&cloud)?;
             Ok(Sandbox::from_cloud(backend, cloud, config))
@@ -257,7 +257,7 @@ impl TryFrom<SandboxConfig> for CloudCreateBody {
 
     /// Build the cloud create body from an SDK config, rejecting the
     /// create-time options the cloud does not accept.
-    fn try_from(config: SandboxConfig) -> MicrosandboxResult<Self> {
+    fn try_from(mut config: SandboxConfig) -> MicrosandboxResult<Self> {
         if config.replace_existing {
             return Err(MicrosandboxError::unsupported(
                 Operation::SandboxCreate,
@@ -323,6 +323,11 @@ impl TryFrom<SandboxConfig> for CloudCreateBody {
             }
         }
 
+        // Direct SandboxConfig callers bypass the fluent builder, so impose
+        // the shared path validation and deterministic order at this final
+        // client-side boundary before constructing the cloud wire request.
+        crate::sandbox::validate_volume_mounts(&mut config.spec.mounts)?;
+
         // registry_auth converts into the cloud's credential selection: absent
         // means the cloud picks the stored credential configured for the
         // image's registry host (mirroring the local fallback to configured
@@ -352,6 +357,17 @@ impl TryFrom<SandboxConfig> for CloudCreateBody {
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+fn cloud_create_body_and_config(
+    mut config: SandboxConfig,
+) -> MicrosandboxResult<(CloudCreateBody, SandboxConfig)> {
+    // Build the request first to preserve cloud-specific error precedence,
+    // then apply the same successful canonicalization to the config retained
+    // by Sandbox::config().
+    let request = CloudCreateBody::try_from(config.clone())?;
+    crate::sandbox::validate_volume_mounts(&mut config.spec.mounts)?;
+    Ok((request, config))
+}
 
 /// Reject SDK configuration whose meaning is absent from the current cloud
 /// wire shape. Failing at the backend boundary prevents a successful create
@@ -589,6 +605,83 @@ mod tests {
         );
         assert_eq!(req.slug, None);
         assert_eq!(req.registry, None);
+    }
+
+    #[test]
+    fn cloud_create_request_orders_direct_config_mounts_parent_first() {
+        let mut config = base_cloud_config();
+        config.spec.mounts = vec![
+            VolumeMount::Tmpfs {
+                guest: "/workspace/persist".into(),
+                size_mib: None,
+                options: MountOptions::default(),
+            },
+            VolumeMount::Tmpfs {
+                guest: "/workspace".into(),
+                size_mib: None,
+                options: MountOptions::default(),
+            },
+        ];
+
+        let request = CloudCreateBody::try_from(config).unwrap();
+
+        assert_eq!(
+            request
+                .envelope
+                .spec
+                .mounts
+                .iter()
+                .map(|mount| match mount {
+                    microsandbox_types::CloudVolumeMount::Bind { guest, .. }
+                    | microsandbox_types::CloudVolumeMount::Named { guest, .. }
+                    | microsandbox_types::CloudVolumeMount::Tmpfs { guest, .. }
+                    | microsandbox_types::CloudVolumeMount::DiskImage { guest, .. } => {
+                        guest.as_str()
+                    }
+                })
+                .collect::<Vec<_>>(),
+            vec!["/workspace", "/workspace/persist"]
+        );
+    }
+
+    #[test]
+    fn cloud_create_retains_canonical_mount_config() {
+        let mut config = base_cloud_config();
+        config.spec.mounts = vec![
+            VolumeMount::Tmpfs {
+                guest: "/workspace/persist/.".into(),
+                size_mib: None,
+                options: MountOptions::default(),
+            },
+            VolumeMount::Tmpfs {
+                guest: "/workspace/".into(),
+                size_mib: None,
+                options: MountOptions::default(),
+            },
+        ];
+
+        let (request, config) = cloud_create_body_and_config(config).unwrap();
+        let retained = config
+            .spec
+            .mounts
+            .iter()
+            .map(VolumeMount::guest)
+            .collect::<Vec<_>>();
+        let sent = request
+            .envelope
+            .spec
+            .mounts
+            .iter()
+            .map(|mount| match mount {
+                microsandbox_types::CloudVolumeMount::Bind { guest, .. }
+                | microsandbox_types::CloudVolumeMount::Named { guest, .. }
+                | microsandbox_types::CloudVolumeMount::Tmpfs { guest, .. }
+                | microsandbox_types::CloudVolumeMount::DiskImage { guest, .. } => guest.as_str(),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(retained, vec!["/workspace", "/workspace/persist"]);
+        assert_eq!(retained, sent);
     }
 
     #[test]

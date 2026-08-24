@@ -2,10 +2,8 @@
 //!
 //! These types are referenced by [`SandboxConfig`](super::SandboxConfig).
 
-use std::{
-    collections::HashSet,
-    path::{Path, PathBuf},
-};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use crate::size::Mebibytes;
 
@@ -1060,7 +1058,11 @@ impl ImageBuilder {
     ///
     /// The directory's contents become the guest root filesystem as-is — no
     /// OCI pull and no overlay. Mutually exclusive with [`oci`](Self::oci) and
-    /// [`disk`](Self::disk).
+    /// [`disk`](Self::disk). Pre-boot patches modify this host directory in
+    /// place. Nested mounts and pre-existing hard links are part of the chosen
+    /// filesystem tree, so bind roots that receive patches must not contain
+    /// host-sensitive aliases. Patch destinations must be absolute, canonical
+    /// guest paths without explicit `..` components.
     ///
     /// ```ignore
     /// .image_with(|i| i.bind("/srv/rootfs"))
@@ -1113,18 +1115,24 @@ impl ImageBuilder {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
-pub(crate) fn validate_volume_mounts(mounts: &[VolumeMount]) -> crate::MicrosandboxResult<()> {
+pub(crate) fn validate_volume_mounts(mounts: &mut [VolumeMount]) -> crate::MicrosandboxResult<()> {
     let mut guests = HashSet::new();
 
-    for mount in mounts {
+    // Normalize and validate in caller order so the first invalid mount still
+    // produces the first error. Sorting only after validation keeps the wire
+    // deterministic without obscuring a more relevant earlier failure.
+    for mount in mounts.iter_mut() {
+        microsandbox_types::canonicalize_volume_mounts(std::slice::from_mut(mount))?;
         validate_volume_mount(mount)?;
-        let guest = mount.guest();
-        if !guests.insert(guest) {
+        if !guests.insert(mount.guest().to_owned()) {
             return Err(crate::MicrosandboxError::InvalidConfig(format!(
-                "multiple volumes cannot mount the same guest path: {guest}"
+                "multiple volumes cannot mount the same guest path: {}",
+                mount.guest()
             )));
         }
     }
+
+    microsandbox_types::canonicalize_volume_mounts(mounts)?;
     Ok(())
 }
 
@@ -1132,24 +1140,20 @@ fn validate_volume_mount(mount: &VolumeMount) -> crate::MicrosandboxResult<()> {
     match mount {
         VolumeMount::Bind {
             host,
-            guest,
             stat_virtualization,
             host_permissions,
             ..
         } => {
-            validate_guest_mount_path(guest)?;
             validate_host_path_wire_safe(host, "bind host path")?;
             validate_virtiofs_policies(*stat_virtualization, *host_permissions)?;
         }
         VolumeMount::Named {
             name,
-            guest,
             stat_virtualization,
             host_permissions,
             create,
             ..
         } => {
-            validate_guest_mount_path(guest)?;
             crate::volume::validate_volume_name(name)?;
             if create
                 .as_ref()
@@ -1160,40 +1164,13 @@ fn validate_volume_mount(mount: &VolumeMount) -> crate::MicrosandboxResult<()> {
                 validate_virtiofs_policies(*stat_virtualization, *host_permissions)?;
             }
         }
-        VolumeMount::Tmpfs { guest, .. } => {
-            validate_guest_mount_path(guest)?;
-        }
-        VolumeMount::DiskImage {
-            host,
-            guest,
-            fstype,
-            ..
-        } => {
-            validate_guest_mount_path(guest)?;
+        VolumeMount::Tmpfs { .. } => {}
+        VolumeMount::DiskImage { host, fstype, .. } => {
             validate_host_path_wire_safe(host, "disk image host path")?;
             if let Some(fstype) = fstype {
                 validate_fstype(fstype)?;
             }
         }
-    }
-    Ok(())
-}
-
-fn validate_guest_mount_path(guest: &str) -> crate::MicrosandboxResult<()> {
-    if !guest.starts_with('/') {
-        return Err(crate::MicrosandboxError::InvalidConfig(format!(
-            "guest mount path must be absolute: {guest}"
-        )));
-    }
-    if guest == "/" {
-        return Err(crate::MicrosandboxError::InvalidConfig(
-            "cannot mount a volume at guest root /".into(),
-        ));
-    }
-    if guest.contains(':') || guest.contains(';') || guest.contains(',') {
-        return Err(crate::MicrosandboxError::InvalidConfig(format!(
-            "guest mount path must not contain ':', ';', or ',': {guest}"
-        )));
     }
     Ok(())
 }
@@ -1591,19 +1568,19 @@ mod tests {
 
     #[test]
     fn test_validate_volume_mounts_rejects_direct_guest_separators() {
-        let mount = VolumeMount::Tmpfs {
+        let mut mount = VolumeMount::Tmpfs {
             guest: "/data,ro".to_string(),
             size_mib: None,
             options: MountOptions::default(),
         };
 
-        let err = validate_volume_mounts(&[mount]).unwrap_err();
+        let err = validate_volume_mounts(std::slice::from_mut(&mut mount)).unwrap_err();
         assert!(err.to_string().contains("guest mount path"));
     }
 
     #[test]
     fn test_validate_volume_mounts_rejects_duplicate_guest_paths() {
-        let mounts = vec![
+        let mut mounts = vec![
             VolumeMount::Tmpfs {
                 guest: "/data".to_string(),
                 size_mib: None,
@@ -1620,13 +1597,13 @@ mod tests {
             },
         ];
 
-        let err = validate_volume_mounts(&mounts).unwrap_err();
+        let err = validate_volume_mounts(&mut mounts).unwrap_err();
         assert!(err.to_string().contains("same guest path"));
     }
 
     #[test]
     fn test_validate_volume_mounts_rejects_direct_disk_host_separators() {
-        let mount = VolumeMount::DiskImage {
+        let mut mount = VolumeMount::DiskImage {
             host: PathBuf::from("/host/data:ro.raw"),
             guest: "/data".to_string(),
             format: DiskImageFormat::Raw,
@@ -1634,14 +1611,36 @@ mod tests {
             options: MountOptions::default(),
         };
 
-        let err = validate_volume_mounts(&[mount]).unwrap_err();
+        let err = validate_volume_mounts(std::slice::from_mut(&mut mount)).unwrap_err();
+        assert!(err.to_string().contains("disk image host path"));
+    }
+
+    #[test]
+    fn test_validate_volume_mounts_preserves_caller_error_order() {
+        let mut mounts = vec![
+            VolumeMount::DiskImage {
+                host: PathBuf::from("/host/data:ro.raw"),
+                guest: "/data".to_string(),
+                format: DiskImageFormat::Raw,
+                fstype: None,
+                options: MountOptions::default(),
+            },
+            VolumeMount::Tmpfs {
+                guest: "relative".to_string(),
+                size_mib: None,
+                options: MountOptions::default(),
+            },
+        ];
+
+        let err = validate_volume_mounts(&mut mounts).unwrap_err();
+
         assert!(err.to_string().contains("disk image host path"));
     }
 
     #[test]
     #[cfg(windows)]
     fn test_validate_volume_mounts_accepts_windows_drive_host_paths() {
-        let mounts = vec![
+        let mut mounts = vec![
             VolumeMount::Bind {
                 host: PathBuf::from(r"C:\Users\Stephen\data"),
                 guest: "/data".to_string(),
@@ -1661,12 +1660,12 @@ mod tests {
             },
         ];
 
-        validate_volume_mounts(&mounts).unwrap();
+        validate_volume_mounts(&mut mounts).unwrap();
     }
 
     #[test]
     fn test_validate_volume_mounts_rejects_direct_empty_fstype() {
-        let mount = VolumeMount::DiskImage {
+        let mut mount = VolumeMount::DiskImage {
             host: PathBuf::from("/host/data.raw"),
             guest: "/data".to_string(),
             format: DiskImageFormat::Raw,
@@ -1674,13 +1673,13 @@ mod tests {
             options: MountOptions::default(),
         };
 
-        let err = validate_volume_mounts(&[mount]).unwrap_err();
+        let err = validate_volume_mounts(std::slice::from_mut(&mut mount)).unwrap_err();
         assert!(err.to_string().contains("fstype must not be empty"));
     }
 
     #[test]
     fn test_validate_volume_mounts_rejects_direct_off_mirror() {
-        let mount = VolumeMount::Bind {
+        let mut mount = VolumeMount::Bind {
             host: PathBuf::from("/host/data"),
             guest: "/data".to_string(),
             options: MountOptions::default(),
@@ -1691,7 +1690,7 @@ mod tests {
             deny: Vec::new(),
         };
 
-        let err = validate_volume_mounts(&[mount]).unwrap_err();
+        let err = validate_volume_mounts(std::slice::from_mut(&mut mount)).unwrap_err();
         assert!(err.to_string().contains("stat_virtualization=Off"));
     }
 
