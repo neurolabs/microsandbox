@@ -152,7 +152,7 @@ func buildFFICreateOptions(o SandboxConfig) ffi.CreateOptions {
 	if len(o.Volumes) > 0 {
 		ffiOpts.Volumes = make(map[string]ffi.MountSpec, len(o.Volumes))
 		for guestPath, m := range o.Volumes {
-			ffiOpts.Volumes[guestPath] = ffi.MountSpec{
+			spec := ffi.MountSpec{
 				Bind:               m.Bind,
 				Named:              m.Named,
 				NamedMode:          m.NamedMode,
@@ -171,6 +171,11 @@ func buildFFICreateOptions(o SandboxConfig) ffi.CreateOptions {
 				StatVirtualization: string(m.StatVirtualization),
 				HostPermissions:    string(m.HostPermissions),
 			}
+			if m.Owner != nil {
+				uid, gid := m.Owner.UID, m.Owner.GID
+				spec.OverrideUid, spec.OverrideGid = &uid, &gid
+			}
+			ffiOpts.Volumes[guestPath] = spec
 		}
 	}
 

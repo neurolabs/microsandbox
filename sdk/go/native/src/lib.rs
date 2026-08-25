@@ -1185,6 +1185,12 @@ struct MountSpec {
     /// Per-mount host-permission policy ("private" | "mirror").
     /// Only valid for bind / named mounts.
     host_permissions: Option<String>,
+    /// Guest uid presented for host files with no per-file stat override.
+    /// Must be set together with `override_gid`. Only valid for bind / named mounts.
+    override_uid: Option<u32>,
+    /// Guest gid presented for host files with no per-file stat override.
+    /// Must be set together with `override_uid`. Only valid for bind / named mounts.
+    override_gid: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -1932,6 +1938,8 @@ fn apply_volume(
     let nodev = m.nodev;
     let size_mib = m.size_mib;
     let quota_mib = m.quota_mib;
+    let override_uid = m.override_uid;
+    let override_gid = m.override_gid;
     let deny = m.deny.clone();
     for pattern in &deny {
         validate_deny_pattern(pattern)?;
@@ -1975,6 +1983,16 @@ fn apply_volume(
     if quota_mib.is_some() && bind.is_none() && named.is_none() {
         return Err(FfiError::invalid_argument(
             "quota_mib is only valid for bind mounts or named volume provisioning",
+        ));
+    }
+    if override_uid.is_some() != override_gid.is_some() {
+        return Err(FfiError::invalid_argument(
+            "override_uid and override_gid must be specified together",
+        ));
+    }
+    if override_uid.is_some() && bind.is_none() && named.is_none() {
+        return Err(FfiError::invalid_argument(
+            "override_uid/override_gid are only valid for bind or named mounts",
         ));
     }
     if !deny.is_empty() && bind.is_none() {
@@ -2051,6 +2069,9 @@ fn apply_volume(
         }
         if let Some(p) = host_perms {
             mb = mb.host_permissions(p);
+        }
+        if let (Some(uid), Some(gid)) = (override_uid, override_gid) {
+            mb = mb.owner(uid, gid);
         }
         mb
     }))

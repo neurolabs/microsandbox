@@ -76,6 +76,15 @@ pub struct PassthroughConfig {
     /// many bytes is rejected with `ENOSPC`.
     pub quota_bytes: Option<u64>,
 
+    /// Guest `(uid, gid)` to present for host files that carry no per-file
+    /// override in the metadata store.
+    ///
+    /// Host-created files have no store entry, so without this they surface as
+    /// `0:0` (root). When set, such files are presented as this owner instead.
+    /// `None` keeps the legacy `0:0` fallback. Only consulted while stat
+    /// virtualization is enabled.
+    pub default_owner: Option<(u32, u32)>,
+
     /// Gitignore-style patterns whose matching paths are hidden from the guest.
     ///
     /// Empty means no paths are denied.
@@ -109,6 +118,14 @@ impl PassthroughConfig {
 impl PassthroughFs {
     /// Create a Windows passthrough filesystem rooted at `cfg.root_dir`.
     pub fn new(cfg: PassthroughConfig) -> io::Result<Self> {
+        // Reject contradictory metadata policy before resolving or probing the
+        // host root. Direct backend callers must receive the same guarantee as
+        // the SDK and runtime boundaries.
+        if cfg.default_owner.is_some() && matches!(cfg.stat_virtualization, StatVirtualization::Off)
+        {
+            return Err(linux_error(LINUX_EINVAL));
+        }
+
         let root = if cfg.no_symlink_root {
             // Resolve without following any reparse point; nothing in the path
             // is trusted, so the escaping-symlink-root vector is closed.
@@ -212,6 +229,7 @@ impl Default for PassthroughConfig {
             attr_timeout: Duration::from_secs(5),
             inject_init: true,
             quota_bytes: None,
+            default_owner: None,
             deny: Vec::new(),
         }
     }

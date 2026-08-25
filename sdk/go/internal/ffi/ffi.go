@@ -1632,6 +1632,8 @@ type MountSpec struct {
 	Deny               []string `json:"deny,omitempty"`
 	StatVirtualization string   `json:"stat_virtualization,omitempty"`
 	HostPermissions    string   `json:"host_permissions,omitempty"`
+	OverrideUid        *uint32 `json:"override_uid,omitempty"`
+	OverrideGid        *uint32 `json:"override_gid,omitempty"`
 }
 
 // NetworkOptions is the JSON representation of the network config block.
