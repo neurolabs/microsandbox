@@ -172,6 +172,7 @@ impl PassthroughFsBuilder {
             inject_init: self.inject_init,
             bind_identity_map: self.bind_identity_map,
             quota_bytes: self.quota_bytes,
+            quota_root: None,
             deny: self.deny,
         };
 
