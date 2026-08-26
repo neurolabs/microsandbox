@@ -3962,6 +3962,7 @@ dependencies = [
  "microsandbox-protocol",
  "microsandbox-runtime",
  "microsandbox-types",
+ "microsandbox-types-macros",
  "microsandbox-utils",
  "rand 0.10.2",
  "regex",
@@ -3979,6 +3980,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -4237,6 +4239,7 @@ dependencies = [
  "chrono",
  "dprint-plugin-typescript",
  "ipnetwork",
+ "microsandbox-types-macros",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -4245,6 +4248,15 @@ dependencies = [
  "typed-path",
  "utoipa",
  "zeroize",
+]
+
+[[package]]
+name = "microsandbox-types-macros"
+version = "0.6.15"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
 ]
 
 [[package]]
