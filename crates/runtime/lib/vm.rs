@@ -381,7 +381,7 @@ pub struct VmConfig {
 
     /// Sandbox slot for deterministic network address derivation.
     #[cfg(feature = "net")]
-    pub sandbox_slot: u64,
+    pub sandbox_slot: u16,
 }
 
 /// JSON structure written to stdout on startup.
@@ -799,6 +799,10 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                     .col_expr(
                         sandbox_entity::Column::ActiveConfig,
                         Expr::value(Option::<String>::None),
+                    )
+                    .col_expr(
+                        sandbox_entity::Column::NetworkSlot,
+                        Expr::value(Option::<u16>::None),
                     )
                     .col_expr(sandbox_entity::Column::UpdatedAt, Expr::value(now))
                     .filter(sandbox_entity::Column::Id.eq(exit_sandbox_id))
