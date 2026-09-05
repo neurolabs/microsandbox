@@ -699,7 +699,6 @@ class MountConfig:
     noexec: bool = False
     nosuid: bool = False
     nodev: bool = False
-    deny: list[str] | None = None
     disk: str | None = None
     format: DiskImageFormat | None = None
     fstype: str | None = None
@@ -709,6 +708,8 @@ class MountConfig:
     #: Must be set together with ``override_gid``. BIND/NAMED mounts only.
     override_uid: int | None = None
     override_gid: int | None = None
+    #: Host-side deny-list of gitignore-style patterns (BIND mounts only).
+    deny: list[str] | None = None
 
     def _to_dict(self) -> dict:
         # Validate every supplied enum before selecting a mount arm. This

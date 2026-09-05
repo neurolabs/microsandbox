@@ -180,7 +180,7 @@ impl PassthroughFs {
             )
         });
 
-        let deny = super::super::deny::DenyList::new(&root, &cfg.deny, cfg.readonly);
+        let deny = super::super::deny::DenyList::new(&root, &cfg.deny, cfg.readonly)?;
 
         Ok(Self {
             cfg,

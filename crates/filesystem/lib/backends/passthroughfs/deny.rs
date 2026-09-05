@@ -16,6 +16,7 @@
 //! deny-checked: lookup returns `ENOENT` for a denied name, so the guest can
 //! never obtain the inode of a hidden entry in the first place.
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -81,34 +82,45 @@ impl DenyList {
     /// filesystem is case-insensitive; when it is, patterns are matched
     /// case-insensitively (see the type docs).
     ///
-    /// Patterns are parsed with gitignore semantics. Invalid patterns are
-    /// skipped; a fully invalid or empty list yields a matcher that denies
-    /// nothing.
+    /// Patterns are parsed with gitignore semantics. An invalid pattern is a
+    /// hard error: every pattern must be accepted, otherwise the deny list
+    /// would be weaker than the caller asked for. An empty list yields a
+    /// matcher that denies nothing.
     ///
     /// `readonly` reports whether the mount is read-only. On read-only mounts
     /// the case-sensitivity probe write cannot run (it fails with `EROFS`), so
     /// case-sensitivity is instead inferred from the filesystem type; see
     /// [`mount_is_case_insensitive`].
-    pub(crate) fn new(root: &Path, patterns: &[String], readonly: bool) -> Self {
+    pub(crate) fn new(root: &Path, patterns: &[String], readonly: bool) -> io::Result<Self> {
         let mut builder = GitignoreBuilder::new(Path::new("/"));
         let mut needs_path_reconstruction = false;
         let mut has_dir_only_patterns = false;
         for pattern in patterns {
             needs_path_reconstruction |= pattern.trim_end_matches('/').contains('/');
             has_dir_only_patterns |= pattern.ends_with('/');
-            let _ = builder.add_line(None, pattern);
+            builder.add_line(None, pattern).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid deny pattern {pattern:?}: {err}"),
+                )
+            })?;
         }
         // Skip the host-side case-insensitivity probe for the common empty-list
         // case, so deny-less mounts avoid creating a probe file in the root.
         if !patterns.is_empty() {
             let _ = builder.case_insensitive(mount_is_case_insensitive(root, readonly));
         }
-        let matcher = builder.build().unwrap_or_else(|_| Gitignore::empty());
-        Self {
+        let matcher = builder.build().map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("failed to build deny matcher: {err}"),
+            )
+        })?;
+        Ok(Self {
             matcher,
             needs_path_reconstruction,
             has_dir_only_patterns,
-        }
+        })
     }
 
     /// Whether any pattern needs the full mount-relative path (interior `/`).
@@ -309,34 +321,28 @@ mod tests {
 
     fn deny(patterns: &[&str]) -> DenyList {
         let owned: Vec<String> = patterns.iter().map(|s| s.to_string()).collect();
-        let root = std::env::temp_dir().join(format!("msb-deny-test-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        let list = DenyList::new(&root, &owned, false);
-        let _ = std::fs::remove_dir_all(&root);
-        list
+        let root = tempfile::tempdir().unwrap();
+        DenyList::new(root.path(), &owned, false).unwrap()
     }
 
     #[test]
     fn mount_is_case_insensitive_cleans_up_fs() {
         // neither for unix nor for windows we can assert the check deterministically.
         // Therefore, we only assert the probe leaves no residue.
-        let root = std::env::temp_dir().join(format!("msb-deny-probe-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        let _ = mount_is_case_insensitive(&root, false);
-        let empty = std::fs::read_dir(&root).unwrap().count();
+        let root = tempfile::tempdir().unwrap();
+        let _ = mount_is_case_insensitive(root.path(), false);
+        let empty = std::fs::read_dir(root.path()).unwrap().count();
         assert_eq!(empty, 0);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn readonly_mount_detects_case_sensitivity_without_probe() {
         // A read-only mount infers case-sensitivity from the filesystem type
         // (via `statfs`) and must never create the probe file.
-        let root = std::env::temp_dir().join(format!("msb-deny-ro-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = tempfile::tempdir().unwrap();
 
-        let list = DenyList::new(&root, &[".env".to_string()], true);
-        let residue = std::fs::read_dir(&root)
+        let list = DenyList::new(root.path(), &[".env".to_string()], true).unwrap();
+        let residue = std::fs::read_dir(root.path())
             .unwrap()
             .filter_map(Result::ok)
             .filter(|e| e.file_name().to_string_lossy().starts_with("MsBCaSePrObE"))
@@ -349,10 +355,8 @@ mod tests {
         // The deny list's effective case-sensitivity must match the detection:
         // on a case-sensitive host `.ENV` stays visible, on a case-insensitive
         // host it is hidden by the `.env` pattern.
-        let case_sensitive = ro_fs_is_case_sensitive(&root);
+        let case_sensitive = ro_fs_is_case_sensitive(root.path());
         assert_eq!(list.matches_basename(b".ENV", false), !case_sensitive);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -401,7 +405,18 @@ mod tests {
     }
 
     #[test]
-    fn invalid_pattern_is_skipped() {
+    fn invalid_pattern_is_rejected() {
+        let owned: Vec<String> = ["[a-z".to_string(), "{".to_string()].to_vec();
+        let root = tempfile::tempdir().unwrap();
+        let result = DenyList::new(root.path(), &owned, false);
+        assert!(
+            result.is_err(),
+            "an invalid pattern must fail the deny-list build"
+        );
+    }
+
+    #[test]
+    fn bracket_pattern_with_unclosed_class_is_literal() {
         let list = deny(&["[a-z"]);
         assert!(!list.matches_basename(b"a", false));
     }

@@ -355,7 +355,7 @@ impl PassthroughFs {
 
         let deny_patterns = cfg.deny.clone();
 
-        let deny = DenyList::new(&cfg.root_dir, &deny_patterns, cfg.readonly);
+        let deny = DenyList::new(&cfg.root_dir, &deny_patterns, cfg.readonly)?;
 
         // Canonical host path of the mount root for deny path-pattern matching.
         #[cfg(target_os = "macos")]

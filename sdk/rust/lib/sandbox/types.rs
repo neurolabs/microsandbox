@@ -1167,10 +1167,14 @@ fn validate_volume_mount(mount: &VolumeMount) -> crate::MicrosandboxResult<()> {
             options,
             stat_virtualization,
             host_permissions,
+            deny,
             ..
         } => {
             validate_host_path_wire_safe(host, "bind host path")?;
             validate_virtiofs_policies(*stat_virtualization, *host_permissions, options)?;
+            for pattern in deny {
+                validate_deny_pattern(pattern)?;
+            }
         }
         VolumeMount::Named {
             name,
@@ -1708,6 +1712,56 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_volume_mounts_rejects_direct_bind_deny_separators() {
+        let mut mount = VolumeMount::Bind {
+            host: PathBuf::from("/host/data"),
+            guest: "/data".to_string(),
+            options: MountOptions::default(),
+            stat_virtualization: StatVirtualization::Strict,
+            host_permissions: HostPermissions::Private,
+            follow_root_symlinks: false,
+            quota_mib: None,
+            deny: vec!["secret,ro".to_string()],
+        };
+
+        let err = validate_volume_mounts(std::slice::from_mut(&mut mount)).unwrap_err();
+        assert!(err.to_string().contains("must not contain"));
+    }
+
+    #[test]
+    fn test_validate_volume_mounts_rejects_direct_bind_empty_deny_pattern() {
+        let mut mount = VolumeMount::Bind {
+            host: PathBuf::from("/host/data"),
+            guest: "/data".to_string(),
+            options: MountOptions::default(),
+            stat_virtualization: StatVirtualization::Strict,
+            host_permissions: HostPermissions::Private,
+            follow_root_symlinks: false,
+            quota_mib: None,
+            deny: vec![String::new()],
+        };
+
+        let err = validate_volume_mounts(std::slice::from_mut(&mut mount)).unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn test_validate_volume_mounts_accepts_direct_bind_valid_deny() {
+        let mut mount = VolumeMount::Bind {
+            host: PathBuf::from("/host/data"),
+            guest: "/data".to_string(),
+            options: MountOptions::default(),
+            stat_virtualization: StatVirtualization::Strict,
+            host_permissions: HostPermissions::Private,
+            follow_root_symlinks: false,
+            quota_mib: None,
+            deny: vec![".env".to_string(), "node_modules/".to_string()],
+        };
+
+        validate_volume_mounts(std::slice::from_mut(&mut mount)).unwrap();
+    }
+
+    #[test]
     fn test_validate_volume_mounts_rejects_duplicate_guest_paths() {
         let mut mounts = vec![
             VolumeMount::Tmpfs {
@@ -1836,6 +1890,7 @@ mod tests {
             host_permissions: HostPermissions::Private,
             follow_root_symlinks: false,
             quota_mib: None,
+            deny: Vec::new(),
         };
         let err = validate_volume_mounts(std::slice::from_mut(&mut partial)).unwrap_err();
         assert!(
@@ -1855,6 +1910,7 @@ mod tests {
             host_permissions: HostPermissions::Private,
             follow_root_symlinks: false,
             quota_mib: None,
+            deny: Vec::new(),
         };
         let err = validate_volume_mounts(std::slice::from_mut(&mut off)).unwrap_err();
         assert!(err.to_string().contains("literal host metadata"), "{err}");

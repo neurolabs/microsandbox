@@ -1120,6 +1120,7 @@ mod tests {
             host_permissions: HostPermissions::Private,
             follow_root_symlinks: false,
             quota_mib: None,
+            deny: Vec::new(),
         });
 
         assert_unsupported_config_field(config, "mount owner");
