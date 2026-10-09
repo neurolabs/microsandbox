@@ -1,21 +1,29 @@
 //! SOCKS outbound proxy builders, credentials, and transport implementations.
 
 use std::fmt;
+#[cfg(feature = "engine")]
 use std::io;
+#[cfg(feature = "engine")]
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use microsandbox_types::SecretSource;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "engine")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(feature = "engine")]
 use tokio::net::TcpStream;
+#[cfg(feature = "engine")]
 use tokio_socks::tcp::Socks4Stream;
 use zeroize::Zeroizing;
 
+#[cfg(feature = "engine")]
+use super::http_connect::HttpConnectProtocol;
 use super::types::{
     OutboundProxy, OutboundProxyBuildError, OutboundProxyBuilder, OutboundProxyConfig,
     OutboundProxyProtocol, ResolvedOutboundProxy,
 };
-use crate::dns::forwarder::{DnsForwarder, DnsForwarderHandle};
+#[cfg(feature = "engine")]
+use crate::engine::dns::forwarder::{DnsForwarder, DnsForwarderHandle};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -51,6 +59,7 @@ pub struct Socks5ProxyBuilder {
 }
 
 /// Active SOCKS5 UDP association.
+#[cfg(feature = "engine")]
 pub(crate) struct Socks5UdpAssociation {
     _control: TcpStream,
     socket: tokio::net::UdpSocket,
@@ -58,9 +67,11 @@ pub(crate) struct Socks5UdpAssociation {
 }
 
 /// SOCKS5 wire protocol operations shared by TCP and UDP proxying.
+#[cfg(feature = "engine")]
 struct Socks5Protocol;
 
 /// Address returned by a SOCKS5 command reply.
+#[cfg(feature = "engine")]
 enum Socks5ReplyAddress {
     Socket(SocketAddr),
     Domain { name: String, port: u16 },
@@ -88,6 +99,14 @@ impl ResolvedOutboundProxy {
 
         configured.validate()?;
         match configured {
+            OutboundProxy::HttpConnect { address } => {
+                if resolved.is_some() {
+                    return Err(OutboundProxyBuildError::InvalidSocks5Credentials {
+                        reason: "launch credentials require a configured SOCKS5 proxy",
+                    });
+                }
+                Ok(Some(Self::HttpConnect { address: *address }))
+            }
             OutboundProxy::Socks4 { address, user_id } => {
                 if resolved.is_some() {
                     return Err(OutboundProxyBuildError::InvalidSocks5Credentials {
@@ -134,8 +153,12 @@ impl ResolvedOutboundProxy {
     }
 
     /// Connects to `destination` through this outbound proxy.
+    #[cfg(feature = "engine")]
     pub(crate) async fn connect(&self, destination: SocketAddr) -> io::Result<TcpStream> {
         match self {
+            Self::HttpConnect { address } => {
+                HttpConnectProtocol::connect(*address, destination).await
+            }
             Self::Socks4 { address, user_id } => match user_id {
                 Some(user_id) => {
                     Socks4Stream::connect_with_userid(*address, destination, user_id).await
@@ -159,6 +182,7 @@ impl ResolvedOutboundProxy {
     }
 
     /// Opens a SOCKS5 UDP association for relaying datagrams.
+    #[cfg(feature = "engine")]
     pub(crate) async fn associate_udp(
         &self,
         dns_forwarder: Option<DnsForwarderHandle>,
@@ -197,6 +221,7 @@ impl ResolvedOutboundProxy {
 impl OutboundProxy {
     fn validate(&self) -> Result<(), OutboundProxyBuildError> {
         match self {
+            Self::HttpConnect { .. } => Ok(()),
             Self::Socks4 { user_id, .. } => Self::validate_socks4_user_id(user_id.as_deref()),
             Self::Socks5 { credentials, .. } => credentials
                 .as_ref()
@@ -285,6 +310,7 @@ impl Socks5Credentials {
     }
 }
 
+#[cfg(feature = "engine")]
 impl Socks5UdpAssociation {
     /// Connects a UDP socket to the first usable relay address.
     async fn connect(
@@ -380,6 +406,11 @@ impl OutboundProxyBuilder {
         Self
     }
 
+    /// Starts building an HTTP CONNECT outbound proxy.
+    pub fn http_connect(self, address: impl Into<String>) -> super::HttpConnectProxyBuilder {
+        super::HttpConnectProxyBuilder::new(address)
+    }
+
     /// Starts building a SOCKS4 outbound proxy.
     pub fn socks4(self, address: impl Into<String>) -> Socks4ProxyBuilder {
         Socks4ProxyBuilder {
@@ -466,6 +497,7 @@ impl OutboundProxyConfig for OutboundProxy {
     }
 }
 
+#[cfg(feature = "engine")]
 impl Socks5Protocol {
     /// Resolves a domain-form SOCKS5 endpoint through the internal DNS path.
     async fn resolve_domain(
@@ -729,7 +761,7 @@ impl Socks5Protocol {
 // Tests
 //--------------------------------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, feature = "engine"))]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::Arc;
@@ -747,7 +779,7 @@ mod tests {
         OutboundProxy, OutboundProxyBuildError, OutboundProxyBuilder, OutboundProxyConfig,
         OutboundProxyProtocol, ResolvedOutboundProxy, ResolvedSocks5Credentials,
     };
-    use crate::dns::forwarder::DnsForwarder;
+    use crate::engine::dns::forwarder::DnsForwarder;
     use crate::netstack::poll::GatewayIps;
     use crate::netstack::shared::SharedState;
 
@@ -954,9 +986,17 @@ mod tests {
 
     #[test]
     fn uri_parses_and_formats_for_cli() {
+        let http: OutboundProxy = "http://127.0.0.1:1080".parse().unwrap();
         let socks4: OutboundProxy = "socks4://127.0.0.1:1080".parse().unwrap();
         let socks5: OutboundProxy = "socks5://127.0.0.1:1080".parse().unwrap();
 
+        assert_eq!(
+            http,
+            OutboundProxy::HttpConnect {
+                address: "127.0.0.1:1080".parse().unwrap(),
+            }
+        );
+        assert_eq!(http.to_string(), "http://127.0.0.1:1080");
         assert_eq!(
             socks4,
             OutboundProxy::Socks4 {
@@ -979,7 +1019,7 @@ mod tests {
     fn uri_rejects_unsupported_forms() {
         for raw in [
             "127.0.0.1:1080",
-            "http://127.0.0.1:1080",
+            "ftp://127.0.0.1:1080",
             "socks4://user@127.0.0.1:1080",
             "socks5://user@127.0.0.1:1080",
             "socks5://127.0.0.1:1080/path",

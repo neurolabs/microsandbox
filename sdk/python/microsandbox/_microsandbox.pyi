@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import os
 from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
-from typing import Any
+from typing import Any, Literal
 
+from microsandbox.jobs import JobEvent, JobExit, JobInfo, JobLogEntry, JobPage
 from microsandbox.types import (
     BackendKind,
+    DiskCompactionResult,
     DiskImageFormat,
     ExecEventType,
     ExecOptions,
     FsEntryKind,
+    GuestFlush,
     HostPermissions,
     ImageArchiveFormat,
     ImageSource,
@@ -24,6 +27,7 @@ from microsandbox.types import (
     MountConfig,
     NamedVolumeMode,
     Network,
+    NetworkPolicy,
     PatchConfig,
     PortBinding,
     PullEventType,
@@ -42,10 +46,20 @@ from microsandbox.types import (
     StatVirtualization,
     Stdin,
     ViolationAction,
-    ViolationPolicy,
     VolumeKind,
     VsockRoute,
 )
+
+class ForkOutcome:
+    @property
+    def name(self) -> str: ...
+    @property
+    def sandbox(self) -> Sandbox | None: ...
+    @property
+    def error(self) -> Exception | None: ...
+
+# Deprecated: use ForkOutcome.
+BranchOutcome = ForkOutcome
 
 class PyAgentClient:
     """Raw agent client.
@@ -87,12 +101,77 @@ class Sandbox:
     Sandbox names are limited to 128 UTF-8 bytes.
     """
 
+    async def get_job(self, id: str) -> Job: ...
+    async def list_jobs(
+        self, *, all: bool = False, limit: int = 50, cursor: str | None = None
+    ) -> JobPage: ...
+
+
+    @staticmethod
+    async def restore(
+        snapshot: Snapshot | SnapshotHandle | str | os.PathLike[str],
+        *,
+        name: str,
+        cpus: int | None = None,
+        memory: int | None = None,
+        network_policy: NetworkPolicy | None = None,
+        max_connections: int | None = None,
+        max_tcp_connections: int | None = None,
+        max_udp_connections: int | None = None,
+        disable_network: bool = False,
+        security: SecurityProfile | None = None,
+        max_duration: float | None = None,
+        idle_timeout: float | None = None,
+        cow_memory: bool = False,
+        forked: bool = False,  # Deprecated: use cow_memory.
+        disk_only: bool = False,
+        snapshot_base: str | None = None,
+        user: str | None = None,
+        log_level: LogLevel | None = None,
+        volumes: Mapping[str, MountConfig] | None = None,
+        captured_volumes: Sequence[str] | None = None,
+        ports: Mapping[int, int] | Sequence[PortBinding] | None = None,
+        tcp_accept_queue_size: int | None = None,
+        vsock: Mapping[str, int] | Sequence[VsockRoute] | None = None,
+        external_mount_policy: Literal["strict", "relaxed"] = "strict",
+        dangerously_inherit_resources: bool = False,
+        allow_missing_resources: bool = False,
+    ) -> Sandbox: ...
+    @staticmethod
+    def restore_with_progress(
+        snapshot: Snapshot | SnapshotHandle | str | os.PathLike[str],
+        *,
+        name: str,
+        cpus: int | None = None,
+        memory: int | None = None,
+        network_policy: NetworkPolicy | None = None,
+        max_connections: int | None = None,
+        max_tcp_connections: int | None = None,
+        max_udp_connections: int | None = None,
+        disable_network: bool = False,
+        security: SecurityProfile | None = None,
+        max_duration: float | None = None,
+        idle_timeout: float | None = None,
+        cow_memory: bool = False,
+        forked: bool = False,  # Deprecated: use cow_memory.
+        disk_only: bool = False,
+        snapshot_base: str | None = None,
+        user: str | None = None,
+        log_level: LogLevel | None = None,
+        volumes: Mapping[str, MountConfig] | None = None,
+        captured_volumes: Sequence[str] | None = None,
+        ports: Mapping[int, int] | Sequence[PortBinding] | None = None,
+        tcp_accept_queue_size: int | None = None,
+        vsock: Mapping[str, int] | Sequence[VsockRoute] | None = None,
+        external_mount_policy: Literal["strict", "relaxed"] = "strict",
+        dangerously_inherit_resources: bool = False,
+        allow_missing_resources: bool = False,
+    ) -> PullSession: ...
     @staticmethod
     async def create(
         name: str,
         *,
         image: str | os.PathLike[str] | ImageSource | None = None,
-        from_snapshot: str | os.PathLike[str] | None = None,
         memory: int | None = None,
         cpus: int | None = None,
         max_memory: int | None = None,
@@ -123,8 +202,9 @@ class Sandbox:
         ports: Mapping[int, int] | Sequence[PortBinding] | None = None,
         vsock: Mapping[str, int] | Sequence[VsockRoute] | None = None,
         network: Network | None = None,
+        intercept_tls: bool = False,
         secrets: Sequence[SecretEntry] | None = None,
-        on_secret_violation: ViolationAction | ViolationPolicy | None = None,
+        secret_violation_action: ViolationAction | None = None,
         detached: bool = False,
     ) -> Sandbox: ...
     @staticmethod
@@ -132,7 +212,6 @@ class Sandbox:
         name: str,
         *,
         image: str | os.PathLike[str] | ImageSource | None = None,
-        from_snapshot: str | os.PathLike[str] | None = None,
         memory: int | None = None,
         cpus: int | None = None,
         max_memory: int | None = None,
@@ -163,8 +242,9 @@ class Sandbox:
         ports: Mapping[int, int] | Sequence[PortBinding] | None = None,
         vsock: Mapping[str, int] | Sequence[VsockRoute] | None = None,
         network: Network | None = None,
+        intercept_tls: bool = False,
         secrets: Sequence[SecretEntry] | None = None,
-        on_secret_violation: ViolationAction | ViolationPolicy | None = None,
+        secret_violation_action: ViolationAction | None = None,
         detached: bool = False,
     ) -> Sandbox: ...
     @staticmethod
@@ -187,7 +267,6 @@ class Sandbox:
         name: str,
         *,
         image: str | os.PathLike[str] | ImageSource | None = None,
-        from_snapshot: str | os.PathLike[str] | None = None,
         memory: int | None = None,
         cpus: int | None = None,
         max_memory: int | None = None,
@@ -218,8 +297,9 @@ class Sandbox:
         ports: Mapping[int, int] | Sequence[PortBinding] | None = None,
         vsock: Mapping[str, int] | Sequence[VsockRoute] | None = None,
         network: Network | None = None,
+        intercept_tls: bool = False,
         secrets: Sequence[SecretEntry] | None = None,
-        on_secret_violation: ViolationAction | ViolationPolicy | None = None,
+        secret_violation_action: ViolationAction | None = None,
         detached: bool = False,
     ) -> PullSession: ...
     async def name(self) -> str: ...
@@ -263,6 +343,19 @@ class Sandbox:
         tty: bool = False,
         rlimits: list[Rlimit] | None = None,
     ) -> ExecOutput: ...
+    async def exec_detached(
+        self,
+        cmd: str,
+        args: list[str] | ExecOptions | None = None,
+        *,
+        cwd: str | None = None,
+        user: str | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+        stdin: Stdin | bytes | None = None,
+        tty: bool = False,
+        rlimits: list[Rlimit] | None = None,
+    ) -> Job: ...
     async def exec_stream(
         self,
         cmd: str,
@@ -323,6 +416,14 @@ class Sandbox:
     async def metrics(self) -> SandboxMetrics: ...
     async def ping(self) -> SandboxPingResult: ...
     async def touch(self) -> SandboxTouchResult: ...
+    async def compact(
+        self,
+        *,
+        layers: int | None = None,
+        dry_run: bool = False,
+        disk: str | None = None,
+        root_disk_only: bool = False,
+    ) -> DiskCompactionResult: ...
     async def modify(
         self,
         *,
@@ -357,7 +458,33 @@ class Sandbox:
         until_ms: float | None = None,
         follow: bool = False,
     ) -> LogStream: ...
+    async def restore_warnings(self) -> list[ExternalMountWarning]: ...
     async def stop(self, timeout: float | None = None) -> None: ...
+    async def stop_with_timeout(self, timeout: float) -> None: ...
+    async def fork(
+        self, name: str, *, record_integrity: bool = False,
+        guest_flush: GuestFlush | None = None,
+        volumes: Mapping[str, MountConfig] | None = None,
+    ) -> Sandbox: ...
+    # Deprecated: use fork.
+    async def branch(
+        self, name: str, *, record_integrity: bool = False,
+        guest_flush: GuestFlush | None = None,
+        volumes: Mapping[str, MountConfig] | None = None,
+    ) -> Sandbox: ...
+    async def fork_many(
+        self, names: list[str], *, record_integrity: bool = False,
+        guest_flush: GuestFlush | None = None,
+        volumes: Mapping[str, MountConfig] | None = None,
+    ) -> list[ForkOutcome]: ...
+    # Deprecated: use fork_many.
+    async def branch_many(
+        self, names: list[str], *, record_integrity: bool = False,
+        guest_flush: GuestFlush | None = None,
+        volumes: Mapping[str, MountConfig] | None = None,
+    ) -> list[ForkOutcome]: ...
+    async def pause(self, *, guest_flush: GuestFlush | None = None) -> None: ...
+    async def resume(self) -> None: ...
     async def request_stop(self) -> None: ...
     async def kill(self, timeout: float | None = None) -> None: ...
     async def request_kill(self) -> None: ...
@@ -410,6 +537,12 @@ class SandboxHandle:
     Sandbox names are limited to 128 UTF-8 bytes.
     """
 
+    async def get_job(self, id: str) -> Job: ...
+    async def list_jobs(
+        self, *, all: bool = False, limit: int = 50, cursor: str | None = None
+    ) -> JobPage: ...
+
+
     @property
     def name(self) -> str: ...
     @property
@@ -423,8 +556,17 @@ class SandboxHandle:
     @property
     def updated_at(self) -> float | None: ...
     async def metrics(self) -> SandboxMetrics: ...
+    async def storage_usage(self) -> StorageItemUsage: ...
     async def ping(self) -> SandboxPingResult: ...
     async def touch(self) -> SandboxTouchResult: ...
+    async def compact(
+        self,
+        *,
+        layers: int | None = None,
+        dry_run: bool = False,
+        disk: str | None = None,
+        root_disk_only: bool = False,
+    ) -> DiskCompactionResult: ...
     async def modify(
         self,
         *,
@@ -464,6 +606,31 @@ class SandboxHandle:
     async def connect(self, timeout: float | None = None) -> Sandbox: ...
     async def connect_or_start(self, *, detached: bool = False) -> Sandbox: ...
     async def stop(self, timeout: float | None = None) -> None: ...
+    async def stop_with_timeout(self, timeout: float) -> None: ...
+    async def fork(
+        self, name: str, *, record_integrity: bool = False,
+        guest_flush: GuestFlush | None = None,
+        volumes: Mapping[str, MountConfig] | None = None,
+    ) -> Sandbox: ...
+    # Deprecated: use fork.
+    async def branch(
+        self, name: str, *, record_integrity: bool = False,
+        guest_flush: GuestFlush | None = None,
+        volumes: Mapping[str, MountConfig] | None = None,
+    ) -> Sandbox: ...
+    async def fork_many(
+        self, names: list[str], *, record_integrity: bool = False,
+        guest_flush: GuestFlush | None = None,
+        volumes: Mapping[str, MountConfig] | None = None,
+    ) -> list[ForkOutcome]: ...
+    # Deprecated: use fork_many.
+    async def branch_many(
+        self, names: list[str], *, record_integrity: bool = False,
+        guest_flush: GuestFlush | None = None,
+        volumes: Mapping[str, MountConfig] | None = None,
+    ) -> list[ForkOutcome]: ...
+    async def pause(self, *, guest_flush: GuestFlush | None = None) -> None: ...
+    async def resume(self) -> None: ...
     async def request_stop(self) -> None: ...
     async def kill(self, timeout: float | None = None) -> None: ...
     async def request_kill(self) -> None: ...
@@ -707,6 +874,21 @@ class Volume:
         gid: int | None = None,
     ) -> MountConfig: ...
     @staticmethod
+    def owned(
+        *,
+        kind: VolumeKind | None = None,
+        size_mib: int | None = None,
+        quota_mib: int | None = None,
+        readonly: bool = False,
+        noexec: bool = False,
+        nosuid: bool = False,
+        nodev: bool = False,
+        stat_virtualization: StatVirtualization | None = None,
+        host_permissions: HostPermissions | None = None,
+        uid: int | None = None,
+        gid: int | None = None,
+    ) -> MountConfig: ...
+    @staticmethod
     def tmpfs(
         *,
         size_mib: int | None = None,
@@ -768,6 +950,97 @@ class VolumeFs:
     async def rename(self, from_: str, to: str) -> None: ...
     async def stat(self, path: str) -> FsMetadata: ...
     async def exists(self, path: str) -> bool: ...
+
+class Storage:
+    """Backend-scoped observations and explicit runtime-cache cleanup."""
+
+    @staticmethod
+    async def usage() -> StorageUsage: ...
+    @staticmethod
+    async def prune(
+        *, dry_run: bool = False, older_than_seconds: int | None = None,
+    ) -> MemoryCacheReport:
+        """Revalidate ownership before removing unused RAM; None applies no age filter."""
+        ...
+
+class StorageUsage:
+    @property
+    def images(self) -> StorageCategoryUsage: ...
+    @property
+    def snapshots(self) -> StorageCategoryUsage: ...
+    @property
+    def sandboxes(self) -> StorageCategoryUsage: ...
+    @property
+    def volumes(self) -> StorageCategoryUsage: ...
+    @property
+    def branch_memory(self) -> StorageCategoryUsage: ...
+    @property
+    def snapshot_memory(self) -> StorageCategoryUsage: ...
+    @property
+    def notes(self) -> list[str]: ...
+
+class StorageCategoryUsage:
+    @property
+    def count(self) -> int | None: ...
+    @property
+    def in_use(self) -> int | None: ...
+    @property
+    def logical_bytes(self) -> int | None: ...
+    @property
+    def allocated_bytes(self) -> int | None: ...
+    @property
+    def reclaimable_logical_bytes(self) -> int | None: ...
+    @property
+    def items(self) -> list[StorageItemUsage]: ...
+    @property
+    def notes(self) -> list[str]: ...
+
+class StorageItemUsage:
+    @property
+    def name(self) -> str: ...
+    @property
+    def path(self) -> str: ...
+    @property
+    def logical_bytes(self) -> int | None: ...
+    @property
+    def allocated_bytes(self) -> int | None: ...
+    @property
+    def in_use(self) -> bool | None: ...
+    @property
+    def reclaimable(self) -> bool | None: ...
+    @property
+    def reasons(self) -> list[str]: ...
+
+class MemoryCacheEntry:
+    @property
+    def path(self) -> str: ...
+    @property
+    def kind(self) -> Literal["branch_memory", "snapshot_memory"]: ...
+    @property
+    def logical_bytes(self) -> int | None: ...
+    @property
+    def allocated_bytes(self) -> int | None: ...
+    @property
+    def state(self) -> Literal[
+        "reclaimable", "in_use", "pending_handoff", "too_young",
+        "missing_handoff_lock", "changed", "removed", "error",
+    ]: ...
+    @property
+    def error(self) -> str | None: ...
+
+class MemoryCacheReport:
+    @property
+    def dry_run(self) -> bool: ...
+    @property
+    def entries(self) -> list[MemoryCacheEntry]: ...
+    @property
+    def files_removed(self) -> int: ...
+    @property
+    def logical_bytes_removed(self) -> int: ...
+    @property
+    def physical_bytes_reclaimed(self) -> int | None: ...
+    @property
+    def truncated(self) -> bool: ...
 
 class Image:
     @staticmethod
@@ -863,6 +1136,8 @@ class ImageLayerDetail:
 
 class ImagePruneReport:
     @property
+    def skipped_in_use(self) -> int: ...
+    @property
     def image_refs_removed(self) -> int: ...
     @property
     def manifests_removed(self) -> int: ...
@@ -875,26 +1150,49 @@ class ImagePruneReport:
     @property
     def bytes_reclaimed(self) -> int | None: ...
 
+class ExternalMountWarning:
+    @property
+    def guest_path(self) -> str: ...
+    @property
+    def reason(self) -> str: ...
+    @property
+    def stale_inodes(self) -> list[int]: ...
+
 class Snapshot:
+    async def storage_usage(self) -> StorageItemUsage: ...
     @staticmethod
     async def create(
-        name: str,
+        name: str = "",
         *,
         from_sandbox: str,
+        group: str | None = None,
         dest_dir: str | os.PathLike[str] | None = None,
         labels: dict[str, str] | None = None,
         force: bool = False,
         record_integrity: bool = False,
-        resumable: bool = False,
+        full: bool = False,
+        guest_flush: GuestFlush | None = None,
     ) -> Snapshot: ...
+    @staticmethod
+    async def create_archive(
+        name: str,
+        archive: str | os.PathLike[str],
+        *,
+        from_sandbox: str,
+        group: str | None = None,
+        labels: dict[str, str] | None = None,
+        force: bool = False,
+        record_integrity: bool = False,
+        full: bool = False,
+        plain_tar: bool = False,
+        guest_flush: GuestFlush | None = None,
+    ) -> SnapshotArchive: ...
     @staticmethod
     async def open(path_or_name: str) -> Snapshot: ...
     @staticmethod
     async def get(name_or_digest: str) -> SnapshotHandle: ...
     @staticmethod
     async def list() -> list[SnapshotHandle]: ...
-    @staticmethod
-    async def list_dir(dir: str | os.PathLike[str]) -> list[Snapshot]: ...
     @staticmethod
     async def remove(path_or_name: str, *, force: bool = False) -> None: ...
     @staticmethod
@@ -907,15 +1205,41 @@ class Snapshot:
         with_parents: bool = False,
         with_image: bool = False,
         plain_tar: bool = False,
+        since: str | None = None,
+        last_layers: int | None = None,
     ) -> None: ...
     @staticmethod
     async def load(
         archive: str | os.PathLike[str],
         *,
         dest: str | os.PathLike[str] | None = None,
+        base: str | None = None,
+        group: str | None = None,
+        set_head: bool = False,
     ) -> SnapshotHandle: ...
+    @staticmethod
+    async def load_many(
+        archives: Sequence[str | os.PathLike[str]],
+        *,
+        dest: str | os.PathLike[str] | None = None,
+        base: str | None = None,
+        group: str | None = None,
+        set_head: bool = False,
+    ) -> list[SnapshotHandle]: ...
+    @staticmethod
+    async def group_head(selector: str) -> dict[str, str | bool | None]: ...
     @property
-    def path(self) -> str: ...
+    def head_update(self) -> dict[str, str | bool | None] | None: ...
+    @property
+    def id(self) -> str: ...
+    @property
+    def reference(self) -> str: ...
+    @property
+    def path(self) -> str:
+        """Deprecated: use reference. Raises UnsupportedError for remote snapshots."""
+        ...
+    @property
+    def reference_kind(self) -> Literal["id", "path"]: ...
     @property
     def digest(self) -> str: ...
     @property
@@ -944,9 +1268,42 @@ class Snapshot:
     def labels(self) -> dict[str, str]: ...
     @property
     def source_sandbox(self) -> str | None: ...
+    @staticmethod
+    async def list_dir(dir: str | os.PathLike[str]) -> list[Snapshot]: ...
+    async def save_to(
+        self,
+        out: str | os.PathLike[str],
+        *,
+        with_parents: bool = False,
+        with_image: bool = False,
+        plain_tar: bool = False,
+        since: str | None = None,
+        last_layers: int | None = None,
+    ) -> None: ...
+    def copy_to(self, output_archive_path: str | os.PathLike[str]) -> SnapshotCopyBuilder: ...
     async def verify(self) -> dict[str, Any]: ...
 
+class SnapshotArchive:
+    @property
+    def id(self) -> str: ...
+    @property
+    def descriptor_digest(self) -> str: ...
+    @property
+    def path(self) -> str: ...
+
+class SnapshotCopyBuilder:
+    def labels(self, labels: dict[str, str]) -> SnapshotCopyBuilder: ...
+    def record_integrity(self, enabled: bool) -> SnapshotCopyBuilder: ...
+    async def save(self) -> None: ...
+
 class SnapshotHandle:
+    async def storage_usage(self) -> StorageItemUsage: ...
+    @property
+    def group(self) -> str | None: ...
+    @property
+    def head_update(self) -> dict[str, str | bool | None] | None: ...
+    @property
+    def id(self) -> str: ...
     @property
     def digest(self) -> str: ...
     @property
@@ -978,11 +1335,28 @@ class SnapshotHandle:
     @property
     def created_at(self) -> float: ...
     @property
-    def path(self) -> str: ...
+    def reference(self) -> str: ...
+    @property
+    def path(self) -> str:
+        """Deprecated: use reference. Raises UnsupportedError for remote snapshots."""
+        ...
+    @property
+    def reference_kind(self) -> Literal["id", "path"]: ...
     async def open(self) -> Snapshot: ...
     async def remove(self, *, force: bool = False) -> None: ...
+    async def save_to(
+        self,
+        out: str | os.PathLike[str],
+        *,
+        with_parents: bool = False,
+        with_image: bool = False,
+        plain_tar: bool = False,
+        since: str | None = None,
+        last_layers: int | None = None,
+    ) -> None: ...
 
 class PullSession:
+    def cancel(self) -> None: ...
     @property
     def progress(self) -> PullProgressIter: ...
     async def result(self) -> Sandbox: ...
@@ -997,6 +1371,8 @@ class PullProgressIter:
 
 class PullEvent:
     event_type: PullEventType
+    phase: str | None
+    completed_bytes: int | None
     reference: str | None
     manifest_digest: str | None
     layer_count: int | None
@@ -1009,8 +1385,10 @@ class PullEvent:
     bytes_read: int | None
 
 async def all_sandbox_metrics() -> dict[str, SandboxMetrics]: ...
-def install() -> None: ...
-def is_installed() -> bool: ...
+async def install_runtime(config_json: str, options_json: str) -> str: ...
+async def ensure_runtime(config_json: str, options_json: str) -> str: ...
+def resolve_runtime(config_json: str) -> str: ...
+def is_runtime_installed(config_json: str) -> bool: ...
 def set_default_backend(
     kind: BackendKind,
     *,
@@ -1027,5 +1405,64 @@ def backend_scope(
 ) -> Any: ...
 def default_backend_kind() -> BackendKind: ...
 def resolved_msb_path() -> str: ...
+def resolved_cli_msb_path() -> str: ...
 def set_runtime_msb_path(path: str) -> None: ...
+def set_packaged_msb_path(path: str) -> None: ...
 def version() -> str: ...
+
+class Job:
+    @property
+    def id(self) -> str: ...
+    async def inspect(self) -> JobInfo: ...
+    async def wait(self) -> JobExit: ...
+    async def signal(self, signal: int) -> None: ...
+    async def kill(self) -> None: ...
+    async def eof(self) -> None: ...
+    async def attach(
+        self,
+        *,
+        read_only: bool = False,
+        replay_bytes: int | None = None,
+        cursor: str | None = None,
+    ) -> JobAttachment: ...
+    async def logs(
+        self,
+        *,
+        tail: int | None = None,
+        since: int | None = None,
+        until: int | None = None,
+        sources: list[str] | None = None,
+        from_cursor: str | None = None,
+    ) -> list[JobLogEntry]: ...
+    async def log_stream(
+        self,
+        *,
+        tail: int | None = None,
+        since: int | None = None,
+        until: int | None = None,
+        sources: list[str] | None = None,
+        from_cursor: str | None = None,
+        follow: bool = False,
+    ) -> JobLogStream: ...
+    async def follow_logs(
+        self,
+        *,
+        tail: int | None = None,
+        since: int | None = None,
+        until: int | None = None,
+        sources: list[str] | None = None,
+        from_cursor: str | None = None,
+    ) -> JobLogStream: ...
+
+class JobAttachment:
+    async def recv(self) -> JobEvent | None: ...
+    async def write_stdin(self, data: bytes) -> None: ...
+    async def resize(self, rows: int, cols: int) -> None: ...
+    async def detach(self) -> None: ...
+    def __aiter__(self) -> JobAttachment: ...
+    async def __anext__(self) -> JobEvent: ...
+
+class JobLogStream:
+    async def close(self) -> None: ...
+    def __aiter__(self) -> JobLogStream: ...
+    async def __anext__(self) -> JobLogEntry: ...

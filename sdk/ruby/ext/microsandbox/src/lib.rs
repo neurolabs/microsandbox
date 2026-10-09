@@ -1,9 +1,11 @@
+mod jobs;
+
 use std::{
     ffi::c_void,
-    fmt::Display,
     future::Future,
     mem::ManuallyDrop,
     panic::{AssertUnwindSafe, catch_unwind},
+    path::PathBuf,
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicPtr, AtomicU32, Ordering},
@@ -12,11 +14,13 @@ use std::{
 };
 
 use magnus::{
-    Error, ExceptionClass, RArray, RHash, RString, Ruby, Symbol, TryConvert, Value, function,
-    method, prelude::*, r_hash::ForEach, scan_args::scan_args, typed_data,
+    Error, ExceptionClass, RArray, RHash, RObject, RString, Ruby, Symbol, TryConvert, Value,
+    function, method, prelude::*, r_hash::ForEach, scan_args::scan_args, typed_data,
 };
 use microsandbox_core::{
-    BackendKind, MicrosandboxResult,
+    AgentClientError, BackendKind, MicrosandboxError, MicrosandboxResult, Operation,
+    PublishedSnapshotArtifact, SnapshotArtifactKind, SnapshotSourceRecoveryError,
+    UnsupportedReason,
     backend::{
         CloudBackend, LocalBackend, default_backend, resolve_default_backend, set_default_backend,
     },
@@ -29,7 +33,7 @@ use microsandbox_core::{
         SandboxPage, SandboxPingResult, SandboxStatus, SandboxStopResult, SandboxTouchResult,
         SecretSource,
     },
-    snapshot::{Snapshot, SnapshotHandle},
+    snapshot::{SaveOpts, Snapshot, SnapshotHandle},
     volume::{Volume, VolumeHandle, VolumeKind},
 };
 
@@ -165,21 +169,24 @@ fn reset_backend_after_fork(ruby: &Ruby) -> Result<(), Error> {
         .clone();
     match selection {
         BackendSelection::Ambient => {
-            let backend = resolve_default_backend().map_err(|error| native_error(ruby, error))?;
+            let backend = resolve_default_backend().map_err(|error| core_error(ruby, error))?;
             set_default_backend(backend);
         }
-        BackendSelection::Local => set_default_backend(LocalBackend::lazy()),
+        BackendSelection::Local => {
+            let backend = LocalBackend::lazy().map_err(|error| core_error(ruby, error))?;
+            set_default_backend(backend);
+        }
         BackendSelection::Cloud { api_key, url } => {
             let backend = match url {
                 Some(url) => CloudBackend::new(url, api_key),
                 None => CloudBackend::with_api_key(api_key),
             }
-            .map_err(|error| native_error(ruby, error))?;
+            .map_err(|error| core_error(ruby, error))?;
             set_default_backend(backend);
         }
         BackendSelection::CloudProfile(name) => {
             let backend =
-                CloudBackend::from_profile(&name).map_err(|error| native_error(ruby, error))?;
+                CloudBackend::from_profile(&name).map_err(|error| core_error(ruby, error))?;
             set_default_backend(backend);
         }
     }
@@ -226,13 +233,190 @@ fn runtime() -> Result<&'static tokio::runtime::Runtime, Error> {
     Ok(unsafe { &*runtime_ptr })
 }
 
-fn native_error(ruby: &Ruby, error: impl Display) -> Error {
-    let msg = error.to_string();
-    let exc = ruby
-        .define_module("Microsandbox")
-        .and_then(|m| m.const_get::<_, ExceptionClass>("Error"))
-        .unwrap_or_else(|_| ruby.exception_runtime_error());
-    Error::new(exc, msg)
+//--------------------------------------------------------------------------------------------------
+// Functions: Core error mapping
+//--------------------------------------------------------------------------------------------------
+
+/// The `Microsandbox::*` exception class for a core error. `"Error"` is the
+/// natively defined base class; the subclasses live in
+/// `lib/microsandbox/errors.rb`. Class names mirror the Python SDK's bridge
+/// (`sdk/python/src/error.rs`), extended with the Go SDK's per-variant coverage
+/// for snapshots, exec spawn failures, and duplicate volumes. Every other
+/// variant falls back to the base class.
+fn core_error_class_name(error: &MicrosandboxError) -> &'static str {
+    match error {
+        MicrosandboxError::RuntimeNotInstalled(_) => "RuntimeNotInstalledError",
+        MicrosandboxError::RuntimeIncomplete(_) => "RuntimeIncompleteError",
+        MicrosandboxError::InvalidConfig(_) | MicrosandboxError::MissingRestoreBindings { .. } => {
+            "InvalidConfigError"
+        }
+        MicrosandboxError::NoDefaultCommand => "NoDefaultCommandError",
+        MicrosandboxError::CloudHttp { .. } => "CloudHttpError",
+        MicrosandboxError::SandboxNotFound(_) => "SandboxNotFoundError",
+        MicrosandboxError::SandboxNotRunning(_) => "SandboxNotRunningError",
+        MicrosandboxError::SandboxAlreadyExists(_) => "SandboxAlreadyExistsError",
+        MicrosandboxError::SandboxReplaced { .. } => "SandboxReplacedError",
+        MicrosandboxError::SandboxStillRunning(_) => "SandboxStillRunningError",
+        MicrosandboxError::SandboxStopTimedOut { .. } => "SandboxStopTimedOutError",
+        MicrosandboxError::StopTimeout { .. } => "StopTimeoutError",
+        MicrosandboxError::ExecTimeout(_) => "ExecTimeoutError",
+        MicrosandboxError::ExecFailed(_) => "ExecFailedError",
+        MicrosandboxError::SandboxFsOps(_) => "FilesystemError",
+        MicrosandboxError::VolumeNotFound(_) => "VolumeNotFoundError",
+        MicrosandboxError::VolumeAlreadyExists(_) => "VolumeAlreadyExistsError",
+        MicrosandboxError::ImageNotFound(_) => "ImageNotFoundError",
+        MicrosandboxError::ImageInUse(_) => "ImageInUseError",
+        MicrosandboxError::SnapshotNotFound(_) => "SnapshotNotFoundError",
+        MicrosandboxError::SnapshotAlreadyExists(_) => "SnapshotAlreadyExistsError",
+        MicrosandboxError::SnapshotSandboxRunning(_) => "SnapshotSandboxRunningError",
+        MicrosandboxError::SnapshotImageMissing(_) => "SnapshotImageMissingError",
+        MicrosandboxError::SnapshotIntegrity(_) => "SnapshotIntegrityError",
+        MicrosandboxError::SnapshotSourceRecovery(_) => "SnapshotSourceRecoveryError",
+        MicrosandboxError::SnapshotMigration { .. } => "SnapshotMigrationError",
+        // Always present: the extension enables the core's `net` feature.
+        MicrosandboxError::NetworkBuilder(_) => "NetworkPolicyError",
+        MicrosandboxError::Io(_) => "IoError",
+        MicrosandboxError::MetricsDisabled(_) => "MetricsDisabledError",
+        MicrosandboxError::MetricsUnavailable(_) => "MetricsUnavailableError",
+        MicrosandboxError::AgentClient(AgentClientError::UnsupportedOperation { .. }) => {
+            "UnsupportedOperationError"
+        }
+        MicrosandboxError::Unsupported { .. } => "UnsupportedError",
+        _ => "Error",
+    }
+}
+
+/// Look up `Microsandbox::<name>`, falling back to the base `Error`, then to
+/// `RuntimeError` if even that is missing.
+fn exception_class(ruby: &Ruby, name: &str) -> ExceptionClass {
+    ruby.define_module("Microsandbox")
+        .and_then(|module| {
+            module
+                .const_get::<_, ExceptionClass>(name)
+                .or_else(|_| module.const_get::<_, ExceptionClass>("Error"))
+        })
+        .unwrap_or_else(|_| ruby.exception_runtime_error())
+}
+
+/// Convert a core error into the matching typed Ruby exception. The message is
+/// always the core error's `Display` rendering, except for `Unsupported`,
+/// which names the Ruby API instead of the Rust path.
+fn core_error(ruby: &Ruby, error: MicrosandboxError) -> Error {
+    if let MicrosandboxError::Unsupported { op, reason } = &error {
+        return unsupported_error(ruby, &ruby_api_name(*op), &ruby_hint(reason));
+    }
+    if let MicrosandboxError::SnapshotSourceRecovery(recovery) = &error {
+        return snapshot_source_recovery_error(ruby, error.to_string(), recovery);
+    }
+    Error::new(
+        exception_class(ruby, core_error_class_name(&error)),
+        error.to_string(),
+    )
+}
+
+/// Build a `Microsandbox::SnapshotSourceRecoveryError` carrying the recovery
+/// locator as the attributes read by its `attr_reader`s, mirroring the Python
+/// SDK's `SnapshotSourceRecoveryError`, so callers never parse the message.
+fn snapshot_source_recovery_error(
+    ruby: &Ruby,
+    message: String,
+    recovery: &SnapshotSourceRecoveryError,
+) -> Error {
+    let class = exception_class(ruby, "SnapshotSourceRecoveryError");
+    let exception = match class.new_instance((message.as_str(),)) {
+        Ok(exception) => exception,
+        Err(_) => return Error::new(class, message),
+    };
+    // Best-effort extras; the message already carries the locator.
+    if let Some(object) = RObject::from_value(exception.as_value()) {
+        let checkpoint_path = recovery.checkpoint_path.to_string_lossy().into_owned();
+        let _ = object.ivar_set("@source_sandbox", recovery.source_sandbox.as_str());
+        let _ = object.ivar_set("@checkpoint_id", recovery.checkpoint_id.as_str());
+        let _ = object.ivar_set("@checkpoint_root", recovery.checkpoint_root.as_str());
+        let _ = object.ivar_set("@checkpoint_path", checkpoint_path);
+        let _ = object.ivar_set("@detail", recovery.detail.as_str());
+        let _ = object.ivar_set("@publication_error", recovery.publication_error.as_deref());
+        let artifact = recovery.artifact.as_ref();
+        if let Some(Ok(hash)) = artifact.map(|artifact| published_artifact_hash(ruby, artifact)) {
+            let _ = object.ivar_set("@artifact", hash);
+        }
+    }
+    exception.into()
+}
+
+/// The snapshot that was published despite the source failing to recover, as
+/// a Hash with the same keys as the Python SDK's `PublishedSnapshotArtifact`.
+fn published_artifact_hash(
+    ruby: &Ruby,
+    artifact: &PublishedSnapshotArtifact,
+) -> Result<RHash, Error> {
+    let kind = match artifact.kind {
+        SnapshotArtifactKind::Installed => "installed",
+        SnapshotArtifactKind::Archive => "archive",
+    };
+    let hash = ruby.hash_new();
+    hash.aset("kind", kind)?;
+    hash.aset("path", artifact.path.to_string_lossy().into_owned())?;
+    hash.aset("snapshot_id", artifact.snapshot_id.as_str())?;
+    hash.aset("digest", artifact.digest.as_str())?;
+    Ok(hash)
+}
+
+/// Build a `Microsandbox::UnsupportedError` carrying the rendered message plus
+/// the structured `@operation` / `@hint` attributes read by
+/// `UnsupportedError#operation` / `#hint`.
+fn unsupported_error(ruby: &Ruby, operation: &str, hint: &str) -> Error {
+    let message = format!("{operation} is not supported by this backend: {hint}");
+    let class = exception_class(ruby, "UnsupportedError");
+    match class.new_instance((message.as_str(),)) {
+        Ok(exception) => {
+            // Best-effort extras; the message already carries both.
+            if let Some(object) = RObject::from_value(exception.as_value()) {
+                let _ = object.ivar_set("@operation", operation);
+                let _ = object.ivar_set("@hint", hint);
+            }
+            exception.into()
+        }
+        Err(_) => Error::new(class, message),
+    }
+}
+
+/// Render an [`Operation`] as the Ruby API it corresponds to: `Sandbox::kill`
+/// becomes `sandbox.kill` and `Sandbox::log_stream(follow=false)` becomes
+/// `sandbox.log_stream(follow: false)`. Plain phrases without a `Type::method`
+/// shape (`config`, `snapshot operations`) pass through as-is.
+fn ruby_api_name(op: Operation) -> String {
+    let path = op.api_path();
+    let Some((ty, method)) = path.split_once("::") else {
+        return path.to_string();
+    };
+    format!("{}.{}", camel_to_snake(ty), method.replace('=', ": "))
+}
+
+/// Render an [`UnsupportedReason`] with `use instead` targets pointing at the
+/// Ruby API name rather than the Rust path.
+fn ruby_hint(reason: &UnsupportedReason) -> String {
+    match reason {
+        UnsupportedReason::UseInstead(op) => format!("use {}", ruby_api_name(*op)),
+        other => other.hint(),
+    }
+}
+
+/// Lower a `CamelCase` type name to `snake_case` (`SandboxFsOps` becomes
+/// `sandbox_fs_ops`).
+fn camel_to_snake(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for (i, ch) in name.char_indices() {
+        if ch.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// Spawn `future` on the tokio runtime and block the Ruby thread **without the
@@ -297,7 +481,7 @@ where
     F: Future<Output = MicrosandboxResult<T>> + Send + 'static,
     T: Send + 'static,
 {
-    block_without_gvl(ruby, future)?.map_err(|e| native_error(ruby, e))
+    block_without_gvl(ruby, future)?.map_err(|e| core_error(ruby, e))
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -411,7 +595,7 @@ fn restricted_network_policy(ruby: &Ruby, value: Value) -> Result<NetworkPolicy,
         .default_deny()
         .egress(|eg| eg.tcp().ports(ports).allow_domains(hosts))
         .build()
-        .map_err(|e| native_error(ruby, e))
+        .map_err(|e| core_error(ruby, MicrosandboxError::from(e)))
 }
 
 fn apply_secret_options(
@@ -433,6 +617,9 @@ fn apply_secret_options(
 
 #[derive(Clone)]
 enum RubyOutboundProxyConfig {
+    HttpConnect {
+        address: String,
+    },
     Socks4 {
         address: String,
         user_id: Option<String>,
@@ -445,6 +632,9 @@ enum RubyOutboundProxyConfig {
 
 fn apply_outbound_proxy(builder: SandboxBuilder, proxy: &RubyOutboundProxy) -> SandboxBuilder {
     match proxy.inner.borrow().clone() {
+        RubyOutboundProxyConfig::HttpConnect { address } => {
+            builder.proxy(|proxy| proxy.http_connect(address))
+        }
         RubyOutboundProxyConfig::Socks4 {
             address,
             user_id: Some(user_id),
@@ -600,6 +790,8 @@ fn apply_builder_options(
         "replace_timeout",
         "root_disk",
         "disable_network",
+        "http",
+        "intercept_tls",
         "network",
         "proxy",
         "secrets",
@@ -679,6 +871,18 @@ fn apply_builder_options(
             let policy = restricted_network_policy(ruby, net)?;
             builder = builder.network(|n| n.policy(policy));
         }
+    }
+    if let Some(http) = keyword::<RHash>(kwargs, "http")? {
+        reject_unknown_keywords(ruby, http, &["deny_response", "deny_message"])?;
+        if let Some(enabled) = keyword::<bool>(http, "deny_response")? {
+            builder = builder.network(|network| network.http(|h| h.deny_response(enabled)));
+        }
+        if let Some(message) = keyword::<String>(http, "deny_message")? {
+            builder = builder.network(|network| network.http(|h| h.deny_message(message)));
+        }
+    }
+    if keyword::<bool>(kwargs, "intercept_tls")?.unwrap_or(false) {
+        builder = builder.intercept_tls();
     }
     if let Some(proxy) = keyword::<typed_data::Obj<RubyOutboundProxy>>(kwargs, "proxy")? {
         builder = apply_outbound_proxy(builder, &proxy);
@@ -855,6 +1059,11 @@ struct RubySnapshotHandle {
     inner: SnapshotHandle,
 }
 
+#[magnus::wrap(class = "Microsandbox::Snapshot", free_immediately, size)]
+struct RubySnapshot {
+    inner: Snapshot,
+}
+
 // -------------------------------------------------------------------------------------------------
 // Builder methods
 // -------------------------------------------------------------------------------------------------
@@ -937,8 +1146,27 @@ impl RubySandboxBuilder {
     fn root_disk(this: typed_data::Obj<Self>, v: u32) -> Result<(), Error> {
         put_builder(&this, |b| b.root_disk(v))
     }
+    fn intercept_tls(this: typed_data::Obj<Self>) -> Result<(), Error> {
+        put_builder(&this, SandboxBuilder::intercept_tls)
+    }
+
     fn disable_network(this: typed_data::Obj<Self>) -> Result<(), Error> {
         put_builder(&this, SandboxBuilder::disable_network)
+    }
+    fn http(
+        this: typed_data::Obj<Self>,
+        enabled: Option<bool>,
+        message: Option<String>,
+    ) -> Result<(), Error> {
+        put_builder(&this, |mut builder| {
+            if let Some(enabled) = enabled {
+                builder = builder.network(|network| network.http(|h| h.deny_response(enabled)));
+            }
+            if let Some(message) = message {
+                builder = builder.network(|network| network.http(|h| h.deny_message(message)));
+            }
+            builder
+        })
     }
     fn quiet_logs(this: typed_data::Obj<Self>) -> Result<(), Error> {
         put_builder(&this, SandboxBuilder::quiet_logs)
@@ -1069,6 +1297,17 @@ impl RubySandbox {
                 None => sb.stop().await,
             }
         })
+    }
+
+    fn stop_with_timeout(
+        ruby: &Ruby,
+        this: typed_data::Obj<Self>,
+        seconds: f64,
+    ) -> Result<(), Error> {
+        // A required scalar cannot turn an explicit bounded call into an unbounded stop.
+        let timeout = duration(ruby, seconds, "timeout")?;
+        let sb = this.inner_clone()?;
+        run(ruby, async move { sb.stop_with_timeout(timeout).await })
     }
 
     fn kill(ruby: &Ruby, this: typed_data::Obj<Self>, args: &[Value]) -> Result<(), Error> {
@@ -1466,6 +1705,16 @@ impl RubySandboxHandle {
         })
     }
 
+    fn stop_with_timeout(
+        ruby: &Ruby,
+        this: typed_data::Obj<Self>,
+        seconds: f64,
+    ) -> Result<(), Error> {
+        let timeout = duration(ruby, seconds, "timeout")?;
+        let handle = Arc::clone(&this.inner);
+        run(ruby, async move { handle.stop_with_timeout(timeout).await })
+    }
+
     fn kill(ruby: &Ruby, this: typed_data::Obj<Self>, args: &[Value]) -> Result<(), Error> {
         let parsed = scan_args::<(), (Option<f64>,), (), (), RHash, ()>(args)?;
         let timeout = parse_timeout(ruby, parsed.optional.0, parsed.keywords, "kill")?;
@@ -1685,8 +1934,28 @@ impl RubyVolumeHandle {
 }
 
 // -------------------------------------------------------------------------------------------------
-// SnapshotHandle methods
+// Snapshot methods
 // -------------------------------------------------------------------------------------------------
+
+impl RubySnapshot {
+    fn digest(&self) -> String {
+        self.inner.digest().to_owned()
+    }
+    fn size_bytes(&self) -> Option<u64> {
+        self.inner.size_bytes()
+    }
+    fn reference(&self) -> String {
+        self.inner.reference().value().to_owned()
+    }
+    fn reference_kind(&self) -> &'static str {
+        self.inner.reference().kind()
+    }
+    fn save_to(ruby: &Ruby, this: typed_data::Obj<Self>, args: &[Value]) -> Result<(), Error> {
+        let (out, opts) = parse_snapshot_save_args(ruby, args)?;
+        let snapshot = this.inner.clone();
+        run(ruby, async move { snapshot.save_to(&out, opts).await })
+    }
+}
 
 impl RubySnapshotHandle {
     fn digest(&self) -> String {
@@ -1704,12 +1973,25 @@ impl RubySnapshotHandle {
     fn state_kind(&self) -> String {
         self.inner.state_kind().to_owned()
     }
-    fn path(&self) -> String {
-        self.inner.path().to_string_lossy().into_owned()
+    fn reference(&self) -> String {
+        self.inner.reference().value().to_owned()
+    }
+    fn reference_kind(&self) -> &'static str {
+        self.inner.reference().kind()
     }
     fn remove(ruby: &Ruby, this: typed_data::Obj<Self>, force: bool) -> Result<(), Error> {
         let handle = this.inner.clone();
         run(ruby, async move { handle.remove(force).await })
+    }
+    fn open(ruby: &Ruby, this: typed_data::Obj<Self>) -> Result<RubySnapshot, Error> {
+        let handle = this.inner.clone();
+        let inner = run(ruby, async move { handle.open().await })?;
+        Ok(RubySnapshot { inner })
+    }
+    fn save_to(ruby: &Ruby, this: typed_data::Obj<Self>, args: &[Value]) -> Result<(), Error> {
+        let (out, opts) = parse_snapshot_save_args(ruby, args)?;
+        let handle = this.inner.clone();
+        run(ruby, async move { handle.save_to(&out, opts).await })
     }
 }
 
@@ -1722,11 +2004,20 @@ fn version() -> &'static str {
 }
 
 fn installed() -> bool {
-    microsandbox_core::setup::is_installed()
+    microsandbox_core::setup::is_runtime_installed(
+        &microsandbox_core::config::GlobalConfig::default(),
+    )
 }
 
 fn install(ruby: &Ruby) -> Result<(), Error> {
-    run(ruby, microsandbox_core::setup::install())
+    run(ruby, async {
+        microsandbox_core::setup::install_runtime(
+            &microsandbox_core::config::GlobalConfig::default(),
+            Default::default(),
+        )
+        .await
+        .map(|_| ())
+    })
 }
 
 fn set_runtime_msb_path(path: String) {
@@ -1756,7 +2047,8 @@ fn remember_backend_selection(ruby: &Ruby, selection: BackendSelection) -> Resul
 }
 
 fn set_default_backend_local(ruby: &Ruby) -> Result<(), Error> {
-    set_default_backend(LocalBackend::lazy());
+    let backend = LocalBackend::lazy().map_err(|error| core_error(ruby, error))?;
+    set_default_backend(backend);
     remember_backend_selection(ruby, BackendSelection::Local)
 }
 
@@ -1769,13 +2061,13 @@ fn set_default_backend_cloud(ruby: &Ruby, args: &[Value]) -> Result<(), Error> {
         Some(url) => CloudBackend::new(url, &api_key),
         None => CloudBackend::with_api_key(&api_key),
     }
-    .map_err(|error| native_error(ruby, error))?;
+    .map_err(|error| core_error(ruby, error))?;
     set_default_backend(backend);
     remember_backend_selection(ruby, BackendSelection::Cloud { api_key, url })
 }
 
 fn set_default_backend_profile(ruby: &Ruby, name: String) -> Result<(), Error> {
-    let backend = CloudBackend::from_profile(&name).map_err(|error| native_error(ruby, error))?;
+    let backend = CloudBackend::from_profile(&name).map_err(|error| core_error(ruby, error))?;
     set_default_backend(backend);
     remember_backend_selection(ruby, BackendSelection::CloudProfile(name))
 }
@@ -1793,6 +2085,12 @@ fn outbound_proxy_socks4(address: String) -> RubyOutboundProxy {
             address,
             user_id: None,
         }),
+    }
+}
+
+fn outbound_proxy_http_connect(address: String) -> RubyOutboundProxy {
+    RubyOutboundProxy {
+        inner: std::cell::RefCell::new(RubyOutboundProxyConfig::HttpConnect { address }),
     }
 }
 
@@ -1831,6 +2129,10 @@ impl RubyOutboundProxy {
                 ruby,
                 "user_id is only supported for SOCKS4 proxies",
             )),
+            RubyOutboundProxyConfig::HttpConnect { .. } => Err(argument_error(
+                ruby,
+                "user_id is only supported for SOCKS4 proxies",
+            )),
         }
     }
 
@@ -1842,6 +2144,10 @@ impl RubyOutboundProxy {
     ) -> Result<(), Error> {
         match &mut *this.inner.borrow_mut() {
             RubyOutboundProxyConfig::Socks4 { .. } => Err(argument_error(
+                ruby,
+                "credentials are only supported for SOCKS5 proxies",
+            )),
+            RubyOutboundProxyConfig::HttpConnect { .. } => Err(argument_error(
                 ruby,
                 "credentials are only supported for SOCKS5 proxies",
             )),
@@ -1987,6 +2293,16 @@ fn volume_builder(name: String) -> RubyVolumeBuilder {
 
 // -- Snapshot statics --------------------------------------------------------
 
+fn snapshot_open(ruby: &Ruby, args: &[Value]) -> Result<RubySnapshot, Error> {
+    let parsed = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
+    if !parsed.keywords.is_empty() {
+        return Err(argument_error(ruby, "open does not accept keywords"));
+    }
+    let reference = parsed.required.0;
+    let inner = run(ruby, async move { Snapshot::open(&reference).await })?;
+    Ok(RubySnapshot { inner })
+}
+
 fn snapshot_get(ruby: &Ruby, args: &[Value]) -> Result<RubySnapshotHandle, Error> {
     let parsed = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
     if !parsed.keywords.is_empty() {
@@ -2018,6 +2334,28 @@ fn snapshot_remove(ruby: &Ruby, args: &[Value]) -> Result<(), Error> {
     let name = parsed.required.0;
     let force = parsed.optional.0.unwrap_or(false);
     run(ruby, async move { Snapshot::remove(&name, force).await })
+}
+
+fn snapshot_save(ruby: &Ruby, args: &[Value]) -> Result<(), Error> {
+    let parsed = scan_args::<(String, String), (), (), (), RHash, ()>(args)?;
+    reject_unknown_keywords(
+        ruby,
+        parsed.keywords,
+        &[
+            "with_parents",
+            "with_image",
+            "plain_tar",
+            "since",
+            "last_layers",
+        ],
+    )?;
+    let reference = parsed.required.0;
+    let out = PathBuf::from(parsed.required.1);
+    let opts = snapshot_save_opts(parsed.keywords)?;
+    run(
+        ruby,
+        async move { Snapshot::save(&reference, &out, opts).await },
+    )
 }
 
 // -- Image statics -----------------------------------------------------------
@@ -2267,9 +2605,33 @@ fn fs_metadata_hash(md: FsMetadata) -> Result<RHash, Error> {
 fn snapshot_hash(snapshot: Snapshot) -> Result<RHash, Error> {
     let hash = current_ruby().hash_new();
     hash.aset("digest", snapshot.digest())?;
-    hash.aset("path", snapshot.path().to_string_lossy().into_owned())?;
+    hash.aset("reference", snapshot.reference().value())?;
+    hash.aset("reference_kind", snapshot.reference().kind())?;
     hash.aset("size_bytes", snapshot.size_bytes())?;
     Ok(hash)
+}
+
+fn parse_snapshot_save_args(ruby: &Ruby, args: &[Value]) -> Result<(PathBuf, SaveOpts), Error> {
+    let parsed = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
+    reject_unknown_keywords(
+        ruby,
+        parsed.keywords,
+        &["with_parents", "with_image", "plain_tar"],
+    )?;
+    Ok((
+        PathBuf::from(parsed.required.0),
+        snapshot_save_opts(parsed.keywords)?,
+    ))
+}
+
+fn snapshot_save_opts(keywords: RHash) -> Result<SaveOpts, Error> {
+    Ok(SaveOpts {
+        with_parents: keyword::<bool>(keywords, "with_parents")?.unwrap_or(false),
+        with_image: keyword::<bool>(keywords, "with_image")?.unwrap_or(false),
+        plain_tar: keyword::<bool>(keywords, "plain_tar")?.unwrap_or(false),
+        since: keyword::<String>(keywords, "since")?,
+        last_layers: keyword::<usize>(keywords, "last_layers")?,
+    })
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -2310,6 +2672,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     secret_source.define_singleton_method("env", function!(secret_source_env, 1))?;
 
     let outbound_proxy = module.define_class("OutboundProxy", ruby.class_object())?;
+    outbound_proxy
+        .define_singleton_method("http_connect", function!(outbound_proxy_http_connect, 1))?;
     outbound_proxy.define_singleton_method("socks4", function!(outbound_proxy_socks4, 1))?;
     outbound_proxy.define_singleton_method("socks5", function!(outbound_proxy_socks5, 1))?;
     outbound_proxy.define_method("user_id!", method!(RubyOutboundProxy::user_id, 1))?;
@@ -2339,6 +2703,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     sandbox.define_method("exec", method!(RubySandbox::exec, -1))?;
     sandbox.define_method("shell", method!(RubySandbox::shell, -1))?;
     sandbox.define_method("stop", method!(RubySandbox::stop, -1))?;
+    sandbox.define_method(
+        "stop_with_timeout",
+        method!(RubySandbox::stop_with_timeout, 1),
+    )?;
     sandbox.define_method("kill", method!(RubySandbox::kill, -1))?;
     sandbox.define_method("request_stop", method!(RubySandbox::request_stop, 0))?;
     sandbox.define_method("request_kill", method!(RubySandbox::request_kill, 0))?;
@@ -2394,6 +2762,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     )?;
     handle.define_method("start", method!(RubySandboxHandle::start, -1))?;
     handle.define_method("stop", method!(RubySandboxHandle::stop, -1))?;
+    handle.define_method(
+        "stop_with_timeout",
+        method!(RubySandboxHandle::stop_with_timeout, 1),
+    )?;
     handle.define_method("kill", method!(RubySandboxHandle::kill, -1))?;
     handle.define_method("remove", method!(RubySandboxHandle::remove, 0))?;
     handle.define_method(
@@ -2441,9 +2813,14 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     )?;
     builder.define_method("root_disk!", method!(RubySandboxBuilder::root_disk, 1))?;
     builder.define_method(
+        "intercept_tls!",
+        method!(RubySandboxBuilder::intercept_tls, 0),
+    )?;
+    builder.define_method(
         "disable_network!",
         method!(RubySandboxBuilder::disable_network, 0),
     )?;
+    builder.define_method("http!", method!(RubySandboxBuilder::http, 2))?;
     builder.define_method("quiet_logs!", method!(RubySandboxBuilder::quiet_logs, 0))?;
     builder.define_method("entrypoint!", method!(RubySandboxBuilder::entrypoint, 1))?;
     builder.define_method("init!", method!(RubySandboxBuilder::init, 1))?;
@@ -2526,9 +2903,16 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
 
     // -- Snapshot ------------------------------------------------------------
     let snapshot = module.define_class("Snapshot", ruby.class_object())?;
+    snapshot.define_singleton_method("open", function!(snapshot_open, -1))?;
     snapshot.define_singleton_method("get", function!(snapshot_get, -1))?;
     snapshot.define_singleton_method("list", function!(snapshot_list, -1))?;
     snapshot.define_singleton_method("remove", function!(snapshot_remove, -1))?;
+    snapshot.define_singleton_method("save", function!(snapshot_save, -1))?;
+    snapshot.define_method("digest", method!(RubySnapshot::digest, 0))?;
+    snapshot.define_method("size_bytes", method!(RubySnapshot::size_bytes, 0))?;
+    snapshot.define_method("reference", method!(RubySnapshot::reference, 0))?;
+    snapshot.define_method("reference_kind", method!(RubySnapshot::reference_kind, 0))?;
+    snapshot.define_method("save_to", method!(RubySnapshot::save_to, -1))?;
 
     let snap_handle = module.define_class("SnapshotHandle", ruby.class_object())?;
     snap_handle.define_method("digest", method!(RubySnapshotHandle::digest, 0))?;
@@ -2536,9 +2920,16 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     snap_handle.define_method("size_bytes", method!(RubySnapshotHandle::size_bytes, 0))?;
     snap_handle.define_method("image_ref", method!(RubySnapshotHandle::image_ref, 0))?;
     snap_handle.define_method("state_kind", method!(RubySnapshotHandle::state_kind, 0))?;
-    snap_handle.define_method("path", method!(RubySnapshotHandle::path, 0))?;
+    snap_handle.define_method("reference", method!(RubySnapshotHandle::reference, 0))?;
+    snap_handle.define_method(
+        "reference_kind",
+        method!(RubySnapshotHandle::reference_kind, 0),
+    )?;
     snap_handle.define_method("remove", method!(RubySnapshotHandle::remove, 1))?;
+    snap_handle.define_method("open", method!(RubySnapshotHandle::open, 0))?;
+    snap_handle.define_method("save_to", method!(RubySnapshotHandle::save_to, -1))?;
 
+    jobs::init(ruby, module)?;
     Ok(())
 }
 

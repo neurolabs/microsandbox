@@ -36,6 +36,7 @@ pub struct PassthroughFsBuilder {
     bind_identity_map: Option<BindIdentityMapHandle>,
     quota_bytes: Option<u64>,
     deny: Vec<String>,
+    max_state_bytes: usize,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -59,6 +60,7 @@ impl PassthroughFsBuilder {
             bind_identity_map: None,
             quota_bytes: None,
             deny: Vec::new(),
+            max_state_bytes: msb_krun::DEFAULT_MAX_FS_BACKEND_STATE_BYTES,
         }
     }
 
@@ -145,6 +147,12 @@ impl PassthroughFsBuilder {
         self
     }
 
+    /// Set the largest serialized filesystem state, in bytes, this mount captures or restores.
+    pub fn with_state_limit(mut self, bytes: usize) -> Self {
+        self.max_state_bytes = bytes;
+        self
+    }
+
     /// Build the PassthroughFs instance.
     pub fn build(self) -> io::Result<PassthroughFs> {
         let root_dir = self
@@ -160,6 +168,9 @@ impl PassthroughFsBuilder {
         }
 
         let cfg = PassthroughConfig {
+            max_state_bytes: self.max_state_bytes,
+            owned_checkpoint: None,
+            external_checkpoint: None,
             root_dir,
             no_symlink_root: self.no_symlink_root,
             stat_virtualization: self.stat_virtualization,

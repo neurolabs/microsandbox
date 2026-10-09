@@ -76,6 +76,10 @@ pub struct InspectArgs {
     /// Sandbox to inspect.
     pub name: String,
 
+    /// Inspect a managed job instead of the sandbox.
+    #[arg(long)]
+    pub job: Option<String>,
+
     /// Output format (json).
     #[arg(long, value_name = "FORMAT", value_parser = ["json"])]
     pub format: Option<String>,
@@ -95,14 +99,29 @@ struct PendingConfigChange {
 
 /// Execute the `msb inspect` command.
 pub async fn run(args: InspectArgs) -> anyhow::Result<()> {
+    if let Some(job) = &args.job {
+        return super::jobs::inspect(&args.name, job, args.format.as_deref() == Some("json")).await;
+    }
     let handle = Sandbox::get(&args.name).await?;
     let desired_config = handle.config().ok();
     let active_config = handle.active_config().ok().flatten();
+    let pause_state = if matches!(
+        handle.status_snapshot(),
+        SandboxStatus::Running | SandboxStatus::Paused
+    ) {
+        tokio::time::timeout(std::time::Duration::from_millis(250), handle.pause_state())
+            .await
+            .ok()
+            .and_then(Result::ok)
+    } else {
+        None
+    };
     let pending_changes = pending_config_changes(
         handle.status_snapshot(),
         desired_config.as_ref(),
         active_config.as_ref(),
     );
+    let storage = handle.storage_usage().await;
 
     if args.format.as_deref() == Some("json") {
         let config: serde_json::Value =
@@ -110,6 +129,7 @@ pub async fn run(args: InspectArgs) -> anyhow::Result<()> {
         let mut json = serde_json::json!({
             "name": handle.name(),
             "status": format!("{:?}", handle.status_snapshot()),
+            "pause": pause_state,
             "config": config,
             "created_at": handle.created_at().map(|dt| ui::format_json_datetime(&dt)),
             "updated_at": handle.updated_at().map(|dt| ui::format_json_datetime(&dt)),
@@ -120,6 +140,10 @@ pub async fn run(args: InspectArgs) -> anyhow::Result<()> {
             .unwrap_or(serde_json::Value::Null);
         json["active_config"] = active_config_json;
         json["pending_changes"] = serde_json::to_value(&pending_changes)?;
+        json["storage"] = match &storage {
+            Ok(usage) => serde_json::to_value(usage)?,
+            Err(error) => serde_json::json!({ "unavailable_reason": error.to_string() }),
+        };
         println!("{}", serde_json::to_string_pretty(&json)?);
         return Ok(());
     }
@@ -128,6 +152,14 @@ pub async fn run(args: InspectArgs) -> anyhow::Result<()> {
 
     ui::detail_kv("Name", handle.name());
     ui::detail_kv("Status", &ui::format_status(&status));
+    if let Some(state) = &pause_state {
+        if state.recovery_required {
+            ui::detail_kv("Recovery", "Required; ordinary resume is fenced");
+        }
+        if let Some(reason) = &state.capture_unavailable {
+            ui::detail_kv("Full snapshot", reason);
+        }
+    }
 
     if let Some(dt) = handle.created_at() {
         ui::detail_kv("Created", &ui::format_datetime(&dt));
@@ -220,6 +252,10 @@ pub async fn run(args: InspectArgs) -> anyhow::Result<()> {
             ),
         );
         ui::detail_kv_indent("THP", config.spec.resources.thp.as_str());
+        ui::detail_kv(
+            "Guest Clock",
+            config.spec.runtime.guest_clock.unwrap_or_default().as_str(),
+        );
 
         let security = match config.spec.security_profile {
             SecurityProfile::Default => "default",
@@ -260,6 +296,34 @@ pub async fn run(args: InspectArgs) -> anyhow::Result<()> {
             ui::detail_header("Mounts");
             for mount in &config.spec.mounts {
                 match mount {
+                    VolumeMount::Owned {
+                        guest,
+                        storage,
+                        options,
+                        stat_virtualization,
+                        host_permissions,
+                    } => {
+                        let flags = mount_flags_suffix(*options);
+                        let detail = match storage {
+                            microsandbox::sandbox::OwnedVolumeStorage::Directory { quota_mib } => {
+                                let quota = quota_mib
+                                    .map(|mib| format!(" [quota={mib}MiB]"))
+                                    .unwrap_or_default();
+                                format!(
+                                    "directory{}{quota}",
+                                    mount_policy_suffix(
+                                        *stat_virtualization,
+                                        *host_permissions,
+                                        false
+                                    )
+                                )
+                            }
+                            microsandbox::sandbox::OwnedVolumeStorage::Disk { capacity_mib } => {
+                                format!("ext4 disk ({capacity_mib} MiB)")
+                            }
+                        };
+                        println!("  {guest:<16}\u{2192} owned {detail}{flags}");
+                    }
                     VolumeMount::Bind {
                         host,
                         guest,
@@ -331,6 +395,13 @@ pub async fn run(args: InspectArgs) -> anyhow::Result<()> {
         }
     }
 
+    match storage {
+        Ok(usage) => super::storage::display_item(&usage),
+        Err(error) => {
+            ui::detail_header("Storage");
+            ui::detail_kv_indent("Unavailable", &error.to_string());
+        }
+    }
     Ok(())
 }
 

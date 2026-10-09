@@ -26,7 +26,6 @@ type SandboxConfig struct {
 	// Deprecated: set RootDisk (via WithRootDisk / RootDisk.Managed) instead.
 	OCIUpperSizeMiB   uint32
 	ociUpperSizeSet   bool
-	Snapshot          string
 	MemoryMiB         uint32
 	CPUs              uint8
 	MaxMemoryMiB      uint32
@@ -80,11 +79,27 @@ type SandboxConfig struct {
 	Volumes             map[string]MountConfig // guest path → mount config
 }
 
+// SnapshotSeed is accepted by RestoreSandbox. Passing a SnapshotArtifact or
+// SnapshotHandle preserves its typed reference; a string remains a
+// backend-relative compatibility reference.
+type SnapshotSeed interface {
+	string | *SnapshotArtifact | *SnapshotHandle
+}
+
 // SandboxOption is a functional option for configuring a sandbox.
 type SandboxOption func(*SandboxConfig)
 
 // CPUPlacement controls how sandbox vCPU threads are placed on host processors.
 type CPUPlacement string
+
+// ExternalMountRestorePolicy selects validation of authorized filesystem mappings.
+// Neither policy inherits resources; unmapped filesystems remain unavailable.
+type ExternalMountRestorePolicy string
+
+const (
+	ExternalMountStrict  ExternalMountRestorePolicy = "strict"
+	ExternalMountRelaxed ExternalMountRestorePolicy = "relaxed"
+)
 
 const (
 	CPUPlacementInherit CPUPlacement = "inherit"
@@ -477,6 +492,25 @@ const (
 // THPPolicy selects the guest transparent huge-page policy at boot.
 type THPPolicy string
 
+// WithForked restores a full snapshot with private copy-on-write memory.
+//
+// Deprecated: use WithCowMemory instead.
+func WithForked() RestoreOption {
+	return func(o *RestoreConfig) { o.Forked = true }
+}
+
+// WithCowMemory restores a full snapshot with private copy-on-write memory.
+// It cannot be combined with a fresh boot or disk-only restore.
+func WithCowMemory() RestoreOption {
+	return func(o *RestoreConfig) { o.CowMemory = true }
+}
+
+// WithExternalMountPolicy selects strict (default) or relaxed validation of mapped filesystems.
+// It does not authorize or inherit host resources.
+func WithExternalMountPolicy(policy ExternalMountRestorePolicy) RestoreOption {
+	return func(o *RestoreConfig) { o.ExternalMountPolicy = policy }
+}
+
 const (
 	// THPAlways transparently uses huge pages for eligible anonymous mappings.
 	THPAlways THPPolicy = "always"
@@ -653,15 +687,20 @@ func WithImageDisk(path string, fstype string) SandboxOption {
 // WithBindRootfs uses a host directory directly as the sandbox root filesystem
 // (a bind rootfs): the directory's contents become the guest root filesystem
 // as-is, with no OCI pull and no overlay. Mutually exclusive with WithImage,
-// WithImageDisk, and WithFromSnapshot.
+// WithImageDisk.
 func WithBindRootfs(path string) SandboxOption {
 	return func(o *SandboxConfig) { o.ImageBind = path }
 }
 
-// WithFromSnapshot boots from a snapshot artifact by bare name or filesystem path.
-// It is mutually exclusive with WithImage.
-func WithFromSnapshot(pathOrName string) SandboxOption {
-	return func(o *SandboxConfig) { o.Snapshot = pathOrName }
+// WithSnapshotDiskOnly cold-boots only the disk state carried by a full snapshot.
+// Use with RestoreSandbox.
+func WithSnapshotDiskOnly() RestoreOption {
+	return func(o *RestoreConfig) { o.SnapshotDiskOnly = true }
+}
+
+// WithSnapshotBase supplies the exact base snapshot or standalone base archive for a delta archive.
+func WithSnapshotBase(base string) RestoreOption {
+	return func(o *RestoreConfig) { o.SnapshotBase = base }
 }
 
 // WithMemory sets the memory limit in MiB (default 512MiB).
@@ -980,6 +1019,21 @@ func WithNetwork(net *NetworkConfig) SandboxOption {
 	return func(o *SandboxConfig) { o.Network = net }
 }
 
+// WithInterceptTLS enables TLS interception while preserving existing network and
+// TLS settings. A later WithNetwork replaces the network configuration.
+func WithInterceptTLS() SandboxOption {
+	return func(o *SandboxConfig) {
+		network := NetworkConfig{}
+		if o.Network != nil {
+			network = *o.Network
+		}
+		if network.TLS == nil {
+			network.TLS = &TLSConfig{}
+		}
+		o.Network = &network
+	}
+}
+
 // WithProxy sets the single proxy used for outbound sandbox connections.
 func WithProxy(proxy *OutboundProxy) SandboxOption {
 	return func(o *SandboxConfig) { o.Proxy = proxy }
@@ -1047,7 +1101,7 @@ type RegistryAuth struct {
 // ---------------------------------------------------------------------------
 
 // OutboundProxy configures the single proxy used for outbound connections.
-// Construct one with a protocol-specific function such as SOCKS5Proxy.
+// Construct one with a protocol-specific function such as HTTPConnectProxy.
 type OutboundProxy struct {
 	protocol       string
 	address        string
@@ -1086,6 +1140,12 @@ func SOCKS4Proxy(address string, options ...SOCKS4ProxyOptions) *OutboundProxy {
 // SOCKS5Proxy configures a SOCKS5 outbound proxy at address.
 func SOCKS5Proxy(address string) *OutboundProxy {
 	return &OutboundProxy{protocol: "socks5", address: address}
+}
+
+// HTTPConnectProxy configures an HTTP proxy that opens outbound TCP tunnels
+// with CONNECT at address.
+func HTTPConnectProxy(address string) *OutboundProxy {
+	return &OutboundProxy{protocol: "http_connect", address: address}
 }
 
 // Credentials returns a copy configured with SOCKS5 username authentication
@@ -1131,11 +1191,19 @@ type NetworkConfig struct {
 	// TLS configures the transparent TLS interception proxy.
 	TLS *TLSConfig
 
+	// DisableStrict opts out of strict hostname policy enforcement.
+	// The zero value keeps strict mode enabled.
+	DisableStrict bool
+
 	// Ports makes sandbox TCP services reachable on localhost ports on the host.
 	Ports map[uint16]uint16
 
 	// PortBindings makes sandbox services reachable on explicit host bind addresses.
 	PortBindings []PortBinding
+
+	// TCPAcceptQueueSize sets the accept-queue depth for published TCP port listeners,
+	// 1 to 2147483647. Nil keeps the default, 1024; the host kernel clamps it to its somaxconn.
+	TCPAcceptQueueSize *uint32
 
 	// IPv4Pool is used to derive per-sandbox /30 guest subnets.
 	// Defaults to "172.16.0.0/12".
@@ -1145,19 +1213,39 @@ type NetworkConfig struct {
 	// Defaults to "fd42:6d73:62::/48".
 	IPv6Pool string
 
-	// MaxConnections caps concurrent network connections from the sandbox.
+	// NAT64Prefixes are NAT64 /96 prefixes used for policy classification.
+	// Defaults to "64:ff9b::/96".
+	NAT64Prefixes []string
+
+	// MaxConnections caps TCP connections.
+	// Deprecated: use MaxTCPConnections instead; specifying both is an error.
 	MaxConnections *uint
+	// MaxTCPConnections caps TCP connections; zero means unlimited.
+	MaxTCPConnections *uint
+	// MaxUDPConnections caps UDP relay sessions. Defaults to unlimited for single-tenant and 1024 for multi-tenant; zero means unlimited.
+	MaxUDPConnections *uint
 
 	// RateLimiter configures local egress and ingress traffic limits. Nil means
 	// unlimited in both directions.
 	RateLimiter *NetworkRateLimiterConfig
 
-	// OnSecretViolation is the sandbox-wide action when a secret is sent to
-	// a disallowed host. Per-secret overrides via SecretEntry.OnViolation.
-	OnSecretViolation ViolationAction
+	// SecretViolationAction is the sandbox-wide action for blocked placeholders.
+	SecretViolationAction ViolationAction
 
 	// TrustHostCAs ships the host's extra CA bundles into the guest.
 	TrustHostCAs *bool
+
+	// HTTP configures HTTP denial responses.
+	HTTP *HTTPConfig
+}
+
+// HTTPConfig configures HTTP denial responses.
+type HTTPConfig struct {
+	// DenyResponse enables readable HTTP denial responses. Default: false.
+	DenyResponse bool
+	// DenyMessage replaces the body when DenyResponse is enabled.
+	// "{host}" names the blocked host. Empty uses the default message.
+	DenyMessage string
 }
 
 // DNSConfig configures the in-VM DNS proxy.
@@ -1382,36 +1470,53 @@ type SecretEntry struct {
 	// Value is the actual secret; it never crosses the FFI into the guest.
 	Value string
 
-	// AllowHosts restricts substitution to exact host matches.
-	AllowHosts []string
+	// Allow lists exact or wildcard hosts that may receive the real secret.
+	Allow []string
 
-	// AllowHostPatterns restricts substitution to wildcard host patterns
-	// (e.g. "*.openai.com").
-	AllowHostPatterns []string
+	// Passthrough lists hosts that may receive the unchanged placeholder.
+	Passthrough []string
 
 	// Placeholder is the string used inside the sandbox in place of the secret.
 	// Auto-generated from EnvVar when empty. Custom values must be non-empty,
 	// at most 1024 bytes, and cannot contain NUL, CR, or LF.
 	Placeholder string
 
-	// RequireTLS requires a verified TLS identity before substituting.
+	// RequireTLSIdentity requires a verified TLS identity before substituting.
 	// Defaults to true when nil.
-	RequireTLS *bool
+	RequireTLSIdentity *bool
 
-	// OnViolation overrides the sandbox-level action when this secret is
-	// detected going to a disallowed host. The last non-empty value across
-	// all secrets wins (matches Node/Python behaviour, since the runtime
-	// applies it network-wide).
-	OnViolation ViolationAction
+	// Substitution selects request locations where the placeholder becomes the secret.
+	Substitution SecretSubstitution
+
+	// ViolationAction overrides the sandbox-level blocking action for this secret.
+	ViolationAction ViolationAction
+}
+
+// SecretSubstitution selects request locations where substitution is enabled.
+type SecretSubstitution struct {
+	Headers *bool
+	// HeaderFields restricts header substitution to these field names when
+	// non-empty (for example, []string{"authorization"}). Prefer this over
+	// substituting in every header: an untrusted guest can otherwise place the
+	// placeholder in a header the upstream host reflects back and read the
+	// real secret. An empty slice allows every header field.
+	HeaderFields []string
+	Query        bool
+	Body         bool
 }
 
 // SecretEnvOptions tunes Secret.Env beyond the required envVar and value.
 type SecretEnvOptions struct {
-	AllowHosts        []string
-	AllowHostPatterns []string
-	Placeholder       string
-	RequireTLS        *bool
-	OnViolation       ViolationAction
+	Allow []string
+	// AllowPlaceholderFor lists hosts that may receive the unchanged placeholder
+	// where substitution does not apply. Combined with Passthrough when both are set.
+	AllowPlaceholderFor []string
+	// Deprecated: use AllowPlaceholderFor instead.
+	Passthrough        []string
+	Placeholder        string
+	RequireTLSIdentity *bool
+	Substitution       SecretSubstitution
+	ViolationAction    ViolationAction
 }
 
 // secretFactory is the factory namespace matching Node's `Secret.env(...)` and
@@ -1422,21 +1527,24 @@ type secretFactory struct{}
 //
 //	microsandbox.Secret.Env("OPENAI_API_KEY",
 //	    os.Getenv("OPENAI_API_KEY"),
-//	    microsandbox.SecretEnvOptions{AllowHosts: []string{"api.openai.com"}},
+//	    microsandbox.SecretEnvOptions{Allow: []string{"api.openai.com"}},
 //	)
 var Secret secretFactory
 
 // Env returns a SecretEntry bound to an environment variable. Pass an empty
 // SecretEnvOptions{} if no additional tuning is needed.
 func (secretFactory) Env(envVar, value string, opts SecretEnvOptions) SecretEntry {
+	placeholderHosts := append([]string(nil), opts.AllowPlaceholderFor...)
+	placeholderHosts = append(placeholderHosts, opts.Passthrough...)
 	return SecretEntry{
-		EnvVar:            envVar,
-		Value:             value,
-		AllowHosts:        opts.AllowHosts,
-		AllowHostPatterns: opts.AllowHostPatterns,
-		Placeholder:       opts.Placeholder,
-		RequireTLS:        opts.RequireTLS,
-		OnViolation:       opts.OnViolation,
+		EnvVar:             envVar,
+		Value:              value,
+		Allow:              opts.Allow,
+		Passthrough:        placeholderHosts,
+		Placeholder:        opts.Placeholder,
+		RequireTLSIdentity: opts.RequireTLSIdentity,
+		Substitution:       opts.Substitution,
+		ViolationAction:    opts.ViolationAction,
 	}
 }
 
@@ -1641,6 +1749,7 @@ type MountConfig struct {
 	Named     string
 	NamedMode string
 	NamedKind string
+	Owned     string
 	QuotaMiB  uint32
 	Deny      []string
 	Tmpfs     bool
@@ -1678,7 +1787,7 @@ type MountOwner struct {
 	GID uint32
 }
 
-// MountKind discriminates between the four mount flavours.
+// MountKind discriminates between the mount flavours.
 type MountKind uint8
 
 const (
@@ -1690,6 +1799,8 @@ const (
 	MountKindTmpfs
 	// MountKindDisk is a host disk image (raw / qcow2 / ...).
 	MountKindDisk
+	// MountKindOwned is storage removed with its sandbox.
+	MountKindOwned
 )
 
 // Kind reports which flavour of mount this is.
@@ -1730,6 +1841,22 @@ type NamedVolumeOptions struct {
 	Kind     string // "dir" or "disk"; empty means dir.
 	SizeMiB  uint32
 	QuotaMiB uint32
+}
+
+// OwnedVolumeOptions configures storage allocated for one sandbox. It survives
+// stop/start and is removed with that sandbox. The default kind is a directory.
+type OwnedVolumeOptions struct {
+	Kind     VolumeKind
+	SizeMiB  uint32 // Required positive capacity for disk storage.
+	QuotaMiB uint32 // Directory quota; zero leaves the quota unset.
+	Readonly bool
+	Noexec   bool
+	Nosuid   bool
+	Nodev    bool
+	// Metadata policies and Owner apply only to directory storage.
+	StatVirtualization StatVirtualization
+	HostPermissions    HostPermissions
+	Owner              *MountOwner
 }
 
 // TmpfsOptions tunes the Tmpfs factory.
@@ -1816,6 +1943,22 @@ func (mountFactory) NamedWith(name string, opts MountOptions, namedOpts NamedVol
 		HostPermissions:    opts.HostPermissions,
 		Deny:               opts.Deny,
 		Owner:              opts.Owner,
+	}
+}
+
+// Owned returns a mount whose storage is allocated once and removed with the
+// sandbox. No separately named volume is created or shared.
+func (mountFactory) Owned(opts OwnedVolumeOptions) MountConfig {
+	kind := opts.Kind
+	if kind == "" {
+		kind = VolumeKindDir
+	}
+	return MountConfig{
+		kind: MountKindOwned, Owned: string(kind),
+		SizeMiB: opts.SizeMiB, QuotaMiB: opts.QuotaMiB,
+		Readonly: opts.Readonly, Noexec: opts.Noexec, Nosuid: opts.Nosuid, Nodev: opts.Nodev,
+		StatVirtualization: opts.StatVirtualization,
+		HostPermissions:    opts.HostPermissions, Owner: opts.Owner,
 	}
 }
 

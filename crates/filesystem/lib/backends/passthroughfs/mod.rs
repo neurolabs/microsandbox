@@ -5,7 +5,11 @@
 //! such as quota accounting live beside the platform modules.
 
 pub(crate) mod deny;
+mod external;
+mod owned;
 pub(crate) mod quota;
+#[cfg(any(target_os = "linux", windows))]
+pub(crate) mod window;
 
 #[cfg(unix)]
 mod unix;
@@ -16,6 +20,9 @@ mod windows;
 // Re-Exports
 //--------------------------------------------------------------------------------------------------
 
+pub use external::ExternalCheckpointOptions;
+pub(crate) use external::ExternalSingleFileIndex;
+pub use owned::{OwnedDirectoryCheckpoint, OwnedDirectoryPayload, OwnedDirectorySnapshot};
 #[cfg(unix)]
 pub use unix::*;
 #[cfg(windows)]

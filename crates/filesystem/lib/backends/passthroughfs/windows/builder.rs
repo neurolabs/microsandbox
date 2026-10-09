@@ -32,6 +32,9 @@ pub enum HostPermissions {
 /// Configuration for the Windows passthrough filesystem backend.
 #[derive(Debug, Clone)]
 pub struct PassthroughConfig {
+    /// Maximum serialized filesystem state per device, in bytes.
+    pub max_state_bytes: usize,
+
     /// Path to the root directory on the host.
     pub root_dir: PathBuf,
 
@@ -95,6 +98,12 @@ pub struct PassthroughConfig {
     ///
     /// Empty means no paths are denied.
     pub deny: Vec<String>,
+
+    /// Explicit external-mount checkpoint policy and destination diagnostic report.
+    pub external_checkpoint: Option<super::super::ExternalCheckpointOptions>,
+
+    /// Sandbox-owned directory capture and private restore context.
+    pub owned_checkpoint: Option<super::super::OwnedDirectoryCheckpoint>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -132,6 +141,9 @@ impl PassthroughFs {
         cfg: PassthroughConfig,
         probe_name: Option<&CStr>,
     ) -> io::Result<Self> {
+        if cfg.owned_checkpoint.is_some() && cfg.external_checkpoint.is_some() {
+            return Err(linux_error(LINUX_EINVAL));
+        }
         // Reject contradictory metadata policy before resolving or probing the
         // host root. Direct backend callers must receive the same guarantee as
         // the SDK and runtime boundaries.
@@ -166,7 +178,7 @@ impl PassthroughFs {
 
         let init_file = if cfg.inject_init {
             let mut file = tempfile::tempfile().map_err(host_error)?;
-            file.write_all(AGENTD_BYTES).map_err(host_error)?;
+            file.write_all(agentd_bytes()).map_err(host_error)?;
             file.sync_data().map_err(host_error)?;
             Some(Mutex::new(file))
         } else {
@@ -194,6 +206,9 @@ impl PassthroughFs {
             stat_store,
             quota,
             deny,
+            invalid_inodes: RwLock::new(std::collections::BTreeSet::new()),
+            map_windows: Mutex::new(DaxWindows::default()),
+            dax_files: DaxFiles::default(),
         })
     }
 
@@ -246,6 +261,7 @@ impl PassthroughFs {
 impl Default for PassthroughConfig {
     fn default() -> Self {
         Self {
+            max_state_bytes: msb_krun::DEFAULT_MAX_FS_BACKEND_STATE_BYTES,
             root_dir: PathBuf::new(),
             no_symlink_root: false,
             stat_virtualization: StatVirtualization::Strict,
@@ -258,6 +274,8 @@ impl Default for PassthroughConfig {
             quota_root: None,
             default_owner: None,
             deny: Vec::new(),
+            external_checkpoint: None,
+            owned_checkpoint: None,
         }
     }
 }

@@ -1,4 +1,13 @@
-import { withMappedErrors } from "./internal/error-mapping.js";
+import { Job, JobListBuilder, jobCall, jobPageFromJson, type JobPage } from "./jobs.js";
+import { remapKeysToCamel } from "./internal/config.js";
+import { mapNapiError, withMappedErrors } from "./internal/error-mapping.js";
+import { validateStopTimeout } from "./internal/stop.js";
+import { forkMountBuilders, type ForkVolumes } from "./internal/fork-volumes.js";
+import {
+  compactionResultFromJson,
+  type DiskCompactionOptions,
+  type DiskCompactionResult,
+} from "./compact.js";
 import {
   modificationPlanFromJson,
   modifyOptionsToNapi,
@@ -14,9 +23,11 @@ import {
   type NapiPullProgressStream,
   type NapiSandbox,
   type NapiSandboxBuilderSetters,
+  type NapiRestoreBuilderSetters,
   type NapiSandboxConfig,
   type NapiSandboxListOptions,
   type NapiSandboxPage,
+  type NapiSnapshotSeed,
 } from "./internal/napi.js";
 import { ExecHandle, ExecOutput } from "./exec.js";
 import { SandboxFsOps } from "./fs.js";
@@ -73,6 +84,14 @@ export interface SandboxBuilder extends NapiSandboxBuilderSetters {
    */
   connectOrCreate(): Promise<Sandbox>;
   createWithPullProgress(): Promise<PullProgressCreate>;
+  /** Image preparation, snapshot backing and activation progress. Await the result for success. */
+  createWithProgress(): Promise<CreationProgressCreate>;
+}
+
+/** Restore a snapshot or archive as a detached sandbox with explicit host bindings. */
+export interface RestoreBuilder extends NapiRestoreBuilderSetters {
+  restore(): Promise<Sandbox>;
+  restoreWithProgress(): Promise<CreationProgressCreate>;
 }
 
 export interface SandboxPingResult {
@@ -83,6 +102,33 @@ export interface SandboxPingResult {
 export interface SandboxTouchResult {
   readonly name: string;
   readonly activitySeq: number;
+}
+
+/** Options for forking a running sandbox. */
+export interface ForkOptions {
+  recordIntegrity?: boolean;
+  guestFlush?: import("./snapshot.js").GuestFlush;
+  /**
+   * Rebind a captured disk at its guest path to a host image holding the captured
+   * state; a fork cannot add a new block device. Each child attaches the image
+   * directly, without a private copy, so batch forks should not share a writable image.
+   */
+  volumes?: ForkVolumes;
+}
+
+/** One named child or startup error from a capture-once batch, in input order. */
+export type ForkOutcome =
+  | { name: string; sandbox: Sandbox; error?: never }
+  | { name: string; sandbox?: never; error: Error };
+
+/** @deprecated Use ForkOutcome instead. */
+export type BranchOutcome = ForkOutcome;
+
+/** An unmapped external filesystem or a mismatch accepted during relaxed restore. */
+export interface ExternalMountWarning {
+  readonly guestPath: string;
+  readonly reason: string;
+  readonly staleInodes: readonly bigint[];
 }
 
 /** One page returned by `Sandbox.list()` or `Sandbox.listWith()`. */
@@ -135,18 +181,17 @@ function sandboxPageFromNapi(page: NapiSandboxPage): SandboxPage {
  * final `Sandbox`.
  */
 export class PullProgressCreate {
+  /** Cancel creation; awaitSandbox() rejects when cancellation is observed. */
+  cancel(): void { this.inner.cancel(); }
+
   /** @internal */
   private readonly inner: NapiPullProgressCreate;
   /** @internal */
   private readonly name: string;
   /** @internal */
-  private readonly attached: boolean;
-
-  /** @internal */
-  constructor(inner: NapiPullProgressCreate, name: string, attached: boolean) {
+  constructor(inner: NapiPullProgressCreate, name: string) {
     this.inner = inner;
     this.name = name;
-    this.attached = attached;
   }
 
   /**
@@ -168,11 +213,66 @@ export class PullProgressCreate {
   /** Await the sandbox. Resolves once pull + boot finishes. */
   async awaitSandbox(): Promise<Sandbox> {
     const inner = await withMappedErrors(() => this.inner.awaitSandbox());
-    return new Sandbox(inner, this.name, this.attached);
+    // Full restores can auto-detach even without an explicit detached builder option.
+    // Only the completed native handle knows whether disposal owns this lifecycle.
+    return new Sandbox(inner, this.name);
   }
 }
 
+/** Creation-wide progress; ignoring events does not cancel or delay creation. */
+export class CreationProgressCreate {
+  private readonly creation: PullProgressCreate;
+  /** @internal */
+  constructor(inner: NapiPullProgressCreate, name: string) {
+    this.creation = new PullProgressCreate(inner, name);
+  }
+  get progress(): import("./creation-progress.js").CreationProgressStream {
+    return this.creation.progress as unknown as import("./creation-progress.js").CreationProgressStream;
+  }
+  [Symbol.asyncIterator](): AsyncIterator<import("./creation-progress.js").CreationProgress> {
+    return this.progress[Symbol.asyncIterator]();
+  }
+  cancel(): void { this.creation.cancel(); }
+  awaitSandbox(): Promise<Sandbox> { return this.creation.awaitSandbox(); }
+}
+
 export class Sandbox implements AsyncDisposable {
+  async getJob(id: string): Promise<Job> { return new Job(await jobCall(() => this.inner.getJob(id))); }
+  async listJobs(): Promise<JobPage> { return this.listJobsWith(b => b); }
+  async listJobsWith(configure: (b: JobListBuilder) => JobListBuilder): Promise<JobPage> {
+    const b = configure(new JobListBuilder());
+    return jobPageFromJson(await jobCall(() => this.inner.listJobs(b.includeAll, b.pageSize, b.after)));
+  }
+
+  async execDetached(cmd: string, args: Iterable<string> = []): Promise<Job> {
+    return new Job(await jobCall(() => this.inner.execDetached(cmd, Array.from(args))));
+  }
+  async execDetachedWith(cmd: string, configure: (b: NapiExecOptionsBuilder) => NapiExecOptionsBuilder): Promise<Job> {
+    const builder = configure(new napi.ExecOptionsBuilder().stdinPipe());
+    return new Job(await jobCall(() => this.inner.execDetachedWithBuilder(cmd, builder)));
+  }
+
+  /** Prepare restoration; no VM starts until the builder's restore terminal. */
+  static restore(snapshot: NapiSnapshotSeed): RestoreBuilder {
+    const builder = typeof snapshot === "string"
+      ? new napi.RestoreBuilder(snapshot)
+      : new napi.RestoreBuilder(snapshot.reference, snapshot.referenceKind);
+    const restore = builder.restore.bind(builder);
+    const progress = builder.restoreWithProgress.bind(builder);
+    let name = "";
+    const setName = builder.name.bind(builder);
+    builder.name = (value: string) => {
+      setName(value);
+      name = value;
+      return builder;
+    };
+    (builder as unknown as RestoreBuilder).restore = async () =>
+      new Sandbox(await withMappedErrors(restore), name);
+    (builder as unknown as RestoreBuilder).restoreWithProgress = async () =>
+      new CreationProgressCreate(await withMappedErrors(progress), name);
+    return builder as unknown as RestoreBuilder;
+  }
+
   /** @internal */
   readonly inner: NapiSandbox;
   /** Sandbox name. Names are limited to 128 UTF-8 bytes. */
@@ -201,23 +301,14 @@ export class Sandbox implements AsyncDisposable {
   /** Begin building a new sandbox. Names are limited to 128 UTF-8 bytes. */
   static builder(name: string): SandboxBuilder {
     const nb = new napi.SandboxBuilder(name);
-    let detached = false;
-    const origDetached = nb.detached.bind(nb);
     const origCreate = nb.create.bind(nb);
     const origConnectOrCreate = nb.connectOrCreate.bind(nb);
     const origCreateWithPP = nb.createWithPullProgress.bind(nb);
-    const wrapped = nb as unknown as {
-      detached: (enabled: boolean) => SandboxBuilder;
-    };
-    wrapped.detached = (enabled: boolean) => {
-      detached = enabled;
-      origDetached(enabled);
-      return nb as unknown as SandboxBuilder;
-    };
+    const origCreateWithProgress = nb.createWithProgress?.bind(nb);
     // Override the terminals so they return a TS Sandbox.
     (nb as unknown as { create: () => Promise<Sandbox> }).create = async () => {
       const inner = await withMappedErrors(() => origCreate());
-      return new Sandbox(inner, name, /*ownsLifecycle*/ !detached);
+      return new Sandbox(inner, name);
     };
     (
       nb as unknown as { connectOrCreate: () => Promise<Sandbox> }
@@ -233,7 +324,12 @@ export class Sandbox implements AsyncDisposable {
       }
     ).createWithPullProgress = async () => {
       const raw = await withMappedErrors(() => origCreateWithPP());
-      return new PullProgressCreate(raw, name, /*attached*/ !detached);
+      return new PullProgressCreate(raw, name);
+    };
+    (nb as unknown as { createWithProgress: () => Promise<CreationProgressCreate> }).createWithProgress = async () => {
+      if (!origCreateWithProgress) throw new Error("Installed native SDK does not support creation progress");
+      const raw = await withMappedErrors(() => origCreateWithProgress());
+      return new CreationProgressCreate(raw, name);
     };
     return nb as unknown as SandboxBuilder;
   }
@@ -492,6 +588,14 @@ export class Sandbox implements AsyncDisposable {
     return modificationPlanFromJson(raw);
   }
 
+  /** Compact sealed root and owned-data disk layers without rewriting existing snapshots. */
+  async compact(opts?: DiskCompactionOptions): Promise<DiskCompactionResult> {
+    const raw = await withMappedErrors(() =>
+      this.inner.compact(opts?.layers, opts?.dryRun, opts?.disk, opts?.rootDiskOnly),
+    );
+    return compactionResultFromJson(raw);
+  }
+
   /** Stream metrics snapshots at the given interval (in milliseconds). */
   async metricsStream(intervalMs: number): Promise<MetricsStream> {
     const raw = await withMappedErrors(() =>
@@ -502,15 +606,63 @@ export class Sandbox implements AsyncDisposable {
 
   // -- lifecycle ----------------------------------------------------------
 
+  /** Read warnings for unmapped external filesystems and accepted restore mismatches. */
+  async restoreWarnings(): Promise<ExternalMountWarning[]> {
+    return withMappedErrors(() => this.inner.restoreWarnings());
+  }
+
+  /** Wait indefinitely for graceful completion and runtime ownership release; never implicitly kills. */
   async stop(): Promise<void> {
     await withMappedErrors(() => this.inner.stop());
+  }
+
+  /** @deprecated Use fork() for live execution duplication. */
+  async branch(name: string, options: ForkOptions = {}): Promise<Sandbox> {
+    return this.fork(name, options);
+  }
+
+  /** @deprecated Use forkMany() for capture-once live duplication. */
+  async branchMany(names: string[], options: ForkOptions = {}): Promise<ForkOutcome[]> {
+    return this.forkMany(names, options);
+  }
+
+  /** Create an independent local CoW child without a durable full snapshot. */
+  async fork(name: string, options: ForkOptions = {}): Promise<Sandbox> {
+    const volumes = forkMountBuilders(options.volumes);
+    const child = await withMappedErrors(() => this.inner.fork(
+      name, options.recordIntegrity, options.guestFlush, volumes.length > 0 ? volumes : undefined,
+    ));
+    return new Sandbox(child, name, false);
+  }
+
+  /** Capture once; return each named child's startup outcome in input order. */
+  async forkMany(names: string[], options: ForkOptions = {}): Promise<ForkOutcome[]> {
+    const volumes = forkMountBuilders(options.volumes);
+    const outcomes = await withMappedErrors(() => this.inner.forkMany(
+      names, options.recordIntegrity, options.guestFlush, volumes.length > 0 ? volumes : undefined,
+    ));
+    return outcomes.map(o => o.sandbox
+      ? { name: o.name, sandbox: new Sandbox(o.sandbox, o.name, false) }
+      : { name: o.name, error: mapNapiError(new Error(o.error ?? "Child startup failed")) as Error });
+  }
+
+  /** Suspend this resident VM without creating a snapshot. */
+  async pause(options: { guestFlush?: import("./snapshot.js").GuestFlush } = {}): Promise<void> {
+    await withMappedErrors(() => this.inner.pause(options.guestFlush));
+  }
+
+  /** Explicit resident resume; no snapshot is created. */
+  async resume(): Promise<void> {
+    await withMappedErrors(() => this.inner.resume());
   }
 
   async requestStop(): Promise<void> {
     await withMappedErrors(() => this.inner.requestStop());
   }
 
+  /** One total budget; StopTimeoutError on expiry without killing. Zero never dispatches shutdown. */
   async stopWithTimeout(timeoutMs: number): Promise<void> {
+    validateStopTimeout(timeoutMs);
     await withMappedErrors(() => this.inner.stopWithTimeout(timeoutMs));
   }
 
@@ -568,6 +720,11 @@ export class Sandbox implements AsyncDisposable {
     );
   }
 
+  /**
+   * Consume this handle without stopping the sandbox. New guest and filesystem
+   * operations on this handle are rejected; already admitted operations retain
+   * their connection. Await operations first when their completion matters.
+   */
   async detach(): Promise<void> {
     await withMappedErrors(() => this.inner.detach());
   }
@@ -598,18 +755,4 @@ function sandboxStopResultFromNapi(result: {
     observedAt: new Date(result.observedAt),
     source: result.source ?? null,
   };
-}
-
-const snakeToCamel = (k: string): string =>
-  k.replace(/_([a-z0-9])/g, (_m, c: string) => c.toUpperCase());
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function remapKeysToCamel(v: any): any {
-  if (Array.isArray(v)) return v.map(remapKeysToCamel);
-  if (v && typeof v === "object") {
-    const out: Record<string, unknown> = {};
-    for (const [k, val] of Object.entries(v)) out[snakeToCamel(k)] = remapKeysToCamel(val);
-    return out;
-  }
-  return v;
 }

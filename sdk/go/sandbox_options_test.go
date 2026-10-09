@@ -58,6 +58,45 @@ func mustField(t *testing.T, m map[string]any, key string) any {
 	return v
 }
 
+func marshalRestoreOptions[T SnapshotSeed](t *testing.T, snapshot T) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(buildFFIRestoreOptions(snapshot, RestoreConfig{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}
+
+func TestRestorePreservesTypedReference(t *testing.T) {
+	snapshot := &SnapshotArtifact{
+		reference:     "baseline",
+		referenceKind: "path",
+	}
+	payload := marshalRestoreOptions(t, snapshot)
+
+	if got := mustField(t, payload, "snapshot"); got != "baseline" {
+		t.Fatalf("snapshot = %v, want baseline", got)
+	}
+	if got := mustField(t, payload, "snapshot_reference_kind"); got != "path" {
+		t.Fatalf("snapshot_reference_kind = %v, want path", got)
+	}
+}
+
+func TestRestoreStringRemainsUnresolved(t *testing.T) {
+	payload := marshalRestoreOptions(t, "baseline")
+
+	if got := mustField(t, payload, "snapshot"); got != "baseline" {
+		t.Fatalf("snapshot = %v, want baseline", got)
+	}
+	if _, ok := payload["snapshot_reference_kind"]; ok {
+		t.Fatalf("snapshot_reference_kind should be omitted for string references: %v", payload)
+	}
+}
+
 func TestSandboxConfigUnmarshalPersistedRootfsSource(t *testing.T) {
 	raw := []byte(`{
 		"name": "go-sdk-example-main",
@@ -333,13 +372,25 @@ func TestFFIWireShape_LegacyConfigFieldMapsToRootDisk(t *testing.T) {
 	}
 }
 
-func TestFFIWireShape_WithFromSnapshot(t *testing.T) {
-	got := marshalCreateOptions(t, WithFromSnapshot("after-pip-install"))
+func TestFFIWireShape_Restore(t *testing.T) {
+	config := RestoreConfig{}
+	WithSnapshotDiskOnly()(&config)
+	raw, err := json.Marshal(buildFFIRestoreOptions("after-pip-install", config))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
 	if v := mustField(t, got, "snapshot"); v != "after-pip-install" {
 		t.Fatalf("snapshot = %v, want %q", v, "after-pip-install")
 	}
 	if _, present := got["image"]; present {
 		t.Fatal("image must not appear in payload when only snapshot is set")
+	}
+	if v := mustField(t, got, "disk_only"); v != true {
+		t.Fatalf("snapshot_disk_only = %v, want true", v)
 	}
 }
 
@@ -697,28 +748,52 @@ func TestFFIWireShape_DeploymentProfile(t *testing.T) {
 }
 
 func TestFFIWireShape_Secrets(t *testing.T) {
-	got := marshalCreateOptions(t,
-		WithImage("alpine"),
-		WithSecrets(Secret.Env("OPENAI_API_KEY", "sk-xxx", SecretEnvOptions{
-			AllowHosts:        []string{"api.openai.com"},
-			AllowHostPatterns: []string{"*.openai.com"},
-			OnViolation:       ViolationActionBlockAndTerminate,
-		})),
-	)
-	secs := mustField(t, got, "secrets").([]any)
-	if len(secs) != 1 {
-		t.Fatalf("secrets length = %d", len(secs))
-	}
-	s := secs[0].(map[string]any)
-	if s["env_var"] != "OPENAI_API_KEY" || s["value"] != "sk-xxx" {
-		t.Fatalf("secret = %v", s)
-	}
-	if s["on_violation"] != "block-and-terminate" {
-		t.Fatalf("on_violation = %v", s["on_violation"])
-	}
-	hosts := s["allow_hosts"].([]any)
-	if len(hosts) != 1 || hosts[0] != "api.openai.com" {
-		t.Fatalf("allow_hosts = %v", hosts)
+	for _, test := range []struct {
+		name                    string
+		preferred, legacy, want []string
+	}{
+		{"preferred", []string{"api.anthropic.com"}, nil, []string{"api.anthropic.com"}},
+		{"legacy", nil, []string{"api.anthropic.com"}, []string{"api.anthropic.com"}},
+		{"combined", []string{"api.anthropic.com"}, []string{"*.anthropic.com"}, []string{"api.anthropic.com", "*.anthropic.com"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := marshalCreateOptions(t,
+				WithImage("alpine"),
+				WithSecrets(Secret.Env("OPENAI_API_KEY", "sk-xxx", SecretEnvOptions{
+					Allow:               []string{"api.openai.com", "*.openai.com"},
+					AllowPlaceholderFor: test.preferred,
+					Passthrough:         test.legacy,
+					ViolationAction:     ViolationActionBlockAndTerminate,
+				})),
+			)
+			secs := mustField(t, got, "secrets").([]any)
+			if len(secs) != 1 {
+				t.Fatalf("secrets length = %d", len(secs))
+			}
+			s := secs[0].(map[string]any)
+			if s["env_var"] != "OPENAI_API_KEY" || s["value"] != "sk-xxx" {
+				t.Fatalf("secret = %v", s)
+			}
+			if s["violation_action"] != "block-and-terminate" {
+				t.Fatalf("violation_action = %v", s["violation_action"])
+			}
+			hosts := s["allow"].([]any)
+			if len(hosts) != 2 || hosts[0] != "api.openai.com" || hosts[1] != "*.openai.com" {
+				t.Fatalf("allow = %v", hosts)
+			}
+			placeholders := s["passthrough"].([]any)
+			if len(placeholders) != len(test.want) {
+				t.Fatalf("passthrough = %v, want %v", placeholders, test.want)
+			}
+			for i, host := range test.want {
+				if placeholders[i] != host {
+					t.Fatalf("passthrough = %v, want %v", placeholders, test.want)
+				}
+			}
+			if _, ok := s["allow_placeholder_for"]; ok {
+				t.Fatal("new API name leaked into wire format")
+			}
+		})
 	}
 }
 
@@ -754,8 +829,9 @@ func TestFFIWireShape_NetworkCustomRules(t *testing.T) {
 			DNS: &DNSConfig{
 				Nameservers: []string{"1.1.1.1:53"},
 			},
-			IPv4Pool: "172.31.240.0/24",
-			IPv6Pool: "fd7a:115c:a1e0:100::/56",
+			IPv4Pool:      "172.31.240.0/24",
+			IPv6Pool:      "fd7a:115c:a1e0:100::/56",
+			NAT64Prefixes: []string{"2001:db8:64::/96"},
 		}),
 		WithProxy(SOCKS5Proxy("127.0.0.1:1080")),
 	)
@@ -779,11 +855,18 @@ func TestFFIWireShape_NetworkCustomRules(t *testing.T) {
 	if len(deny) != 1 || deny[0] != "blocked.example.com" {
 		t.Fatalf("deny_domains = %v", deny)
 	}
+	if net["strict"] != true {
+		t.Fatalf("strict = %v", net["strict"])
+	}
 	if net["ipv4_pool"] != "172.31.240.0/24" {
 		t.Fatalf("ipv4_pool = %v", net["ipv4_pool"])
 	}
 	if net["ipv6_pool"] != "fd7a:115c:a1e0:100::/56" {
 		t.Fatalf("ipv6_pool = %v", net["ipv6_pool"])
+	}
+	nat64 := net["nat64_prefixes"].([]any)
+	if len(nat64) != 1 || nat64[0] != "2001:db8:64::/96" {
+		t.Fatalf("nat64_prefixes = %v", nat64)
 	}
 	dns := net["dns"].(map[string]any)
 	ns := dns["nameservers"].([]any)
@@ -804,6 +887,49 @@ func TestFFIWireShape_SOCKS4Proxy(t *testing.T) {
 	proxy := mustField(t, got, "proxy").(map[string]any)
 	if proxy["protocol"] != "socks4" || proxy["address"] != "127.0.0.1:1080" || proxy["user_id"] != "sandbox" {
 		t.Fatalf("proxy = %#v", proxy)
+	}
+}
+
+func TestFFIWireShape_NetworkConnectionLimits(t *testing.T) {
+	zero, finite := uint(0), uint(7)
+	for _, test := range []struct {
+		name    string
+		network *NetworkConfig
+		want    map[string]any
+	}{
+		{"omitted", &NetworkConfig{}, map[string]any{}},
+		{"canonical", &NetworkConfig{MaxTCPConnections: &zero, MaxUDPConnections: &finite, SecretViolationAction: ViolationActionBlockAndLog}, map[string]any{"max_tcp_connections": float64(0), "max_udp_connections": float64(7)}},
+		{"legacy", &NetworkConfig{MaxConnections: &finite, MaxUDPConnections: &zero}, map[string]any{"max_connections": float64(7), "max_udp_connections": float64(0)}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := marshalCreateOptions(t, WithNetwork(test.network))["network"].(map[string]any)
+			if action := test.network.SecretViolationAction; action != "" && got["secret_violation_action"] != string(action) {
+				t.Fatalf("connection limits discarded the secret violation action: %#v", got)
+			}
+			for _, field := range []string{"max_connections", "max_tcp_connections", "max_udp_connections"} {
+				actual, present := got[field]
+				want, expected := test.want[field]
+				if present != expected || actual != want {
+					t.Errorf("%s = %#v (present %v), want %#v (present %v)", field, actual, present, want, expected)
+				}
+			}
+		})
+	}
+}
+
+func TestFFIWireShape_TCPAcceptQueueSize(t *testing.T) {
+	omitted := marshalCreateOptions(t, WithNetwork(&NetworkConfig{}))["network"].(map[string]any)
+	if value, present := omitted["tcp_accept_queue_size"]; present {
+		t.Fatalf("unset accept queue size reached the wire as %#v", value)
+	}
+
+	size := uint32(4096)
+	got := marshalCreateOptions(t, WithNetwork(&NetworkConfig{
+		Ports:              map[uint16]uint16{8080: 80},
+		TCPAcceptQueueSize: &size,
+	}))["network"].(map[string]any)
+	if got["tcp_accept_queue_size"] != float64(4096) {
+		t.Fatalf("tcp_accept_queue_size = %#v, want 4096", got["tcp_accept_queue_size"])
 	}
 }
 
@@ -979,7 +1105,7 @@ func TestFFIWireShape_KitchenSinkDoesNotPanic(t *testing.T) {
 			TLS: &TLSConfig{Bypass: []string{"*.googleapis.com"}},
 		}),
 		WithSecrets(Secret.Env("K", "v", SecretEnvOptions{
-			AllowHosts: []string{"h"},
+			Allow: []string{"h"},
 		})),
 		WithPatches(Patch.Mkdir("/app", PatchOptions{})),
 		WithPorts(map[uint16]uint16{8080: 80}),
@@ -990,5 +1116,37 @@ func TestFFIWireShape_KitchenSinkDoesNotPanic(t *testing.T) {
 	body, _ := json.Marshal(got)
 	if !strings.Contains(string(body), "python:3.12") {
 		t.Fatalf("kitchen-sink payload missing image: %s", body)
+	}
+}
+
+func TestNetworkStrictDefaultsAndOptOut(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config NetworkConfig
+		want   bool
+	}{
+		{"default", NetworkConfig{}, true},
+		{"explicit default", NetworkConfig{DisableStrict: false}, true},
+		{"opt out", NetworkConfig{DisableStrict: true}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := marshalCreateOptions(t, WithNetwork(&tc.config))
+			network := mustField(t, got, "network").(map[string]any)
+			if network["strict"] != tc.want {
+				t.Fatalf("strict = %v, want %v", network["strict"], tc.want)
+			}
+		})
+	}
+}
+
+func TestHTTPDenyMessageSurvivesFFIConversion(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		config := buildFFINetwork(&NetworkConfig{HTTP: &HTTPConfig{DenyResponse: enabled, DenyMessage: "blocked {host}"}})
+		if config.HTTP.DenyResponse != enabled {
+			t.Fatalf("HTTP denial response flag lost")
+		}
+		if config.HTTP.DenyMessage != "blocked {host}" {
+			t.Fatalf("HTTP denial message lost: %q", config.HTTP.DenyMessage)
+		}
 	}
 }

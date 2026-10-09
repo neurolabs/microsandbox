@@ -6,11 +6,14 @@
 
 pub(crate) mod builder;
 mod create_ops;
+#[cfg(target_os = "linux")]
+mod dax;
 mod dir_ops;
 mod file_ops;
 mod host_mode;
 pub(crate) mod inode;
 mod metadata;
+mod mobility;
 mod remove_ops;
 mod special;
 mod xattr_ops;
@@ -115,6 +118,13 @@ pub enum HostPermissions {
 /// Configuration for the passthrough filesystem backend.
 #[derive(Debug, Clone)]
 pub struct PassthroughConfig {
+    /// Maximum serialized filesystem state per device, in bytes.
+    pub max_state_bytes: usize,
+
+    /// Seal owned namespace/data and reconstruct private linked or detached objects.
+    pub owned_checkpoint: Option<super::OwnedDirectoryCheckpoint>,
+    /// Capture external-object identity and apply explicit destination reconciliation.
+    pub external_checkpoint: Option<super::ExternalCheckpointOptions>,
     /// Path to the root directory on the host.
     pub root_dir: PathBuf,
 
@@ -191,6 +201,8 @@ pub struct PassthroughConfig {
 /// Implements [`DynFileSystem`] by mapping guest filesystem operations to
 /// the host filesystem, with stat virtualization via xattr.
 pub struct PassthroughFs {
+    /// Invalid restored node identities are never reused when a path later reappears.
+    pub(crate) invalid_inodes: RwLock<std::collections::BTreeSet<u64>>,
     /// Configuration.
     pub(crate) cfg: PassthroughConfig,
 
@@ -243,6 +255,12 @@ pub struct PassthroughFs {
 
 /// Open directory handle with a lazy point-in-time snapshot.
 pub(crate) struct PassthroughDirHandle {
+    /// Guest-visible inode that owns this directory handle.
+    pub inode: u64,
+
+    /// Guest open flags used when the handle was admitted.
+    pub flags: u32,
+
     /// Real open fd for directory operations.
     pub file: RwLock<File>,
 
@@ -276,6 +294,32 @@ pub(crate) struct PassthroughDirEntry {
 //--------------------------------------------------------------------------------------------------
 
 impl PassthroughFs {
+    pub(crate) fn max_state_bytes(&self) -> usize {
+        self.cfg.max_state_bytes
+    }
+
+    /// Validate external checkpoint structure without resolving or creating host paths.
+    pub fn validate_external_state_with_limit(bytes: &[u8], limit: usize) -> io::Result<()> {
+        mobility::validate_unavailable(bytes, limit)
+    }
+
+    /// Validate external state with the default filesystem budget.
+    pub fn validate_external_state(bytes: &[u8]) -> io::Result<()> {
+        Self::validate_external_state_with_limit(
+            bytes,
+            msb_krun::DEFAULT_MAX_FS_BACKEND_STATE_BYTES,
+        )
+    }
+
+    /// Validate the single-file facade's inner namespace before translating its selected name.
+    pub(crate) fn prepare_single_file_state(
+        bytes: &[u8],
+        source: &CStr,
+        destination: &CStr,
+        limit: usize,
+    ) -> io::Result<(Vec<u8>, super::ExternalSingleFileIndex)> {
+        mobility::prepare_single_file_state(bytes, source, destination, limit)
+    }
     /// Create a builder for constructing a `PassthroughFs` instance.
     pub fn builder() -> builder::PassthroughFsBuilder {
         builder::PassthroughFsBuilder::new()
@@ -297,6 +341,13 @@ impl PassthroughFs {
         cfg: PassthroughConfig,
         probe_name: Option<&CStr>,
     ) -> io::Result<Self> {
+        if cfg.owned_checkpoint.is_some() && (cfg.external_checkpoint.is_some() || cfg.inject_init)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "owned directory checkpoints require an ordinary, non-external directory backend",
+            ));
+        }
         // Open the root directory, contained beneath the anchor when one is set.
         let root_fd = open_root(&cfg)?;
 
@@ -326,8 +377,13 @@ impl PassthroughFs {
             .map_or_else(|| root_fd.as_raw_fd(), AsRawFd::as_raw_fd);
         probe_strict_xattr_support(&cfg, probe_fd)?;
 
-        // Create the init binary file.
-        let init_file = init_binary::create_init_file()?;
+        // Create the init binary file. Mounts that do not inject the virtual
+        // init binary use an empty file and never touch the Agentd payload.
+        let init_file = if cfg.inject_init {
+            init_binary::create_init_file()?
+        } else {
+            init_binary::create_empty_init_file()?
+        };
 
         // Probe openat2 / RESOLVE_BENEATH availability (Linux 5.6+).
         #[cfg(target_os = "linux")]
@@ -363,6 +419,7 @@ impl PassthroughFs {
             platform::path_from_fd(root_fd.as_raw_fd()).unwrap_or_else(|_| cfg.root_dir.clone());
 
         Ok(Self {
+            invalid_inodes: RwLock::new(std::collections::BTreeSet::new()),
             cfg,
             root_fd,
             #[cfg(target_os = "macos")]
@@ -608,6 +665,9 @@ impl PassthroughConfig {
 impl Default for PassthroughConfig {
     fn default() -> Self {
         Self {
+            max_state_bytes: msb_krun::DEFAULT_MAX_FS_BACKEND_STATE_BYTES,
+            owned_checkpoint: None,
+            external_checkpoint: None,
             root_dir: PathBuf::new(),
             no_symlink_root: false,
             stat_virtualization: StatVirtualization::Strict,
@@ -637,6 +697,25 @@ pub use stat_override::{BindIdentityMap, BindIdentityMapHandle};
 //--------------------------------------------------------------------------------------------------
 
 impl DynFileSystem for PassthroughFs {
+    fn request_error(&self, inode: u64) -> Option<i32> {
+        self.invalid_inodes
+            .read()
+            .unwrap()
+            .contains(&inode)
+            .then_some(116)
+    }
+    fn capture_state(&self) -> io::Result<Vec<u8>> {
+        mobility::capture(self)
+    }
+
+    fn validate_state(&self, state: &[u8]) -> io::Result<()> {
+        mobility::prepare(self, state).map(drop)
+    }
+
+    fn restore_state(&self, state: &[u8]) -> io::Result<()> {
+        mobility::restore(self, state)
+    }
+
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
         // Register root inode (inode 1) in the inode table.
         // The guest kernel issues GETATTR on the root inode immediately after FUSE_INIT.
@@ -1022,6 +1101,43 @@ impl DynFileSystem for PassthroughFs {
             self, ctx, inode_in, handle_in, offset_in, inode_out, handle_out, offset_out, len,
             flags,
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    fn setupmapping(
+        &self,
+        _ctx: Context,
+        inode: u64,
+        _handle: u64,
+        foffset: u64,
+        len: u64,
+        flags: u64,
+        moffset: u64,
+        host_shm_base: u64,
+        shm_size: u64,
+    ) -> io::Result<()> {
+        dax::do_setupmapping(
+            self,
+            inode,
+            foffset,
+            len,
+            flags,
+            moffset,
+            host_shm_base,
+            shm_size,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn removemapping(
+        &self,
+        _ctx: Context,
+        requests: Vec<crate::RemovemappingOne>,
+        host_shm_base: u64,
+        shm_size: u64,
+    ) -> io::Result<()> {
+        dax::do_removemapping(&requests, host_shm_base, shm_size)
     }
 }
 

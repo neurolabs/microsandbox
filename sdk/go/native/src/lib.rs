@@ -35,9 +35,18 @@
 // be repetitive without adding signal.
 #![allow(clippy::missing_safety_doc)]
 
+mod creation_progress;
+mod exec_adapter;
+mod jobs;
+mod restore;
+mod setup;
+mod storage;
+mod volume_fs;
+
 use std::{
     collections::HashMap,
     ffi::{CStr, CString},
+    future::Future,
     net::IpAddr,
     os::raw::{c_char, c_uchar},
     path::PathBuf,
@@ -50,8 +59,8 @@ use std::{
 
 use base64::Engine;
 use microsandbox::{
-    AgentBridge, LogLevel, MicrosandboxError, RegistryAuth, Sandbox, Snapshot, UpperVerifyStatus,
-    default_backend,
+    AgentBridge, LogLevel, MicrosandboxError, RegistryAuth, Sandbox, Snapshot, SnapshotReference,
+    UpperVerifyStatus, default_backend,
     logs::{LogOptions, LogSource},
     sandbox::{
         DeploymentProfile, FsEntryKind, PullPolicy, SecurityProfile, all_sandbox_metrics_local,
@@ -60,9 +69,9 @@ use microsandbox::{
         ssh::{SftpClient, SshClient, SshServer, SshStdioStream},
     },
     snapshot::{SaveOpts, SnapshotFormat, SnapshotScope},
-    volume::{Volume, VolumeBuilder, VolumeFs, VolumeHandle, VolumeKind},
+    volume::{Volume, VolumeBuilder, VolumeHandle, VolumeKind},
 };
-use microsandbox_network::{builder::ViolationActionBuilder, secrets::config::ViolationAction};
+use microsandbox_network::secrets::config::SecretViolationAction;
 use tokio::io::AsyncWriteExt;
 use tokio::runtime::Runtime;
 use tokio_stream::StreamExt as _;
@@ -450,9 +459,11 @@ mod error_kind {
     pub const SANDBOX_NOT_RUNNING: &str = "sandbox_not_running";
     pub const SANDBOX_ALREADY_EXISTS: &str = "sandbox_already_exists";
     pub const SANDBOX_REPLACED: &str = "sandbox_replaced";
+    pub const SANDBOX_STOP_TIMED_OUT: &str = "sandbox_stop_timed_out";
     pub const VOLUME_NOT_FOUND: &str = "volume_not_found";
     pub const VOLUME_ALREADY_EXISTS: &str = "volume_already_exists";
     pub const EXEC_TIMEOUT: &str = "exec_timeout";
+    pub const STOP_TIMEOUT: &str = "stop_timeout";
     pub const NO_DEFAULT_COMMAND: &str = "no_default_command";
     pub const INVALID_CONFIG: &str = "invalid_config";
     pub const INVALID_ARGUMENT: &str = "invalid_argument";
@@ -469,6 +480,7 @@ mod error_kind {
     pub const SNAPSHOT_IMAGE_MISSING: &str = "snapshot_image_missing";
     pub const SNAPSHOT_INTEGRITY: &str = "snapshot_integrity";
     pub const SNAPSHOT_MIGRATION: &str = "snapshot_migration";
+    pub const SNAPSHOT_SOURCE_RECOVERY: &str = "snapshot_source_recovery";
     pub const PATCH_FAILED: &str = "patch_failed";
     pub const METRICS_DISABLED: &str = "metrics_disabled";
     pub const METRICS_UNAVAILABLE: &str = "metrics_unavailable";
@@ -479,6 +491,18 @@ mod error_kind {
 struct FfiError {
     kind: &'static str,
     message: String,
+    recovery: Option<Box<microsandbox::SnapshotSourceRecoveryError>>,
+    os_error: Option<i32>,
+}
+
+#[derive(serde::Deserialize)]
+struct BranchManyRequest {
+    names: Vec<String>,
+    source_identity: Option<String>,
+    #[serde(default)]
+    guest_flush: microsandbox::snapshot::GuestFlush,
+    #[serde(default)]
+    volumes: HashMap<String, MountSpec>,
 }
 
 impl FfiError {
@@ -486,6 +510,8 @@ impl FfiError {
         Self {
             kind,
             message: message.into(),
+            recovery: None,
+            os_error: None,
         }
     }
 
@@ -508,6 +534,20 @@ impl FfiError {
     fn to_json(&self) -> String {
         // Message is escaped via serde_json so it's safe to embed arbitrary text.
         let msg = serde_json::to_string(&self.message).unwrap_or_else(|_| "\"\"".into());
+        if let Some(os_error) = self.os_error {
+            return format!(
+                r#"{{"kind":"{}","message":{},"os_error":{}}}"#,
+                self.kind, msg, os_error
+            );
+        }
+        if let Some(recovery) = &self.recovery
+            && let Ok(recovery) = serde_json::to_string(recovery)
+        {
+            return format!(
+                r#"{{"kind":"{}","message":{},"recovery":{}}}"#,
+                self.kind, msg, recovery
+            );
+        }
         format!(r#"{{"kind":"{}","message":{}}}"#, self.kind, msg)
     }
 }
@@ -520,11 +560,14 @@ impl From<MicrosandboxError> for FfiError {
             MicrosandboxError::SandboxNotRunning(_) => error_kind::SANDBOX_NOT_RUNNING,
             MicrosandboxError::SandboxAlreadyExists(_) => error_kind::SANDBOX_ALREADY_EXISTS,
             MicrosandboxError::SandboxReplaced { .. } => error_kind::SANDBOX_REPLACED,
+            MicrosandboxError::SandboxStopTimedOut { .. } => error_kind::SANDBOX_STOP_TIMED_OUT,
             MicrosandboxError::VolumeNotFound(_) => error_kind::VOLUME_NOT_FOUND,
             MicrosandboxError::VolumeAlreadyExists(_) => error_kind::VOLUME_ALREADY_EXISTS,
             MicrosandboxError::ExecTimeout(_) => error_kind::EXEC_TIMEOUT,
+            MicrosandboxError::StopTimeout { .. } => error_kind::STOP_TIMEOUT,
             MicrosandboxError::NoDefaultCommand => error_kind::NO_DEFAULT_COMMAND,
-            MicrosandboxError::InvalidConfig(_) => error_kind::INVALID_CONFIG,
+            MicrosandboxError::InvalidConfig(_)
+            | MicrosandboxError::MissingRestoreBindings { .. } => error_kind::INVALID_CONFIG,
             MicrosandboxError::SandboxFsOps(_) => error_kind::FILESYSTEM,
             MicrosandboxError::ImageNotFound(_) => error_kind::IMAGE_NOT_FOUND,
             MicrosandboxError::ImageInUse(_) => error_kind::IMAGE_IN_USE,
@@ -534,16 +577,24 @@ impl From<MicrosandboxError> for FfiError {
             MicrosandboxError::SnapshotImageMissing(_) => error_kind::SNAPSHOT_IMAGE_MISSING,
             MicrosandboxError::SnapshotIntegrity(_) => error_kind::SNAPSHOT_INTEGRITY,
             MicrosandboxError::SnapshotMigration { .. } => error_kind::SNAPSHOT_MIGRATION,
+            MicrosandboxError::SnapshotSourceRecovery(_) => error_kind::SNAPSHOT_SOURCE_RECOVERY,
             MicrosandboxError::PatchFailed(_) => error_kind::PATCH_FAILED,
             MicrosandboxError::MetricsDisabled(_) => error_kind::METRICS_DISABLED,
             MicrosandboxError::MetricsUnavailable(_) => error_kind::METRICS_UNAVAILABLE,
             MicrosandboxError::Unsupported { .. } => error_kind::UNSUPPORTED_OPERATION,
+            MicrosandboxError::RuntimeNotInstalled(_) => "runtime_not_installed",
+            MicrosandboxError::RuntimeIncomplete(_) => "runtime_incomplete",
             MicrosandboxError::Io(_) => error_kind::IO,
             _ => error_kind::INTERNAL,
         };
         Self {
             kind,
             message: e.to_string(),
+            os_error: None,
+            recovery: match e {
+                MicrosandboxError::SnapshotSourceRecovery(recovery) => Some(recovery),
+                _ => None,
+            },
         }
     }
 }
@@ -711,7 +762,7 @@ pub unsafe extern "C" fn msb_free_string(ptr: *mut c_char) {
 // ---------------------------------------------------------------------------
 
 /// Push the SDK-resolved msb binary path into the Rust resolver's tier 2.
-/// Called once from setup.EnsureInstalled after the install dir is known.
+/// An explicit process-level override; automatic home discovery does not set it.
 /// Set-once: subsequent calls are ignored (matches the OnceLock in
 /// microsandbox::config). Null or invalid-UTF-8 paths are silently ignored
 /// since the resolver's lower tiers (~/.microsandbox/bin/msb, PATH) still
@@ -912,24 +963,34 @@ struct NetworkOpts {
     #[serde(default)]
     deny_domain_suffixes: Vec<String>,
     tls: Option<TlsOpts>,
+    strict: Option<bool>,
     /// Ports nested inside network: {host_port: guest_port}.
     #[serde(default)]
     ports: HashMap<u16, u16>,
     /// Ports nested inside network with explicit bind addresses.
     #[serde(default)]
     port_bindings: Vec<PortBindingOpts>,
+    /// Accept-queue depth for published TCP port listeners.
+    tcp_accept_queue_size: Option<u32>,
     /// IPv4 pool used to derive per-sandbox /30 guest subnets.
     ipv4_pool: Option<String>,
     /// IPv6 pool used to derive per-sandbox /64 guest prefixes.
     ipv6_pool: Option<String>,
-    max_connections: Option<usize>,
+    /// NAT64 /96 prefixes for policy classification.
+    #[serde(default)]
+    nat64_prefixes: Vec<String>,
+    #[serde(alias = "max_connections")]
+    max_tcp_connections: Option<usize>,
+    max_udp_connections: Option<usize>,
     /// Local egress and ingress rate limiters.
     rate_limiter: Option<NetworkRateLimiterOpts>,
     /// Sandbox-wide secret violation action: "block", "block-and-log",
     /// "block-and-terminate".
-    on_secret_violation: Option<String>,
+    secret_violation_action: Option<String>,
     /// Trust the host's extra CA certificates inside the guest.
     trust_host_cas: Option<bool>,
+    /// Body returned to HTTP/HTTPS clients when egress is denied.
+    http: Option<microsandbox_network::config::HttpConfig>,
 }
 
 #[derive(serde::Deserialize)]
@@ -956,16 +1017,25 @@ struct SecretOpts {
     env_var: String,
     value: String,
     #[serde(default)]
-    allow_hosts: Vec<String>,
+    allow: Vec<String>,
     #[serde(default)]
-    allow_host_patterns: Vec<String>,
+    passthrough: Vec<String>,
     placeholder: Option<String>,
-    require_tls: Option<bool>,
-    /// Per-network (sandbox-wide) violation action override. The Node/Python
-    /// SDKs accept this as a per-secret field on `SecretEntry`; it ends up
-    /// applied at the network builder level. We honour it the same way:
-    /// the last seen non-null value wins.
-    on_violation: Option<String>,
+    require_tls_identity: Option<bool>,
+    #[serde(default)]
+    substitution: SecretSubstitutionOpts,
+    violation_action: Option<String>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct SecretSubstitutionOpts {
+    headers: Option<bool>,
+    #[serde(default)]
+    header_fields: Vec<String>,
+    #[serde(default)]
+    query: bool,
+    #[serde(default)]
+    body: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -1016,7 +1086,9 @@ struct RootDiskOpts {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SandboxCreateOpts {
+    creation_progress: Option<u64>,
     image: Option<String>,
     image_fstype: Option<String>,
     /// Host directory used directly as the root filesystem (bind rootfs).
@@ -1027,7 +1099,6 @@ struct SandboxCreateOpts {
     /// Deprecated flat spelling of a managed root disk size. Still
     /// accepted so older Go SDK versions keep working against this dylib.
     oci_upper_size_mib: Option<u32>,
-    snapshot: Option<String>,
     memory_mib: Option<u32>,
     cpus: Option<u8>,
     max_memory_mib: Option<u32>,
@@ -1157,6 +1228,7 @@ struct LogStreamOpts {
 #[derive(serde::Deserialize, Default)]
 struct SnapshotCreateOpts {
     name: Option<String>,
+    group: Option<String>,
     dest_dir: Option<String>,
     #[serde(default)]
     labels: HashMap<String, String>,
@@ -1165,11 +1237,15 @@ struct SnapshotCreateOpts {
     #[serde(default)]
     record_integrity: bool,
     #[serde(default)]
-    resumable: bool,
+    full: bool,
+    #[serde(default)]
+    guest_flush: microsandbox::snapshot::GuestFlush,
 }
 
 #[derive(serde::Deserialize, Default)]
 struct SnapshotSaveOptsJson {
+    since: Option<String>,
+    last_layers: Option<usize>,
     #[serde(default)]
     with_parents: bool,
     #[serde(default)]
@@ -1179,9 +1255,28 @@ struct SnapshotSaveOptsJson {
 }
 
 #[derive(serde::Deserialize, Default)]
+struct SnapshotLoadOptsJson {
+    dest: Option<PathBuf>,
+    base: Option<String>,
+    group: Option<String>,
+    #[serde(default)]
+    set_head: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct SnapshotCopyOpts {
+    #[serde(default)]
+    labels: HashMap<String, String>,
+    #[serde(default)]
+    record_integrity: bool,
+}
+
+#[derive(serde::Deserialize, Default)]
 struct MountSpec {
     bind: Option<String>,
     named: Option<String>,
+    /// Exclusive sandbox-owned storage selector; no legacy source is emitted.
+    owned: Option<String>,
     named_mode: Option<String>,
     named_kind: Option<String>,
     #[serde(default)]
@@ -1229,11 +1324,53 @@ enum FfiNamedMode {
 // Sandbox create — helpers
 // ---------------------------------------------------------------------------
 
+/// Parse the shared policy vocabulary without applying DNS, TLS, or bootstrap options.
+fn parse_custom_network_policy(
+    cp: &CustomNetworkPolicy,
+    mut rules: Vec<microsandbox_network::policy::Rule>,
+) -> Result<microsandbox_network::policy::NetworkPolicy, FfiError> {
+    use microsandbox_network::policy::{Action, Direction, NetworkPolicy, Rule};
+
+    let default_egress = match cp.default_egress.as_deref() {
+        Some(s) => parse_action(s)?,
+        None => Action::Deny,
+    };
+    let default_ingress = match cp.default_ingress.as_deref() {
+        Some(s) => parse_action(s)?,
+        None => Action::Allow,
+    };
+    for r in &cp.rules {
+        let action = parse_action(&r.action)?;
+        let direction = match r.direction.as_str() {
+            "egress" | "outbound" => Direction::Egress,
+            "ingress" | "inbound" => Direction::Ingress,
+            "any" | "both" => Direction::Any,
+            other => {
+                return Err(FfiError::invalid_argument(format!(
+                    "unknown direction: {other}"
+                )));
+            }
+        };
+        rules.push(Rule {
+            action,
+            direction,
+            destination: parse_destination(r.destination.as_deref())?,
+            protocols: parse_protocols(r.protocol.as_deref(), &r.protocols)?,
+            ports: parse_ports(r.port.as_ref(), &r.ports)?,
+        });
+    }
+    Ok(NetworkPolicy {
+        default_egress,
+        default_ingress,
+        rules,
+    })
+}
+
 fn apply_network(
     mut builder: microsandbox::sandbox::SandboxBuilder,
     net: &NetworkOpts,
 ) -> Result<microsandbox::sandbox::SandboxBuilder, FfiError> {
-    use microsandbox_network::policy::{Action, Destination, Direction, NetworkPolicy, Rule};
+    use microsandbox_network::policy::{Action, Destination, NetworkPolicy, Rule};
 
     // Bulk DNS-level deny rules (composed up-front so any error short-
     // circuits before we touch the builder).
@@ -1261,46 +1398,8 @@ fn apply_network(
 
     // Custom policy.
     if let Some(ref cp) = net.custom_policy {
-        let default_egress = match cp.default_egress.as_deref() {
-            Some(s) => parse_action(s)?,
-            None => Action::Deny,
-        };
-        let default_ingress = match cp.default_ingress.as_deref() {
-            Some(s) => parse_action(s)?,
-            None => Action::Allow,
-        };
-
-        let mut rules = bulk_deny.clone();
-        for r in &cp.rules {
-            let action = parse_action(&r.action)?;
-            let direction = match r.direction.as_str() {
-                "egress" | "outbound" => Direction::Egress,
-                "ingress" | "inbound" => Direction::Ingress,
-                "any" | "both" => Direction::Any,
-                other => {
-                    return Err(FfiError::invalid_argument(format!(
-                        "unknown direction: {other}"
-                    )));
-                }
-            };
-            let destination = parse_destination(r.destination.as_deref())?;
-            let protocols = parse_protocols(r.protocol.as_deref(), &r.protocols)?;
-            let ports = parse_ports(r.port.as_ref(), &r.ports)?;
-            rules.push(Rule {
-                action,
-                direction,
-                destination,
-                protocols,
-                ports,
-            });
-        }
-        builder = builder.network(|n| {
-            n.policy(NetworkPolicy {
-                default_egress,
-                default_ingress,
-                rules,
-            })
-        });
+        let policy = parse_custom_network_policy(cp, bulk_deny.clone())?;
+        builder = builder.network(|n| n.policy(policy));
         policy_set = true;
     }
 
@@ -1328,6 +1427,12 @@ fn apply_network(
             .parse()
             .map_err(|e| FfiError::invalid_argument(format!("ipv6_pool {raw:?}: {e}")))?;
         builder = builder.network(|n| n.ipv6_pool(pool));
+    }
+    for raw in &net.nat64_prefixes {
+        let prefix: ipnetwork::Ipv6Network = raw.parse().map_err(|e| {
+            FfiError::invalid_argument(format!("nat64_prefixes entry {raw:?}: {e}"))
+        })?;
+        builder = builder.network(|n| n.nat64_prefix(prefix));
     }
 
     // DNS configuration. Either nested `dns: {...}` or the legacy flat
@@ -1413,8 +1518,19 @@ fn apply_network(
     }
 
     // Connection ceiling.
-    if let Some(max) = net.max_connections {
-        builder = builder.network(move |n| n.max_connections(max));
+    if let Some(max) = net.max_tcp_connections {
+        builder = builder.network(move |n| n.max_tcp_connections(max));
+    }
+    if let Some(max) = net.max_udp_connections {
+        builder = builder.network(move |n| n.max_udp_connections(max));
+    }
+    if let Some(size) = net.tcp_accept_queue_size {
+        builder = builder.network(move |n| n.tcp_accept_queue_size(size));
+    }
+
+    // Strict hostname policy.
+    if let Some(strict) = net.strict {
+        builder = builder.network(move |n| n.strict(strict));
     }
 
     // Rate limiters. Validation (empty limiter, zero size/refill, burst
@@ -1439,12 +1555,19 @@ fn apply_network(
         builder = builder.network(move |n| n.trust_host_cas(trust));
     }
 
+    // Body returned to HTTP/HTTPS clients when egress is denied.
+    if let Some(http) = net.http.as_ref() {
+        builder = builder.network(|n| n.http(|h| h.deny_response(http.deny_response)));
+        if let Some(message) = http.deny_message.as_ref() {
+            let message = message.clone();
+            builder = builder.network(move |n| n.http(|h| h.deny_message(message)));
+        }
+    }
+
     // Sandbox-wide secret violation action.
-    if let Some(ref violation) = net.on_secret_violation {
+    if let Some(ref violation) = net.secret_violation_action {
         let action = parse_violation_action(violation)?;
-        builder = builder.network(move |n| {
-            n.on_secret_violation(move |_| ViolationActionBuilder::from_action(action))
-        });
+        builder = builder.network(move |n| n.secret_violation_action(action));
     }
 
     // Ports nested inside network object.
@@ -1626,11 +1749,13 @@ fn parse_port_string(s: &str) -> Result<microsandbox_network::policy::PortRange,
     }
 }
 
-fn parse_violation_action(s: &str) -> Result<ViolationAction, FfiError> {
+fn parse_violation_action(s: &str) -> Result<SecretViolationAction, FfiError> {
     match s {
-        "block" => Ok(ViolationAction::Block),
-        "block-and-log" | "block_and_log" => Ok(ViolationAction::BlockAndLog),
-        "block-and-terminate" | "block_and_terminate" => Ok(ViolationAction::BlockAndTerminate),
+        "block" => Ok(SecretViolationAction::Block),
+        "block-and-log" | "block_and_log" => Ok(SecretViolationAction::BlockAndLog),
+        "block-and-terminate" | "block_and_terminate" => {
+            Ok(SecretViolationAction::BlockAndTerminate)
+        }
         other => Err(FfiError::invalid_argument(format!(
             "unknown violation action: {other}"
         ))),
@@ -1781,28 +1906,31 @@ fn apply_secret(
 ) -> Result<microsandbox::sandbox::SandboxBuilder, FfiError> {
     let env_var = s.env_var.clone();
     let value = s.value.clone();
-    let allow_hosts = s.allow_hosts.clone();
-    let allow_host_patterns = s.allow_host_patterns.clone();
-    if allow_hosts.is_empty() && allow_host_patterns.is_empty() {
+    let allow = s.allow.clone();
+    if allow.is_empty() {
         return Err(FfiError::invalid_argument(
             "secret requires at least one allowed host or allowed host pattern",
         ));
     }
     let placeholder = s.placeholder.clone();
-    let require_tls = s.require_tls;
-    let on_violation = s
-        .on_violation
+    let require_tls = s.require_tls_identity;
+    let violation_action = s
+        .violation_action
         .as_ref()
         .map(|violation| parse_violation_action(violation))
         .transpose()?;
 
     builder = builder.secret(move |mut sb| {
         sb = sb.env(&env_var).value(value.clone());
-        for h in &allow_hosts {
-            sb = sb.allow_host(h);
+        for host in &allow {
+            sb = if host == "*" {
+                sb.allow_any_host_dangerous(true)
+            } else {
+                sb.allow(host)
+            };
         }
-        for p in &allow_host_patterns {
-            sb = sb.allow_host_pattern(p);
+        for host in &s.passthrough {
+            sb = sb.allow_placeholder_for(host);
         }
         if let Some(ref ph) = placeholder {
             sb = sb.placeholder(ph);
@@ -1810,8 +1938,20 @@ fn apply_secret(
         if let Some(req) = require_tls {
             sb = sb.require_tls_identity(req);
         }
-        if let Some(action) = on_violation {
-            sb = sb.on_violation(move |_| ViolationActionBuilder::from_action(action));
+        if !s.substitution.header_fields.is_empty() {
+            sb = sb.substitute_in_header_fields(s.substitution.header_fields.clone());
+        }
+        // Apply the explicit enabled/disabled switch after the header list:
+        // `substitute_in_header_fields` enables header substitution, so a
+        // caller that sets `headers=false` must win regardless of ordering.
+        if let Some(headers) = s.substitution.headers {
+            sb = sb.substitute_in_headers(headers);
+        }
+        sb = sb
+            .substitute_in_query(s.substitution.query)
+            .substitute_in_body(s.substitution.body);
+        if let Some(action) = violation_action {
+            sb = sb.violation_action(action);
         }
         sb
     });
@@ -1925,6 +2065,14 @@ fn apply_volume(
     guest_path: &str,
     m: &MountSpec,
 ) -> Result<microsandbox::sandbox::SandboxBuilder, FfiError> {
+    let mount = volume_mount(guest_path, m)?;
+    Ok(builder.volume(guest_path, |_| mount))
+}
+
+fn volume_mount(
+    guest_path: &str,
+    m: &MountSpec,
+) -> Result<microsandbox::sandbox::MountBuilder, FfiError> {
     // Disk mounts have additional fields that need to be parsed before
     // entering the closure (so `?` works cleanly on the format string).
     let disk_format = if let Some(ref f) = m.format {
@@ -1971,6 +2119,71 @@ fn apply_volume(
     }
     let raw_named_mode = m.named_mode.clone();
     let raw_named_kind = m.named_kind.clone();
+
+    if let Some(kind) = m.owned.as_deref() {
+        // Reject mixed sources at the native boundary as well as in Go. The
+        // ownership selector must never become a named or host-backed mount.
+        if bind.is_some()
+            || named.is_some()
+            || tmpfs
+            || disk.is_some()
+            || raw_named_mode.is_some()
+            || raw_named_kind.is_some()
+            || m.format.is_some()
+            || fstype.is_some()
+        {
+            return Err(FfiError::invalid_argument(
+                "owned mount cannot specify a source, name, mode, format or fstype",
+            ));
+        }
+        if !matches!(kind, "dir" | "disk") {
+            return Err(FfiError::invalid_argument(
+                "owned volume kind must be dir or disk",
+            ));
+        }
+        if override_uid.is_some() != override_gid.is_some() {
+            return Err(FfiError::invalid_argument(
+                "override_uid and override_gid must be specified together",
+            ));
+        }
+        let mut mount =
+            microsandbox::sandbox::MountBuilder::new(guest_path).owned_with(|mut owned| {
+                owned = if kind == "disk" {
+                    owned.disk()
+                } else {
+                    owned.directory()
+                };
+                if let Some(size) = size_mib {
+                    owned = owned.size(size);
+                }
+                if let Some(quota) = quota_mib {
+                    owned = owned.quota(quota);
+                }
+                owned
+            });
+        if readonly {
+            mount = mount.readonly();
+        }
+        if noexec {
+            mount = mount.noexec();
+        }
+        if nosuid {
+            mount = mount.nosuid();
+        }
+        if nodev {
+            mount = mount.nodev();
+        }
+        if let Some(policy) = stat_virt {
+            mount = mount.stat_virtualization(policy);
+        }
+        if let Some(policy) = host_perms {
+            mount = mount.host_permissions(policy);
+        }
+        if let (Some(uid), Some(gid)) = (override_uid, override_gid) {
+            mount = mount.owner(uid, gid);
+        }
+        return Ok(mount);
+    }
 
     let kinds_set: u8 =
         bind.is_some() as u8 + named.is_some() as u8 + tmpfs as u8 + disk.is_some() as u8;
@@ -2026,7 +2239,8 @@ fn apply_volume(
         ));
     }
 
-    Ok(builder.volume(guest_path, move |mb| {
+    let mb = microsandbox::sandbox::MountBuilder::new(guest_path);
+    Ok({
         let mut mb = if let Some(ref host) = bind {
             // A caller-provided guest-write quota overrides the protective
             // default; None keeps it.
@@ -2099,7 +2313,7 @@ fn apply_volume(
             mb = mb.owner(uid, gid);
         }
         mb
-    }))
+    })
 }
 
 fn parse_named_mode(s: &str) -> Result<FfiNamedMode, FfiError> {
@@ -2212,24 +2426,14 @@ pub unsafe extern "C" fn msb_sandbox_create(
 
         Ok(Box::pin(async move {
             let mut builder = Sandbox::builder(&name);
-            if opts.image.is_some() && opts.snapshot.is_some() {
-                return Err(FfiError::invalid_argument(
-                    "image and snapshot are mutually exclusive",
-                ));
-            }
+
             if opts.root_disk.is_some() && opts.oci_upper_size_mib.is_some() {
                 return Err(FfiError::invalid_argument(
                     "root_disk and oci_upper_size_mib are mutually exclusive",
                 ));
             }
-            if (opts.root_disk.is_some() || opts.oci_upper_size_mib.is_some())
-                && opts.snapshot.is_some()
-            {
-                return Err(FfiError::invalid_argument(
-                    "root_disk is not valid when booting from a snapshot",
-                ));
-            }
-            if opts.image_bind.is_some() && (opts.image.is_some() || opts.snapshot.is_some()) {
+
+            if opts.image_bind.is_some() && opts.image.is_some() {
                 return Err(FfiError::invalid_argument(
                     "image_bind is mutually exclusive with image and snapshot",
                 ));
@@ -2251,9 +2455,7 @@ pub unsafe extern "C" fn msb_sandbox_create(
                 // Deprecated flat spelling: managed root disk of that size.
                 builder = builder.root_disk(size_mib);
             }
-            if let Some(snapshot) = opts.snapshot {
-                builder = builder.from_snapshot(snapshot);
-            }
+
             if let Some(m) = opts.memory_mib {
                 builder = builder.memory(m);
             }
@@ -2281,6 +2483,7 @@ pub unsafe extern "C" fn msb_sandbox_create(
                     .map_err(FfiError::invalid_argument)?;
                 builder = builder.thp(policy);
             }
+
             if let Some(w) = opts.workdir {
                 builder = builder.workdir(w);
             }
@@ -2412,6 +2615,7 @@ pub unsafe extern "C" fn msb_sandbox_create(
                     )));
                 }
                 builder = match proxy.protocol.as_str() {
+                    "http_connect" => builder.proxy(move |p| p.http_connect(proxy.address)),
                     "socks4" => builder.proxy(move |p| {
                         let proxy_builder = p.socks4(proxy.address);
                         match proxy.user_id {
@@ -2459,6 +2663,8 @@ pub unsafe extern "C" fn msb_sandbox_create(
 
             let sandbox = if connect_or_create {
                 builder.detached(opts.detached).connect_or_create().await?
+            } else if let Some(progress) = opts.creation_progress {
+                creation_progress::create(builder.detached(opts.detached), progress).await?
             } else if opts.detached {
                 builder.create_detached().await?
             } else {
@@ -2728,6 +2934,36 @@ async fn identified_sandbox_handle(
     Ok(handle)
 }
 
+/// Include catalog lookup in the same deadline as graceful completion. In particular, an
+/// explicit zero must not poll lookup (which may reconcile catalog/runtime state).
+async fn stop_identified_with_timeout<L>(
+    name: &str,
+    identity: &str,
+    timeout: Duration,
+    lookup: L,
+) -> Result<(), FfiError>
+where
+    L: Future<Output = Result<microsandbox::sandbox::SandboxHandle, FfiError>>,
+{
+    let expired = || {
+        FfiError::from(MicrosandboxError::StopTimeout {
+            name: name.to_string(),
+            identity: identity.to_string(),
+            timeout,
+        })
+    };
+    if timeout.is_zero() {
+        return Err(expired());
+    }
+    tokio::time::timeout(timeout, async {
+        let handle = lookup.await?;
+        // Do not restart the budget after lookup; the outer deadline covers both stages.
+        handle.stop().await.map_err(FfiError::from)
+    })
+    .await
+    .map_err(|_| expired())?
+}
+
 fn registered_sandbox_json(sandbox: Sandbox) -> Result<String, FfiError> {
     let backend_kind = sandbox.backend_kind().as_str();
     let id = sandbox.id().to_string();
@@ -2762,6 +2998,19 @@ pub unsafe extern "C" fn msb_sandbox_handle_lifecycle(
             })?;
 
         Ok(Box::pin(async move {
+            if operation == "stop_with_timeout" {
+                let timeout = opts.timeout_ms.ok_or_else(|| {
+                    FfiError::invalid_argument("stop_with_timeout requires timeout_ms")
+                })?;
+                stop_identified_with_timeout(
+                    &name,
+                    &expected_id,
+                    Duration::from_millis(timeout),
+                    identified_sandbox_handle(&name, &expected_id),
+                )
+                .await?;
+                return Ok(r#"{"ok":true}"#.to_string());
+            }
             let handle = identified_sandbox_handle(&name, &expected_id).await?;
             match operation.as_str() {
                 "refresh" => Ok(sandbox_handle_json(&handle)),
@@ -2783,9 +3032,18 @@ pub unsafe extern "C" fn msb_sandbox_handle_lifecycle(
                     registered_sandbox_json(sandbox)
                 }
                 "stop" => {
-                    handle
-                        .stop_with_timeout(Duration::from_millis(opts.timeout_ms.unwrap_or(10_000)))
-                        .await?;
+                    match opts.timeout_ms {
+                        Some(timeout_ms) => {
+                            handle
+                                .stop_with_timeout(Duration::from_millis(timeout_ms))
+                                .await?;
+                        }
+                        None => handle.stop().await?,
+                    }
+                    Ok(r#"{"ok":true}"#.to_string())
+                }
+                "stop_gracefully" => {
+                    handle.stop().await?;
                     Ok(r#"{"ok":true}"#.to_string())
                 }
                 "request_stop" => {
@@ -2873,6 +3131,44 @@ pub unsafe extern "C" fn msb_sandbox_handle_stop(
             h.stop_with_timeout(Duration::from_millis(timeout_ms))
                 .await
                 .map_err(FfiError::from)?;
+            Ok(r#"{"ok":true}"#.into())
+        }))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_sandbox_handle_pause(
+    cancel_id: u64,
+    name: *const c_char,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run_c(cancel_id, buf, buf_len, || {
+        let name = unsafe { cstr(name) }?;
+        Ok(Box::pin(async move {
+            let sb = Sandbox::get_for_control(&name)
+                .await
+                .map_err(FfiError::from)?;
+            sb.pause().await.map_err(FfiError::from)?;
+            Ok(r#"{"ok":true}"#.into())
+        }))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_sandbox_handle_resume(
+    cancel_id: u64,
+    name: *const c_char,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run_c(cancel_id, buf, buf_len, || {
+        let name = unsafe { cstr(name) }?;
+        Ok(Box::pin(async move {
+            let sb = Sandbox::get_for_control(&name)
+                .await
+                .map_err(FfiError::from)?;
+            sb.resume().await.map_err(FfiError::from)?;
             Ok(r#"{"ok":true}"#.into())
         }))
     })
@@ -3023,6 +3319,65 @@ pub unsafe extern "C" fn msb_sandbox_handle_modify(
     })
 }
 
+/// Explicit compaction. A nonzero handle retains its backend; zero resolves the supplied name.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_sandbox_compact(
+    cancel_id: u64,
+    handle: Handle,
+    name: *const c_char,
+    opts_json: *const c_char,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Options {
+        layers: Option<usize>,
+        #[serde(default)]
+        dry_run: bool,
+        disk: Option<String>,
+        #[serde(default)]
+        root_disk_only: bool,
+    }
+    run_c(cancel_id, buf, buf_len, || {
+        let name = unsafe { cstr(name) }?;
+        let opts: Options =
+            serde_json::from_str(&unsafe { cstr(opts_json) }?).map_err(|error| {
+                FfiError::invalid_argument(format!("invalid compaction options: {error}"))
+            })?;
+        let sandbox = if handle == 0 {
+            None
+        } else {
+            Some(get(handle)?)
+        };
+        Ok(Box::pin(async move {
+            let mut builder = if let Some(sandbox) = sandbox {
+                sandbox.compact()
+            } else {
+                Sandbox::get(&name).await.map_err(FfiError::from)?.compact()
+            };
+            if let Some(layers) = opts.layers {
+                builder = builder.layers(layers);
+            }
+            if let Some(disk) = opts.disk {
+                builder = builder.disk(disk);
+            }
+            if opts.root_disk_only {
+                builder = builder.root_disk_only();
+            }
+            let result = if opts.dry_run {
+                builder.dry_run().await
+            } else {
+                builder.apply().await
+            }
+            .map_err(FfiError::from)?;
+            Ok(serde_json::to_value(result)
+                .map_err(|error| FfiError::invalid_argument(error.to_string()))?
+                .to_string())
+        }))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Sandbox — close
 //
@@ -3087,6 +3442,23 @@ pub unsafe extern "C" fn msb_sandbox_detach(
 // Sandbox — stop (graceful) and stop_and_wait
 // ---------------------------------------------------------------------------
 
+/// Read structured filesystem warnings retained by relaxed full restore.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_sandbox_restore_warnings(
+    cancel_id: u64,
+    handle: Handle,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run_c(cancel_id, buf, buf_len, || {
+        let sandbox = get(handle)?;
+        Ok(Box::pin(async move {
+            let warnings = sandbox.restore_warnings().await.map_err(FfiError::from)?;
+            serde_json::to_string(&warnings).map_err(|error| FfiError::internal(error.to_string()))
+        }))
+    })
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn msb_sandbox_stop(
     cancel_id: u64,
@@ -3101,6 +3473,236 @@ pub unsafe extern "C" fn msb_sandbox_stop(
             sb.stop_with_timeout(Duration::from_millis(timeout_ms))
                 .await
                 .map_err(FfiError::from)?;
+            Ok(r#"{"ok":true}"#.into())
+        }))
+    })
+}
+
+/// Wait for graceful shutdown without forced termination. An absent timeout is unbounded.
+/// This distinct symbol also gates the revised stop semantics for older native libraries.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_sandbox_stop_gracefully(
+    cancel_id: u64,
+    handle: Handle,
+    has_timeout: u8,
+    timeout_ms: u64,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run_c(cancel_id, buf, buf_len, || {
+        let timeout = graceful_stop_timeout(has_timeout, timeout_ms)?;
+        let sb = get(handle)?;
+        Ok(Box::pin(async move {
+            match timeout {
+                Some(timeout) => sb.stop_with_timeout(timeout).await,
+                None => sb.stop().await,
+            }
+            .map_err(FfiError::from)?;
+            Ok(r#"{"ok":true}"#.into())
+        }))
+    })
+}
+
+fn graceful_stop_timeout(has_timeout: u8, timeout_ms: u64) -> Result<Option<Duration>, FfiError> {
+    match has_timeout {
+        0 => Ok(None),
+        1 => Ok(Some(Duration::from_millis(timeout_ms))),
+        _ => Err(FfiError::invalid_argument("has_timeout must be 0 or 1")),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_sandbox_pause(
+    cancel_id: u64,
+    handle: Handle,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run_c(cancel_id, buf, buf_len, || {
+        let sb = get(handle)?;
+        Ok(Box::pin(async move {
+            sb.pause().await.map_err(FfiError::from)?;
+            Ok(r#"{"ok":true}"#.into())
+        }))
+    })
+}
+
+/// Pause with an explicit flush policy. Its presence also advertises policy-aware JSON APIs.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_sandbox_pause_with_guest_flush(
+    cancel_id: u64,
+    handle: Handle,
+    source: *const c_char,
+    expected_id: *const c_char,
+    policy: *const c_char,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run_c(cancel_id, buf, buf_len, || {
+        let source = unsafe { cstr(source) }?;
+        let expected_id = unsafe { cstr(expected_id) }?;
+        let policy = unsafe { cstr(policy) }?
+            .parse::<microsandbox::snapshot::GuestFlush>()
+            .map_err(FfiError::invalid_argument)?;
+        let live = if handle == 0 {
+            None
+        } else {
+            Some(get(handle)?)
+        };
+        Ok(Box::pin(async move {
+            if let Some(live) = live {
+                live.pause_with_guest_flush(policy)
+                    .await
+                    .map_err(FfiError::from)?;
+            } else {
+                identified_sandbox_handle(&source, &expected_id)
+                    .await?
+                    .pause_with_guest_flush(policy)
+                    .await
+                    .map_err(FfiError::from)?;
+            }
+            Ok("null".to_string())
+        }))
+    })
+}
+
+/// Branch by live handle, or by persisted name when handle is zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_sandbox_branch(
+    cancel_id: u64,
+    handle: Handle,
+    source: *const c_char,
+    child: *const c_char,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    unsafe {
+        msb_sandbox_branch_with_options(cancel_id, handle, source, child, false, buf, buf_len)
+    }
+}
+
+/// Capture once for a JSON request containing child names and return named outcomes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_sandbox_branch_many(
+    cancel_id: u64,
+    handle: Handle,
+    source: *const c_char,
+    names: *const c_char,
+    record_integrity: bool,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run_c(cancel_id, buf, buf_len, || {
+        let request: BranchManyRequest = serde_json::from_str(&unsafe { cstr(names) }?)
+            .map_err(|e| FfiError::invalid_argument(e.to_string()))?;
+        let source = unsafe { cstr(source) }?;
+        let live = if handle == 0 {
+            None
+        } else {
+            Some(get(handle)?)
+        };
+        Ok(Box::pin(async move {
+            let mut builder = if let Some(live) = live {
+                live.fork_many(request.names)
+            } else {
+                let source = Sandbox::get(&source).await.map_err(FfiError::from)?;
+                if let Some(expected) = request.source_identity.filter(|id| !id.is_empty())
+                    && source.id().as_str() != expected
+                {
+                    return Err(FfiError::from(MicrosandboxError::SandboxReplaced {
+                        name: source.name().to_string(),
+                        expected,
+                        actual: source.id().to_string(),
+                    }));
+                }
+                source.fork_many(request.names)
+            };
+            builder = builder.guest_flush(request.guest_flush);
+            if record_integrity {
+                builder = builder.record_integrity();
+            }
+            for (guest, spec) in &request.volumes {
+                let mount = volume_mount(guest, spec)?;
+                builder = builder.volume(guest, |_| mount);
+            }
+            let outcomes = builder.fork().await.map_err(FfiError::from)?;
+            let mut rows = Vec::with_capacity(outcomes.len());
+            for outcome in outcomes {
+                let row = match outcome.result {
+                    Ok(child) => {
+                        let kind = child.backend_kind().as_str();
+                        let id = child.id().to_string();
+                        match register(child) {
+                            Ok(handle) => {
+                                serde_json::json!({"name": outcome.name, "id": id, "handle": handle, "backend_kind": kind})
+                            }
+                            Err(error) => {
+                                serde_json::json!({"name": outcome.name, "error": {"kind": error.kind, "message": error.message}})
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let error = FfiError::from(error);
+                        serde_json::json!({"name": outcome.name, "error": {"kind": error.kind, "message": error.message}})
+                    }
+                };
+                rows.push(row);
+            }
+            Ok(serde_json::json!({"outcomes": rows}).to_string())
+        }))
+    })
+}
+
+/// Branch with explicit disk content integrity, retaining the original branch ABI.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_sandbox_branch_with_options(
+    cancel_id: u64,
+    handle: Handle,
+    source: *const c_char,
+    child: *const c_char,
+    record_integrity: bool,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run_c(cancel_id, buf, buf_len, || {
+        let child = unsafe { cstr(child) }?;
+        let source = unsafe { cstr(source) }?;
+        let live = if handle == 0 {
+            None
+        } else {
+            Some(get(handle)?)
+        };
+        Ok(Box::pin(async move {
+            let mut builder = if let Some(live) = live {
+                live.fork(child)
+            } else {
+                Sandbox::get(&source)
+                    .await
+                    .map_err(FfiError::from)?
+                    .fork(child)
+            };
+            if record_integrity {
+                builder = builder.record_integrity();
+            }
+            let sb = builder.fork().await.map_err(FfiError::from)?;
+            let backend_kind = sb.backend_kind().as_str();
+            let handle = register(sb)?;
+            Ok(serde_json::json!({ "handle": handle, "backend_kind": backend_kind }).to_string())
+        }))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_sandbox_resume(
+    cancel_id: u64,
+    handle: Handle,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run_c(cancel_id, buf, buf_len, || {
+        let sb = get(handle)?;
+        Ok(Box::pin(async move {
+            sb.resume().await.map_err(FfiError::from)?;
             Ok(r#"{"ok":true}"#.into())
         }))
     })
@@ -4207,15 +4809,7 @@ pub unsafe extern "C" fn msb_sandbox_exec(
                 .await
                 .map_err(FfiError::from)?;
 
-            let stdout = output.stdout().unwrap_or_default();
-            let stderr = output.stderr().unwrap_or_default();
-            let exit_code = output.status().code;
-            Ok(serde_json::json!({
-                "stdout": stdout,
-                "stderr": stderr,
-                "exit_code": exit_code,
-            })
-            .to_string())
+            Ok(exec_adapter::collected_output_json(&output))
         }))
     })
 }
@@ -4260,12 +4854,7 @@ pub unsafe extern "C" fn msb_sandbox_exec_default(
                 .await
                 .map_err(FfiError::from)?;
 
-            Ok(serde_json::json!({
-                "stdout": output.stdout().unwrap_or_default(),
-                "stderr": output.stderr().unwrap_or_default(),
-                "exit_code": output.status().code,
-            })
-            .to_string())
+            Ok(exec_adapter::collected_output_json(&output))
         }))
     })
 }
@@ -5599,53 +6188,7 @@ pub unsafe extern "C" fn msb_volume_fs_op(
                 FfiError::invalid_argument(format!("invalid volume fs args: {error}"))
             })?;
         Ok(Box::pin(async move {
-            let path = args["path"]
-                .as_str()
-                .ok_or_else(|| FfiError::invalid_argument("missing volume fs path"))?;
-            // Rust handles encode cloud volume UUIDs as `cloud-id:<uuid>`.
-            // Reusing that target here preserves handle identity across a
-            // named volume delete/recreate instead of resolving by name.
-            let backend = default_backend();
-            let fs = VolumeFs::with_backend(backend, &target);
-            match op.as_str() {
-                "read" => {
-                    let data = fs.read(path).await.map_err(FfiError::from)?;
-                    Ok(serde_json::json!({
-                        "data_b64": base64::engine::general_purpose::STANDARD.encode(data)
-                    })
-                    .to_string())
-                }
-                "write" => {
-                    let encoded = args["data_b64"]
-                        .as_str()
-                        .ok_or_else(|| FfiError::invalid_argument("missing volume fs data"))?;
-                    let data = base64::engine::general_purpose::STANDARD
-                        .decode(encoded)
-                        .map_err(|error| {
-                            FfiError::invalid_argument(format!("invalid base64 data: {error}"))
-                        })?;
-                    fs.write(path, data).await.map_err(FfiError::from)?;
-                    Ok(r#"{"ok":true}"#.into())
-                }
-                "mkdir" => {
-                    fs.mkdir(path).await.map_err(FfiError::from)?;
-                    Ok(r#"{"ok":true}"#.into())
-                }
-                "remove" => {
-                    let recursive = args["recursive"].as_bool().unwrap_or(false);
-                    if recursive {
-                        fs.remove_dir(path).await.map_err(FfiError::from)?;
-                    } else {
-                        fs.remove(path).await.map_err(FfiError::from)?;
-                    }
-                    Ok(r#"{"ok":true}"#.into())
-                }
-                "exists" => {
-                    let exists = fs.exists(path).await.map_err(FfiError::from)?;
-                    Ok(serde_json::json!({ "exists": exists }).to_string())
-                }
-                _ => Err(FfiError::invalid_argument("unknown volume fs operation")),
-            }
+            volume_fs::dispatch(&target, &op, &args).await
         }))
     })
 }
@@ -5834,6 +6377,7 @@ pub unsafe extern "C" fn msb_image_prune(
                 "layers_removed": report.layers_removed,
                 "fsmeta_removed": report.fsmeta_removed,
                 "vmdk_removed": report.vmdk_removed,
+                "skipped_in_use": report.skipped_in_use,
                 "bytes_reclaimed": report.bytes_reclaimed,
             })
             .to_string())
@@ -5939,17 +6483,13 @@ fn snapshot_format_str(f: SnapshotFormat) -> &'static str {
 fn snapshot_scope_str(scope: SnapshotScope) -> &'static str {
     match scope {
         SnapshotScope::Disk => "disk",
-        SnapshotScope::Resumable => "resumable",
+        SnapshotScope::Full => "full",
     }
 }
 
 fn snapshot_json(s: &Snapshot) -> serde_json::Value {
     let manifest = s.manifest();
-    let labels: HashMap<String, String> = manifest
-        .labels
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
+    let labels = s.labels();
     let (
         state_kind,
         format,
@@ -5964,7 +6504,8 @@ fn snapshot_json(s: &Snapshot) -> serde_json::Value {
         checkpoint_manifest_digest,
     ) = match &manifest.state {
         microsandbox::snapshot::SnapshotState::File(state) => {
-            let integrity = state.upper.integrity.as_ref();
+            let head = state.head_layer().ok();
+            let integrity = head.and_then(|layer| layer.payload.integrity.as_ref());
             let (root, logical_size, leaf_size) = match integrity {
                 Some(microsandbox::UpperIntegrity::FileMerkleBlake3V1 {
                     root,
@@ -5975,9 +6516,9 @@ fn snapshot_json(s: &Snapshot) -> serde_json::Value {
             };
             (
                 "file",
-                Some(snapshot_format_str(state.format)),
-                Some(state.fstype.as_str()),
-                Some(state.upper.file.as_str()),
+                Some(snapshot_format_str(state.disk_format)),
+                Some(state.filesystem.as_str()),
+                head.map(|layer| state.layer_path(layer).to_string_lossy().into_owned()),
                 integrity.map(microsandbox::UpperIntegrity::algorithm),
                 integrity.map(microsandbox::UpperIntegrity::value),
                 root,
@@ -5998,11 +6539,15 @@ fn snapshot_json(s: &Snapshot) -> serde_json::Value {
             None,
             None,
             Some(state.checkpoint_id.as_str()),
-            Some(state.manifest.as_str()),
+            Some(state.checkpoint_root.as_str()),
         ),
     };
     serde_json::json!({
-        "path": s.path().display().to_string(),
+        "head_update": s.head_update(),
+        "id": s.id().as_str(),
+        "path": s.path().ok().map(|path| path.to_string_lossy().into_owned()),
+        "reference": s.reference().value(),
+        "reference_kind": s.reference().kind(),
         "digest": s.digest(),
         "size_bytes": s.size_bytes(),
         "image_ref": manifest.image.reference,
@@ -6020,16 +6565,19 @@ fn snapshot_json(s: &Snapshot) -> serde_json::Value {
         "checkpoint_id": checkpoint_id,
         "checkpoint_manifest_digest": checkpoint_manifest_digest,
         "parent": manifest.parent,
-        "created_at": manifest.created_at,
+        "created_at": manifest.capture.created_at,
         "labels": labels,
-        "source_sandbox": manifest.source_sandbox,
+        "source_sandbox": manifest.capture.source_lineage,
     })
 }
 
 fn snapshot_handle_json(h: &microsandbox::SnapshotHandle) -> serde_json::Value {
     serde_json::json!({
+        "id": h.id(),
         "digest": h.digest(),
         "name": h.name(),
+        "group": h.group(),
+        "head_update": h.head_update(),
         "parent_digest": h.parent_digest(),
         "image_ref": h.image_ref(),
         "scope": snapshot_scope_str(h.scope()),
@@ -6043,7 +6591,9 @@ fn snapshot_handle_json(h: &microsandbox::SnapshotHandle) -> serde_json::Value {
         "migration_state": h.migration_state(),
         "migration_error_code": h.migration_error_code(),
         "created_at_unix": h.created_at().and_utc().timestamp(),
-        "path": h.path().display().to_string(),
+        "path": h.path().ok().map(|path| path.to_string_lossy().into_owned()),
+        "reference": h.reference().value(),
+        "reference_kind": h.reference().kind(),
     })
 }
 
@@ -6054,21 +6604,41 @@ fn verify_report_json(report: microsandbox::snapshot::SnapshotVerifyReport) -> s
             serde_json::json!({"kind":"verified","algorithm":algorithm,"digest":digest})
         }
     };
+    let checkpoint = report
+        .checkpoint
+        .map(|checkpoint| serde_json::json!({"kind":"verified","root":checkpoint.root}));
     serde_json::json!({
         "digest": report.digest,
         "path": report.path.display().to_string(),
         "upper": upper,
+        "checkpoint": checkpoint,
     })
+}
+
+fn parse_snapshot_reference(
+    value: String,
+    reference_kind: &str,
+) -> Result<SnapshotReference, FfiError> {
+    match reference_kind {
+        "" | "auto" => Ok(SnapshotReference::auto(value)),
+        "id" => Ok(SnapshotReference::id(value)),
+        "path" => Ok(SnapshotReference::path(value)),
+        other => Err(FfiError::invalid_argument(format!(
+            "unknown snapshot reference kind: {other}"
+        ))),
+    }
 }
 
 fn snapshot_builder_from_opts(
     source_sandbox: String,
     opts: SnapshotCreateOpts,
 ) -> Result<microsandbox::SnapshotBuilder, FfiError> {
-    let Some(name) = opts.name else {
-        return Err(FfiError::invalid_argument("snapshot create requires name"));
-    };
-    let mut builder = Snapshot::builder(name).from_sandbox(source_sandbox);
+    let mut builder = Snapshot::builder(opts.name.unwrap_or_default())
+        .from_sandbox(source_sandbox)
+        .guest_flush(opts.guest_flush);
+    if let Some(group) = opts.group {
+        builder = builder.group(group);
+    }
     if let Some(dest_dir) = opts.dest_dir {
         builder = builder.dest_dir(PathBuf::from(dest_dir));
     }
@@ -6081,8 +6651,8 @@ fn snapshot_builder_from_opts(
     if opts.record_integrity {
         builder = builder.record_integrity();
     }
-    if opts.resumable {
-        builder = builder.resumable();
+    if opts.full {
+        builder = builder.full();
     }
     Ok(builder)
 }
@@ -6128,16 +6698,51 @@ pub unsafe extern "C" fn msb_snapshot_create(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn msb_snapshot_open(
+pub unsafe extern "C" fn msb_snapshot_create_archive(
     cancel_id: u64,
-    path_or_name: *const c_char,
+    source_sandbox: *const c_char,
+    archive_path: *const c_char,
+    opts_json: *const c_char,
+    plain_tar: bool,
     buf: *mut c_uchar,
     buf_len: usize,
 ) -> *mut c_char {
     run_c(cancel_id, buf, buf_len, || {
-        let path_or_name = unsafe { cstr(path_or_name) }?;
+        let source_sandbox = unsafe { cstr(source_sandbox) }?;
+        let archive_path = unsafe { cstr(archive_path) }?;
+        let opts_raw = unsafe { cstr(opts_json) }?;
+        let opts: SnapshotCreateOpts = serde_json::from_str(&opts_raw)
+            .map_err(|e| FfiError::invalid_argument(format!("invalid opts JSON: {e}")))?;
+        let builder = snapshot_builder_from_opts(source_sandbox, opts)?;
         Ok(Box::pin(async move {
-            let snap = Snapshot::open(&path_or_name)
+            let archive = builder
+                .create_archive(archive_path, plain_tar)
+                .await
+                .map_err(FfiError::from)?;
+            Ok(serde_json::json!({
+                "id": archive.id().as_str(),
+                "descriptor_digest": archive.descriptor_digest(),
+                "path": archive.path().display().to_string(),
+            })
+            .to_string())
+        }))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_snapshot_open(
+    cancel_id: u64,
+    reference: *const c_char,
+    reference_kind: *const c_char,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run_c(cancel_id, buf, buf_len, || {
+        let reference = unsafe { cstr(reference) }?;
+        let reference_kind = unsafe { cstr(reference_kind) }?;
+        let reference = parse_snapshot_reference(reference, &reference_kind)?;
+        Ok(Box::pin(async move {
+            let snap = Snapshot::open_ref(reference)
                 .await
                 .map_err(FfiError::from)?;
             Ok(snapshot_json(&snap).to_string())
@@ -6148,14 +6753,17 @@ pub unsafe extern "C" fn msb_snapshot_open(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn msb_snapshot_verify(
     cancel_id: u64,
-    path_or_name: *const c_char,
+    reference: *const c_char,
+    reference_kind: *const c_char,
     buf: *mut c_uchar,
     buf_len: usize,
 ) -> *mut c_char {
     run_c(cancel_id, buf, buf_len, || {
-        let path_or_name = unsafe { cstr(path_or_name) }?;
+        let reference = unsafe { cstr(reference) }?;
+        let reference_kind = unsafe { cstr(reference_kind) }?;
+        let reference = parse_snapshot_reference(reference, &reference_kind)?;
         Ok(Box::pin(async move {
-            let snap = Snapshot::open(&path_or_name)
+            let snap = Snapshot::open_ref(reference)
                 .await
                 .map_err(FfiError::from)?;
             let report = snap.verify().await.map_err(FfiError::from)?;
@@ -6219,15 +6827,18 @@ pub unsafe extern "C" fn msb_snapshot_list_dir(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn msb_snapshot_remove(
     cancel_id: u64,
-    path_or_name: *const c_char,
+    reference: *const c_char,
+    reference_kind: *const c_char,
     force: bool,
     buf: *mut c_uchar,
     buf_len: usize,
 ) -> *mut c_char {
     run_c(cancel_id, buf, buf_len, || {
-        let path_or_name = unsafe { cstr(path_or_name) }?;
+        let reference = unsafe { cstr(reference) }?;
+        let reference_kind = unsafe { cstr(reference_kind) }?;
+        let reference = parse_snapshot_reference(reference, &reference_kind)?;
         Ok(Box::pin(async move {
-            Snapshot::remove(&path_or_name, force)
+            Snapshot::remove_ref(reference, force)
                 .await
                 .map_err(FfiError::from)?;
             Ok(r#"{"ok":true}"#.into())
@@ -6245,9 +6856,12 @@ pub unsafe extern "C" fn msb_snapshot_reindex(
     run_c(cancel_id, buf, buf_len, || {
         let dir = unsafe { cstr(dir) }?;
         Ok(Box::pin(async move {
-            let indexed = Snapshot::reindex(PathBuf::from(dir))
-                .await
-                .map_err(FfiError::from)?;
+            let indexed = if dir.is_empty() {
+                Snapshot::reindex_default().await
+            } else {
+                Snapshot::reindex(PathBuf::from(dir)).await
+            }
+            .map_err(FfiError::from)?;
             Ok(format!(r#"{{"indexed":{indexed}}}"#))
         }))
     })
@@ -6256,30 +6870,72 @@ pub unsafe extern "C" fn msb_snapshot_reindex(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn msb_snapshot_export(
     cancel_id: u64,
-    name_or_path: *const c_char,
+    reference: *const c_char,
+    reference_kind: *const c_char,
     out: *const c_char,
     opts_json: *const c_char,
     buf: *mut c_uchar,
     buf_len: usize,
 ) -> *mut c_char {
     run_c(cancel_id, buf, buf_len, || {
-        let name_or_path = unsafe { cstr(name_or_path) }?;
+        let reference = unsafe { cstr(reference) }?;
+        let reference_kind = unsafe { cstr(reference_kind) }?;
+        let reference = parse_snapshot_reference(reference, &reference_kind)?;
         let out = unsafe { cstr(out) }?;
         let opts_raw = unsafe { cstr(opts_json) }?;
         let opts: SnapshotSaveOptsJson = serde_json::from_str(&opts_raw)
             .map_err(|e| FfiError::invalid_argument(format!("invalid opts JSON: {e}")))?;
         Ok(Box::pin(async move {
-            Snapshot::save(
-                &name_or_path,
-                &PathBuf::from(out),
-                SaveOpts {
-                    with_parents: opts.with_parents,
-                    with_image: opts.with_image,
-                    plain_tar: opts.plain_tar,
-                },
-            )
-            .await
-            .map_err(FfiError::from)?;
+            let backend = default_backend();
+            backend
+                .snapshots()
+                .save(
+                    reference,
+                    &PathBuf::from(out),
+                    SaveOpts {
+                        with_parents: opts.with_parents,
+                        with_image: opts.with_image,
+                        plain_tar: opts.plain_tar,
+                        since: opts.since,
+                        last_layers: opts.last_layers,
+                    },
+                )
+                .await
+                .map_err(FfiError::from)?;
+            Ok(r#"{"ok":true}"#.into())
+        }))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_snapshot_copy(
+    cancel_id: u64,
+    reference: *const c_char,
+    reference_kind: *const c_char,
+    output_archive_path: *const c_char,
+    opts_json: *const c_char,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run_c(cancel_id, buf, buf_len, || {
+        let reference = unsafe { cstr(reference) }?;
+        let reference_kind = unsafe { cstr(reference_kind) }?;
+        let reference = parse_snapshot_reference(reference, &reference_kind)?;
+        let output_archive_path = unsafe { cstr(output_archive_path) }?;
+        let opts_raw = unsafe { cstr(opts_json) }?;
+        let opts: SnapshotCopyOpts = serde_json::from_str(&opts_raw)
+            .map_err(|e| FfiError::invalid_argument(format!("invalid opts JSON: {e}")))?;
+        Ok(Box::pin(async move {
+            let snapshot = Snapshot::open_ref(reference)
+                .await
+                .map_err(FfiError::from)?;
+            snapshot
+                .copy_to(output_archive_path)
+                .labels(opts.labels.into_iter().collect())
+                .record_integrity(opts.record_integrity)
+                .save()
+                .await
+                .map_err(FfiError::from)?;
             Ok(r#"{"ok":true}"#.into())
         }))
     })
@@ -6306,6 +6962,119 @@ pub unsafe extern "C" fn msb_snapshot_import(
                 .await
                 .map_err(FfiError::from)?;
             Ok(snapshot_handle_json(&h).to_string())
+        }))
+    })
+}
+
+/// Import a dependent archive with an explicit base without changing the existing import ABI.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_snapshot_import_with_base(
+    cancel_id: u64,
+    archive: *const c_char,
+    dest: *const c_char,
+    base: *const c_char,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run_c(cancel_id, buf, buf_len, || {
+        let archive = PathBuf::from(unsafe { cstr(archive) }?);
+        let dest = unsafe { cstr(dest) }?;
+        let base = unsafe { cstr(base) }?;
+        let dest = if dest.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(dest))
+        };
+        Ok(Box::pin(async move {
+            let h = Snapshot::load_with_base(&archive, dest.as_deref(), &base)
+                .await
+                .map_err(FfiError::from)?;
+            Ok(snapshot_handle_json(&h).to_string())
+        }))
+    })
+}
+
+/// Import an archive with group selection without changing the existing import ABI.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_snapshot_import_with_options(
+    cancel_id: u64,
+    archive: *const c_char,
+    opts_json: *const c_char,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run_c(cancel_id, buf, buf_len, || {
+        let archive = PathBuf::from(unsafe { cstr(archive) }?);
+        let opts_raw = unsafe { cstr(opts_json) }?;
+        let opts: SnapshotLoadOptsJson = serde_json::from_str(&opts_raw)
+            .map_err(|error| FfiError::invalid_argument(error.to_string()))?;
+        Ok(Box::pin(async move {
+            let h = Snapshot::load_with_options(
+                &archive,
+                microsandbox::snapshot::LoadOpts {
+                    dest: opts.dest,
+                    base: opts.base,
+                    group: opts.group,
+                    set_head: opts.set_head,
+                },
+            )
+            .await
+            .map_err(FfiError::from)?;
+            Ok(snapshot_handle_json(&h).to_string())
+        }))
+    })
+}
+
+/// Import archives together with dependencies resolved within the batch and destination group.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_snapshot_import_many(
+    cancel_id: u64,
+    archives_json: *const c_char,
+    opts_json: *const c_char,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run_c(cancel_id, buf, buf_len, || {
+        let archives_raw = unsafe { cstr(archives_json) }?;
+        let archives: Vec<PathBuf> = serde_json::from_str(&archives_raw)
+            .map_err(|error| FfiError::invalid_argument(error.to_string()))?;
+        let opts_raw = unsafe { cstr(opts_json) }?;
+        let opts: SnapshotLoadOptsJson = serde_json::from_str(&opts_raw)
+            .map_err(|error| FfiError::invalid_argument(error.to_string()))?;
+        Ok(Box::pin(async move {
+            let handles = Snapshot::load_many(
+                &archives,
+                microsandbox::snapshot::LoadOpts {
+                    dest: opts.dest,
+                    base: opts.base,
+                    group: opts.group,
+                    set_head: opts.set_head,
+                },
+            )
+            .await
+            .map_err(FfiError::from)?;
+            let values = handles.iter().map(snapshot_handle_json).collect::<Vec<_>>();
+            Ok(serde_json::Value::Array(values).to_string())
+        }))
+    })
+}
+
+/// Read a group head, or select a `group:member` as its head.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_snapshot_group_head(
+    cancel_id: u64,
+    selector: *const c_char,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run_c(cancel_id, buf, buf_len, || {
+        let selector = unsafe { cstr(selector) }?;
+        Ok(Box::pin(async move {
+            let update = Snapshot::group_head(&selector)
+                .await
+                .map_err(FfiError::from)?;
+            serde_json::to_string(&update)
+                .map_err(|error| FfiError::invalid_argument(error.to_string()))
         }))
     })
 }
@@ -7046,7 +7815,196 @@ fn agent_error(err: microsandbox::AgentClientError) -> FfiError {
 
 #[cfg(test)]
 mod tests {
+    use microsandbox::{MicrosandboxError, RestoreKind};
+
+    use super::FfiError;
+
+    #[test]
+    fn missing_restore_bindings_keep_the_invalid_config_kind() {
+        let error = MicrosandboxError::MissingRestoreBindings {
+            missing: vec!["mount /data".into()],
+            restore: RestoreKind::Disk,
+        };
+        let message = error.to_string();
+
+        let ffi = FfiError::from(error);
+
+        assert_eq!(ffi.kind, super::error_kind::INVALID_CONFIG);
+        assert_eq!(ffi.message, message);
+    }
+
+    #[test]
+    fn tcp_network_aliases_are_exclusive() {
+        for name in ["max_connections", "max_tcp_connections"] {
+            let config: super::NetworkOpts = serde_json::from_value(serde_json::json!({
+                name: 0, "max_udp_connections": 7
+            }))
+            .unwrap();
+            assert_eq!(config.max_tcp_connections, Some(0));
+            assert_eq!(config.max_udp_connections, Some(7));
+        }
+        assert!(
+            serde_json::from_value::<super::NetworkOpts>(serde_json::json!({
+                "max_connections": 0, "max_tcp_connections": 64
+            }))
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn network_accept_queue_size_reaches_the_sandbox_config() {
+        let omitted: super::NetworkOpts = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(omitted.tcp_accept_queue_size, None);
+
+        let net: super::NetworkOpts = serde_json::from_value(serde_json::json!({
+            "ports": {"8080": 80}, "tcp_accept_queue_size": 4096
+        }))
+        .unwrap();
+        let builder = microsandbox::Sandbox::builder("accept-queue").image("alpine");
+        let Ok(builder) = super::apply_network(builder, &net) else {
+            panic!("apply_network rejected a valid accept queue size");
+        };
+        let config = builder.build().await.unwrap();
+        assert_eq!(config.spec.network.tcp_accept_queue_size, Some(4096));
+    }
+
+    #[tokio::test]
+    async fn explicit_header_disable_wins_over_header_fields() {
+        // `substitute_in_header_fields` enables header substitution, so the
+        // adapter must apply the explicit `headers` switch last. Otherwise a
+        // caller that sets `headers=false` would silently re-enable it.
+        let secret: super::SecretOpts = serde_json::from_value(serde_json::json!({
+            "env_var": "TOKEN",
+            "value": "synthetic",
+            "allow": ["example.com"],
+            "substitution": {"headers": false, "header_fields": ["authorization"], "query": true},
+        }))
+        .unwrap();
+        let builder = microsandbox::Sandbox::builder("secret-headers").image("alpine");
+        let Ok(builder) = super::apply_secret(builder, &secret) else {
+            panic!("apply_secret rejected valid options");
+        };
+        // The explicit disable must win, so the now-inert allowlist is rejected
+        // by validation. If the adapter re-enabled header substitution by
+        // applying the list last, the config would build successfully instead.
+        let error = builder.build().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("header field substitutions require header substitution"),
+            "{error}"
+        );
+    }
+
     use super::*;
+
+    #[tokio::test]
+    async fn bounded_stop_zero_does_not_poll_identity_lookup() {
+        let polled = std::sync::atomic::AtomicBool::new(false);
+        let error = stop_identified_with_timeout("worker", "local:42", Duration::ZERO, async {
+            polled.store(true, Ordering::SeqCst);
+            std::future::pending().await
+        })
+        .await
+        .unwrap_err();
+
+        assert!(!polled.load(Ordering::SeqCst));
+        assert_eq!(error.kind, error_kind::STOP_TIMEOUT);
+        assert!(error.message.contains("worker"));
+        assert!(error.message.contains("local:42"));
+        assert!(error.message.contains("0ns"));
+    }
+
+    #[tokio::test]
+    async fn bounded_stop_deadline_includes_pending_identity_lookup() {
+        struct DropProbe<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for DropProbe<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let polled = std::sync::atomic::AtomicBool::new(false);
+        let dropped = std::sync::atomic::AtomicBool::new(false);
+        let timeout = Duration::from_millis(20);
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            stop_identified_with_timeout("worker", "local:42", timeout, async {
+                let _probe = DropProbe(&dropped);
+                polled.store(true, Ordering::SeqCst);
+                std::future::pending().await
+            }),
+        )
+        .await
+        .expect("pending catalog lookup escaped the stop deadline")
+        .unwrap_err();
+
+        assert!(polled.load(Ordering::SeqCst));
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(error.kind, error_kind::STOP_TIMEOUT);
+        assert!(error.message.contains("worker"));
+        assert!(error.message.contains("local:42"));
+        assert!(error.message.contains("20ms"));
+    }
+
+    #[tokio::test]
+    async fn bounded_stop_preserves_identity_lookup_failure() {
+        let error =
+            stop_identified_with_timeout("worker", "local:42", Duration::from_secs(1), async {
+                Err(FfiError::new(
+                    error_kind::SANDBOX_REPLACED,
+                    "identity changed",
+                ))
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind, error_kind::SANDBOX_REPLACED);
+        assert_eq!(error.message, "identity changed");
+    }
+
+    #[test]
+    fn graceful_stop_timeout_preserves_absent_zero_and_explicit_values() {
+        let timeout = |has_timeout, millis| {
+            graceful_stop_timeout(has_timeout, millis)
+                .unwrap_or_else(|error| panic!("{}", error.message))
+        };
+        assert_eq!(timeout(0, 0), None);
+        assert_eq!(timeout(0, u64::MAX), None);
+        assert_eq!(timeout(1, 0), Some(Duration::ZERO));
+        assert_eq!(timeout(1, 30_000), Some(Duration::from_secs(30)));
+        assert_eq!(timeout(1, u64::MAX), Some(Duration::from_millis(u64::MAX)));
+        assert!(graceful_stop_timeout(2, 0).is_err());
+    }
+
+    #[test]
+    fn source_recovery_error_preserves_ffi_payload() {
+        let error = MicrosandboxError::SnapshotSourceRecovery(Box::new(
+            microsandbox::SnapshotSourceRecoveryError {
+                source_sandbox: "team/source".into(),
+                checkpoint_id: "checkpoint-1".into(),
+                checkpoint_root: "sha256:root".into(),
+                checkpoint_path: "/runtime/checkpoint".into(),
+                artifact: Some(microsandbox::PublishedSnapshotArtifact {
+                    kind: microsandbox::SnapshotArtifactKind::Archive,
+                    path: "/saved.msb".into(),
+                    snapshot_id: "snap_1".into(),
+                    digest: "sha256:descriptor".into(),
+                }),
+                detail: "thaw acknowledgement lost".into(),
+                publication_error: None,
+            },
+        ));
+        let message = error.to_string();
+        let payload: serde_json::Value =
+            serde_json::from_str(&FfiError::from(error).to_json()).unwrap();
+        assert_eq!(payload["kind"], "snapshot_source_recovery");
+        assert_eq!(payload["message"], message);
+        assert_eq!(payload["recovery"]["checkpoint_id"], "checkpoint-1");
+        assert_eq!(payload["recovery"]["artifact"]["kind"], "archive");
+        assert_eq!(payload["recovery"]["artifact"]["path"], "/saved.msb");
+        assert!(payload["recovery"]["publication_error"].is_null());
+    }
 
     #[test]
     fn sandbox_create_opts_preserves_explicit_zero_oci_upper_size() {
@@ -7180,6 +8138,82 @@ mod tests {
                 err.message.contains("must not contain"),
                 "pattern {bad:?} got: {}",
                 err.message
+            );
+        }
+    }
+
+    #[test]
+    fn branch_many_request_carries_disk_volumes() {
+        let request: BranchManyRequest = serde_json::from_str(
+            r#"{"names":["a"],"volumes":{"/data":{"disk":"/images/seed.img","fstype":"ext4","readonly":true}}}"#,
+        )
+        .unwrap();
+        assert_eq!(request.volumes.len(), 1);
+        let mount = volume_mount("/data", &request.volumes["/data"])
+            .unwrap_or_else(|error| panic!("{}", error.message));
+        match mount.build().unwrap() {
+            microsandbox::sandbox::VolumeMount::DiskImage {
+                host,
+                guest,
+                fstype,
+                options,
+                ..
+            } => {
+                assert_eq!(host, std::path::Path::new("/images/seed.img"));
+                assert_eq!(guest, "/data");
+                assert_eq!(fstype.as_deref(), Some("ext4"));
+                assert!(options.readonly);
+            }
+            _ => panic!("expected a disk mount"),
+        }
+        let plain: BranchManyRequest = serde_json::from_str(r#"{"names":["a"]}"#).unwrap();
+        assert!(plain.volumes.is_empty());
+    }
+
+    #[test]
+    fn owned_volume_wire_preserves_storage_and_flags() {
+        let spec: MountSpec = serde_json::from_str(
+            r#"{"owned":"disk","size_mib":10240,"noexec":true,"nosuid":true}"#,
+        )
+        .unwrap();
+        let mount = volume_mount("/data", &spec)
+            .unwrap_or_else(|error| panic!("{}", error.message))
+            .build()
+            .unwrap();
+        let json = serde_json::to_value(mount).unwrap();
+        assert_eq!(json["type"], "Owned");
+        assert_eq!(json["options"]["noexec"], true);
+        assert_eq!(json["options"]["nosuid"], true);
+        assert!(json.get("name").is_none());
+        assert!(json.get("host").is_none());
+    }
+
+    #[test]
+    fn owned_volume_rejects_legacy_source_and_invalid_storage() {
+        for payload in [
+            r#"{"owned":"dir","named":"shared"}"#,
+            r#"{"owned":"dir","bind":"/host"}"#,
+            r#"{"owned":"dir","disk":"/host/disk.raw"}"#,
+            r#"{"owned":"dir","format":"raw"}"#,
+            r#"{"owned":"unknown"}"#,
+        ] {
+            let spec = serde_json::from_str(payload).unwrap();
+            assert!(volume_mount("/data", &spec).is_err(), "{payload}");
+        }
+        for payload in [
+            r#"{"owned":"disk"}"#,
+            r#"{"owned":"disk","size_mib":0}"#,
+            r#"{"owned":"dir","size_mib":64}"#,
+            r#"{"owned":"disk","size_mib":64,"quota_mib":0}"#,
+            r#"{"owned":"disk","size_mib":64,"override_uid":0,"override_gid":0}"#,
+        ] {
+            let spec = serde_json::from_str(payload).unwrap();
+            assert!(
+                volume_mount("/data", &spec)
+                    .unwrap_or_else(|error| panic!("{}", error.message))
+                    .build()
+                    .is_err(),
+                "{payload}"
             );
         }
     }

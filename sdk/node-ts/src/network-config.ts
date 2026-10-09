@@ -61,10 +61,15 @@ export interface NetworkRateLimiterConfig {
 }
 
 /** Where in the HTTP request the secret value can be substituted. */
-export interface SecretInjection {
+export interface SecretSubstitution {
   readonly headers?: boolean;
-  readonly basicAuth?: boolean;
-  readonly queryParams?: boolean;
+  /**
+   * When set and non-empty, restrict header substitution to these field
+   * names (for example `["authorization"]`). A placeholder in any other
+   * header is treated as a disabled location.
+   */
+  readonly headerFields?: readonly string[];
+  readonly query?: boolean;
   readonly body?: boolean;
 }
 
@@ -90,12 +95,17 @@ export interface SecretEntry {
   readonly allowedHosts: readonly string[];
   readonly allowedHostPatterns: readonly string[];
   readonly allowAnyHost: boolean;
+  readonly passthroughHosts: readonly string[];
   readonly requireTlsIdentity: boolean;
-  readonly injection: SecretInjection;
+  readonly substitution: SecretSubstitution;
 }
 
 /** Proxy used for outbound sandbox connections. */
 export type OutboundProxy =
+  | {
+      readonly protocol: "http_connect";
+      readonly address: string;
+    }
   | {
       readonly protocol: "socks4";
       readonly address: string;
@@ -118,8 +128,14 @@ export interface NetworkConfig {
   readonly dns: DnsConfig | null;
   readonly tls: TlsConfig | null;
   readonly secrets: readonly SecretEntry[];
-  readonly secretViolation: ViolationAction | null;
+  readonly secretViolationAction: ViolationAction | null;
+  /** @deprecated Use maxTcpConnections instead. */
   readonly maxConnections: number | null;
+  readonly maxTcpConnections: number | null;
+  readonly maxUdpConnections?: number | null;
+  /** Accept-queue depth for published TCP port listeners. Absent means the default, 1024. */
+  readonly tcpAcceptQueueSize?: number | null;
+  readonly strict: boolean;
   readonly rateLimiter: NetworkRateLimiterConfig | null;
   readonly interface?: {
     readonly ipv4Pool?: string | null;
@@ -129,7 +145,13 @@ export interface NetworkConfig {
     readonly mac?: readonly number[] | null;
     readonly mtu?: number | null;
   };
+  readonly nat64Prefixes: readonly string[];
   readonly trustHostCAs: boolean;
   /** Canonical proxy configuration for outbound connections. */
   readonly outboundProxy: OutboundProxy | null;
+  /**
+   * HTTP denial responses are disabled by default. When enabled, denyMessage
+   * overrides the built-in body; `{host}` names the blocked hostname.
+   */
+  readonly http: { readonly denyResponse: boolean; readonly denyMessage?: string | null };
 }

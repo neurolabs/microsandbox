@@ -10,6 +10,8 @@ For the full API reference and longer guides, use the docs site:
 - [SDK overview](https://docs.microsandbox.dev/sdk/overview)
 - [Repository examples](../../examples/python)
 
+A complete runtime in the configured home (`MSB_HOME`, or `~/.microsandbox` by default) takes precedence over wheel binaries. Explicit binary paths still win. A partial home installation errors instead of falling back to the wheel. This also applies to the packaged CLI entry points.
+
 ## Features
 
 - Hardware VM isolation with a guest Linux kernel
@@ -83,6 +85,19 @@ await restarted.destroy()
 ## Common Examples
 
 These snippets assume you already have a live `sandbox: Sandbox`.
+
+### Fork a Live Sandbox
+
+Forking copies a running or paused local sandbox's disk and execution state into an independent child. Memory uses copy-on-write automatically. The source keeps its previous running or paused state. Host resources require explicit bindings; see [forking and resource bindings](https://docs.microsandbox.dev/sandboxes/snapshots#forking).
+
+```python
+child = await sandbox.fork("experiment")
+await child.stop()
+```
+
+Use `await sandbox.fork_many(["alice", "bob"])` to capture once for several children. Inspect every returned outcome: one child's startup failure does not remove successful siblings. See the [fork API reference](https://docs.microsandbox.dev/sdk/python/sandbox#forking).
+
+Restoring starts from a saved snapshot instead. Use `cow_memory=True` to request copy-on-write memory for a full-snapshot restore. A generation describes snapshot-history progression; a branch describes a distinct path through that history. The former live branch APIs and old CoW restore names remain deprecated aliases. See [restore migration notes](https://docs.microsandbox.dev/sandboxes/snapshots#migrating-restore-options) for the old-to-new names and language-specific deprecation notices.
 
 ### Command Execution
 
@@ -212,7 +227,7 @@ sandbox = await Sandbox.create(
         Secret.env(
             "OPENAI_API_KEY",
             value=os.environ["OPENAI_API_KEY"],
-            allow_hosts=["api.openai.com"],
+            allow=["api.openai.com"],
         ),
     ],
     replace=True,
@@ -301,6 +316,27 @@ for name, sample in (await all_sandbox_metrics()).items():
     print(f"{name}: {sample.cpu_percent:.1f}%")
 ```
 
+### Storage Usage and Runtime Cache Cleanup
+
+`Storage.usage()` reports the selected local backend's aggregate storage. Sandbox and snapshot handles also provide `storage_usage()` for their managed files. Reports contain raw integer byte counts; `None` means unknown. Logical sizes and allocated-block observations do not measure exclusive physical ownership on filesystems that share copy-on-write blocks.
+
+```python
+from microsandbox import Storage
+
+usage = await Storage.usage()
+print(usage.branch_memory.logical_bytes)
+
+preview = await Storage.prune(dry_run=True, older_than_seconds=600)
+for entry in preview.entries:
+    print(entry.path, entry.state, entry.logical_bytes)
+
+# Explicitly remove currently unused runtime RAM after rechecking ownership.
+result = await Storage.prune(older_than_seconds=600)
+print(result.logical_bytes_removed)
+```
+
+Pruning preserves durable snapshots, sandbox disks, named volumes, and stable lock files. Pending handoffs, live or paused VMs, and retained baselines protect their RAM. The report lists skipped entries and per-file errors, including partial success; `physical_bytes_reclaimed` remains `None`. Remote backend storage operations raise `UnsupportedError`. Static storage calls retain the backend selected when called, and handle methods retain the backend that created the handle.
+
 ### Typed Errors
 
 Python exports typed errors for the common SDK categories and falls back to `MicrosandboxError` for unmapped runtime variants. Catch specific errors when you need category-specific handling, and catch `MicrosandboxError` as the broad SDK base class.
@@ -321,10 +357,10 @@ except MicrosandboxError as exc:
 Installed wheels bundle the runtime files. The setup helpers are useful for source checkouts, shared runtime installs, and surfacing setup failures at process startup.
 
 ```python
-from microsandbox import install, is_installed
+from microsandbox import ensure_runtime
 
-if not is_installed():
-    await install()
+runtime = await ensure_runtime()
+print(runtime.msb_path, runtime.libkrunfw_path)
 ```
 
 ## More Documentation

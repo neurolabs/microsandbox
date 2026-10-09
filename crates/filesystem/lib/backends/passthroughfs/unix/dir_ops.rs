@@ -30,13 +30,15 @@ pub(crate) fn do_opendir(
     fs: &PassthroughFs,
     _ctx: Context,
     inode: u64,
-    _flags: u32,
+    flags: u32,
 ) -> io::Result<(Option<u64>, OpenOptions)> {
     let fd = inode::open_inode_fd(fs, inode, libc::O_RDONLY | libc::O_DIRECTORY)?;
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
 
     let handle = fs.next_handle.fetch_add(1, Ordering::Relaxed);
     let data = Arc::new(PassthroughDirHandle {
+        inode,
+        flags,
         file: RwLock::new(file),
         snapshot: std::sync::Mutex::new(None),
     });
@@ -115,7 +117,7 @@ pub(crate) fn do_readdirplus(
             continue;
         }
 
-        if name_bytes == init_binary::INIT_FILENAME {
+        if fs.injects_init() && name_bytes == init_binary::INIT_FILENAME {
             let entry = init_binary::init_entry(fs.cfg.entry_timeout, fs.cfg.attr_timeout);
             result.push((de, entry));
             continue;
@@ -177,7 +179,7 @@ pub(crate) fn do_readdirplus_for_each(
             name: name_bytes,
         };
 
-        if name_bytes == init_binary::INIT_FILENAME {
+        if fs.injects_init() && name_bytes == init_binary::INIT_FILENAME {
             let entry = init_binary::init_entry(fs.cfg.entry_timeout, fs.cfg.attr_timeout);
             if add_entry(dir_entry, entry)? == 0 {
                 break;

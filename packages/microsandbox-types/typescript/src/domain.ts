@@ -93,23 +93,54 @@ export type MountOptions = {
   override_gid?: number | null;
 };
 
+export type OwnedVolumeStorage = {
+  "kind": "directory";
+  /**
+   * Guest-write budget in MiB; `None` uses the directory-mount default.
+   */
+  quota_mib: number | null;
+} | {
+  "kind": "disk";
+  /**
+   * Required, positive capacity in MiB.
+   */
+  capacity_mib: number;
+};
+
 export type StatVirtualization = "strict" | "relaxed" | "off";
 
 export type HostPermissions = "private" | "mirror";
 
-export type SecretInjection = {
+export type SecretSubstitution = {
   /**
    * Substitute in HTTP headers (default: true).
    */
   headers: boolean;
   /**
-   * Substitute in HTTP Basic Auth (default: true).
+   * Restrict header substitution to these header field names.
+   *
+   * Requires [`headers`](Self::headers) to be true; a non-empty list with
+   * header substitution disabled is rejected as contradictory. An empty list
+   * (the default) allows every header field. When non-empty, the
+   * placeholder is substituted only in the named fields (matched ASCII
+   * case-insensitively); a placeholder found in any other header field is
+   * treated as a disabled location: on a verified allowed destination it is
+   * forwarded unchanged, while other destinations follow the violation
+   * policy.
+   *
+   * Prefer an allowlist containing only the intended credential header
+   * (typically `Authorization`). Substituting in every header lets an
+   * untrusted guest place the placeholder in a header the upstream host
+   * reflects back in its response (or otherwise exposes), which would let
+   * the guest read the real secret out of that response.
+   *
+   * Names must be valid HTTP field names (RFC 9110 `token`).
    */
-  basic_auth: boolean;
+  header_fields?: Array<string>;
   /**
    * Substitute in URL query parameters (default: false).
    */
-  query_params: boolean;
+  query: boolean;
   /**
    * Substitute in request body (default: false).
    *

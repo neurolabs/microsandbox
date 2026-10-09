@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   GiB,
   ImageBuilder,
@@ -98,6 +98,39 @@ describe("intoRootfsSource", () => {
 });
 
 describe("MountBuilder", () => {
+  it("preserves owned storage without a named or host source", () => {
+    const directory = new MountBuilder("/cache")
+      .owned({ quotaMib: 512 }).owner(0, 0).build();
+    expect(directory).toMatchObject({
+      kind: "owned", ownedKind: "dir", quotaMib: 512,
+      overrideUid: 0, overrideGid: 0,
+    });
+    expect(directory.host).toBeUndefined();
+    expect(directory.name).toBeUndefined();
+    const disk = new MountBuilder("/data")
+      .owned({ kind: "disk", sizeMib: 10240 }).noexec().nosuid().nodev().build();
+    expect(disk).toMatchObject({
+      kind: "owned", ownedKind: "disk", sizeMib: 10240,
+      noexec: true, nosuid: true, nodev: true,
+    });
+    expect(disk.host).toBeUndefined();
+    expect(disk.name).toBeUndefined();
+    expect(disk.statVirtualization).toBeUndefined();
+  });
+
+  it("rejects invalid owned storage settings", () => {
+    expect(() => new MountBuilder("/data").owned({ kind: "disk" }).build()).toThrow();
+    expect(() => new MountBuilder("/data").owned({ kind: "disk", sizeMib: 0 }).build()).toThrow();
+    expect(() => new MountBuilder("/data").owned({ sizeMib: 64 }).build()).toThrow();
+    expect(() => new MountBuilder("/data").owned({ kind: "disk", sizeMib: 64, quotaMib: 0 }).build()).toThrow();
+    expect(() => new MountBuilder("/data").owned({ kind: "disk", sizeMib: 64 }).owner(0, 0).build()).toThrow();
+    for (const size of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 32]) {
+      expect(() => new MountBuilder("/data").owned({ kind: "disk", sizeMib: size })).toThrow();
+    }
+    expect(() => new MountBuilder("/data").owned({ name: "shared" } as never)).toThrow(/unsupported owned/);
+    expect(() => new MountBuilder("/data").owned({ kind: "directory" } as never)).toThrow(/invalid owned/);
+  });
+
   it("builds a bind mount with default writeable flag", () => {
     const m = new MountBuilder("/data").bind("/host/data").build();
     expect(m).toEqual({
@@ -378,6 +411,43 @@ describe("PatchBuilder", () => {
 });
 
 describe("SandboxBuilder.build", () => {
+  it("opts into missing restore resources independently of object validation", () => {
+    const builder = Sandbox.restore("saved").name("missing-resources");
+    expect(builder.allowMissingResources()).toBe(builder);
+    expect(builder.externalMountPolicy("strict")).toBe(builder);
+    expect(Sandbox.builder("fresh")).not.toHaveProperty("allowMissingResources");
+  });
+
+  it.each(["strict", "relaxed"] as const)("accepts restore mount policy %s", (policy) => {
+    const builder = Sandbox.restore("saved").name("external-policy");
+    expect(builder.externalMountPolicy(policy)).toBe(builder);
+  });
+
+  it("rejects unknown external mount policies without consuming the builder", async () => {
+    const builder = Sandbox.restore("saved").name("external-policy");
+    expect(() => builder.externalMountPolicy("unsafe" as "strict"))
+      .toThrow("external mount policy must be strict or relaxed");
+    expect(builder.externalMountPolicy("strict")).toBe(builder);
+  });
+
+  it("keeps restore and creation surfaces separate", () => {
+    const create = Sandbox.builder("fresh");
+    const restore = Sandbox.restore("saved");
+    for (const method of ["fromSnapshot", "forked", "diskOnly", "snapshotBase", "externalMountPolicy"]) {
+      expect(create).not.toHaveProperty(method);
+    }
+    for (const method of ["image", "network", "cmd", "entrypoint", "replace", "create"]) {
+      expect(restore).not.toHaveProperty(method);
+    }
+  });
+
+  it("rejects a missing restore source and cannot reuse its consumed builder", async () => {
+    const builder = Sandbox.restore(`/tmp/msb-missing-restore-${process.pid}/snapshot.json`)
+      .name(`missing-restore-${process.pid}`);
+    await expect(builder.restore()).rejects.toThrow();
+    expect(() => builder.name("retry")).toThrow("RestoreBuilder already consumed");
+  });
+
   it("requires .image()", async () => {
     await expect(Sandbox.builder("x").build()).rejects.toThrow(
       InvalidConfigError,
@@ -412,7 +482,7 @@ describe("SandboxBuilder.build", () => {
     const cfg = await Sandbox.builder("x")
       .image("alpine")
       .proxy((p) => p.socks5("127.0.0.1:1080"))
-      .network((n) => n.maxConnections(64))
+      .network((n) => n.maxTcpConnections(64))
       .build();
 
     expect(cfg.network).toMatchObject({
@@ -420,7 +490,7 @@ describe("SandboxBuilder.build", () => {
         protocol: "socks5",
         address: "127.0.0.1:1080",
       },
-      maxConnections: 64,
+      maxTcpConnections: 64,
     });
   });
 
@@ -525,7 +595,7 @@ describe("SandboxBuilder.build", () => {
     expect((cleared.runtime as { cmd: string[] }).cmd).toEqual([]);
   });
 
-  it("collects stream and datagram vsock routes", async () => {
+  it.skipIf(process.platform === "win32")("collects stream and datagram vsock routes", async () => {
     const cfg = await Sandbox.builder("x")
       .image("alpine")
       .vsock("/run/host-api.sock", 5000)
@@ -539,6 +609,18 @@ describe("SandboxBuilder.build", () => {
       { hostSocket: "/run/host-api.sock", port: 5000, socketType: "stream" },
       { hostSocket: "/run/events.sock", port: 5001, socketType: "dgram" },
     ]);
+  });
+
+  it.runIf(process.platform === "win32")("collects named-pipe streams and rejects datagrams", async () => {
+    // Windows routes use local named pipes; datagrams require a Unix host.
+    const pipe = String.raw`\\.\pipe\host-api`;
+    const cfg = await Sandbox.builder("x").image("alpine").vsock(pipe, 5000).build();
+    expect(cfg.vsock).toMatchObject({
+      routes: [{ hostSocket: pipe, port: 5000, socketType: "stream" }],
+    });
+    await expect(
+      Sandbox.builder("x").image("alpine").vsockDgram(pipe, 5001).build(),
+    ).rejects.toThrow("unix hosts only");
   });
 
   it("keeps libkrunfwPath as a chainable compatibility alias", async () => {
@@ -637,6 +719,18 @@ describe("InterfaceOverridesBuilder", () => {
     expect(cfg.interface.ipv4Pool).toBe("172.31.240.0/24");
     expect(cfg.interface.ipv6Pool).toBe("fd7a:115c:a1e0:100::/56");
   });
+
+  it("defaults to strict hostname policy and supports opting out", () => {
+    expect(new NetworkBuilder().build().strict).toBe(true);
+    expect(new NetworkBuilder().strict(false).build().strict).toBe(false);
+  });
+
+  it("sets strict hostname policy mode", () => {
+    const cfg = new NetworkBuilder().strict(true).build() as {
+      strict: boolean;
+    };
+    expect(cfg.strict).toBe(true);
+  });
 });
 
 describe("NetworkBuilder.secretEnvSimple (3-arg shorthand)", () => {
@@ -650,51 +744,46 @@ describe("NetworkBuilder.secretEnvSimple (3-arg shorthand)", () => {
     };
     expect(cfg.secrets.secrets).toHaveLength(1);
     expect(cfg.secrets.secrets[0].envVar).toBe("API_KEY");
-    // Placeholder defaults to the value when omitted.
-    expect(cfg.secrets.secrets[0].placeholder).toBe("sk-abc");
+    // The guest must receive a token rather than the credential.
+    expect(cfg.secrets.secrets[0].placeholder).toBe("$MSB_API_KEY");
   });
 });
 
 describe("NetworkBuilder secret passthrough", () => {
-  it("builds global passthrough violation policy", () => {
+  it("builds a global blocking action", () => {
     const cfg = new NetworkBuilder()
-      .onSecretViolation((v) =>
-        v
-          .blockAndTerminate()
-          .passthroughHost("api.anthropic.com")
-          .passthroughHostPattern("*.anthropic.com"),
-      )
+      .secretViolationAction("block-and-terminate")
       .build() as {
       secrets: {
-        onViolation: {
-          passthrough: unknown[];
-        };
+        violationAction: string;
       };
     };
 
-    expect(cfg.secrets.onViolation).toEqual({
-      passthrough: [
-        { exact: "api.anthropic.com" },
-        { wildcard: "*.anthropic.com" },
-      ],
-    });
+    expect(cfg.secrets.violationAction).toBe("block-and-terminate");
   });
 
-  it("builds per-secret passthrough violation policy", () => {
-    const secret = new SecretBuilder()
-      .env("API_KEY")
-      .value("sk-abc")
-      .allowHost("api.github.com")
-      .onViolation((v) =>
-        v
-          .blockAndLog()
-          .passthroughHost("api.anthropic.com")
-          .passthroughHostPattern("*.anthropic.com"),
-      )
-      .build();
+  it.each(["allowPlaceholderFor", "allowPassthroughFor"] as const)(
+    "builds independent per-secret policies through %s",
+    (method) => {
+      const secret = new SecretBuilder()
+        .env("API_KEY")
+        .value("sk-abc")
+        .allow("api.github.com")[method]("api.anthropic.com")
+        .allowPlaceholderFor("*.anthropic.com")
+        .substituteInHeaderFields(["authorization"])
+        .substituteInBody(true)
+        .violationAction("block-and-log")
+        .build();
 
-    expect(secret.allowedHosts).toEqual(["api.github.com"]);
-  });
+      expect(secret.allowedHosts).toEqual(["api.github.com"]);
+      expect(secret.passthroughHosts).toEqual([
+        "api.anthropic.com",
+        "*.anthropic.com",
+      ]);
+      expect(secret.substitution.headerFields).toEqual(["authorization"]);
+      expect(secret.substitution.body).toBe(true);
+    },
+  );
 });
 
 describe("NetworkBuilder ports", () => {
@@ -889,5 +978,113 @@ describe("Stdin factory", () => {
     if (bytes.kind === "bytes") {
       expect(new TextDecoder().decode(bytes.data)).toBe("hello");
     }
+  });
+});
+
+describe("TCP connection limit aliases", () => {
+  it("keeps omitted limits distinct from explicit unlimited", () => {
+    const omitted = new NetworkBuilder().build();
+    expect(omitted.maxTcpConnections).toBeNull();
+    expect(omitted.maxUdpConnections).toBeNull();
+    const explicit = new NetworkBuilder().maxTcpConnections(64).maxUdpConnections(0).build();
+    expect(explicit.maxTcpConnections).toBe(64);
+    expect(explicit.maxUdpConnections).toBe(0);
+  });
+
+  it("keeps the deprecated builder and read accessor TCP-only", () => {
+    const config = new NetworkBuilder().maxConnections(0).maxUdpConnections(7).build();
+    expect(config.maxTcpConnections).toBe(0);
+    expect(config.maxConnections).toBe(0);
+    expect(config.maxUdpConnections).toBe(7);
+  });
+
+  it("uses the last builder value regardless of spelling", () => {
+    expect(new NetworkBuilder().maxConnections(0).maxTcpConnections(64).build().maxTcpConnections)
+      .toBe(64);
+    expect(new NetworkBuilder().maxTcpConnections(64).maxConnections(0).build().maxTcpConnections)
+      .toBe(0);
+  });
+
+  it("exposes both read names on a sandbox configuration", async () => {
+    const config = await Sandbox.builder("x").image("alpine")
+      .network(n => n.maxTcpConnections(64).maxUdpConnections(7)).build();
+    expect(config.network.maxTcpConnections).toBe(64);
+    expect(config.network.maxConnections).toBe(64);
+    expect(config.network.maxUdpConnections).toBe(7);
+  });
+});
+
+describe("TCP accept queue size", () => {
+  it("is absent unless set and survives into the sandbox configuration", async () => {
+    expect(new NetworkBuilder().build().tcpAcceptQueueSize).toBeUndefined();
+    expect(new NetworkBuilder().tcpAcceptQueueSize(4096).build().tcpAcceptQueueSize).toBe(4096);
+    const config = await Sandbox.builder("x").image("alpine").port(8080, 80)
+      .network(n => n.tcpAcceptQueueSize(4096)).build();
+    expect(config.network.tcpAcceptQueueSize).toBe(4096);
+  });
+
+  it("rejects values instead of wrapping or truncating them", () => {
+    // N-API's u32 conversion would turn the last three into 1.
+    for (const invalid of [0, 2_147_483_648, 4_294_967_297, -4_294_967_295, 1.5]) {
+      expect(() => new NetworkBuilder().tcpAcceptQueueSize(invalid))
+        .toThrow(/tcpAcceptQueueSize must be an integer/);
+      expect(() => Sandbox.restore("saved").tcpAcceptQueueSize(invalid))
+        .toThrow(/tcpAcceptQueueSize must be an integer/);
+    }
+  });
+});
+
+describe("NetworkBuilder HTTP denial messages", () => {
+  it("requires an explicit opt-in and preserves settings across callbacks", () => {
+    expect(new NetworkBuilder().build().http.denyResponse).toBe(false);
+    expect(new NetworkBuilder().http((h) => h.denyMessage("custom")).build().http.denyResponse).toBe(false);
+    const builder = new NetworkBuilder().http((h) => h.denyResponse(true));
+    expect(builder.build().http).toEqual({ denyResponse: true });
+    builder.http((h) => h.denyMessage("keep"));
+    expect(builder.build().http).toEqual({ denyResponse: true, denyMessage: "keep" });
+    builder.http((h) => h.denyResponse(false));
+    expect(builder.build().http).toEqual({ denyResponse: false, denyMessage: "keep" });
+    expect(new NetworkBuilder().http((h) => h.denyMessage("blocked {host}")).build().http.denyMessage)
+      .toBe("blocked {host}");
+    expect(new NetworkBuilder().http((h) => h.denyMessage("")).build().http.denyMessage).toBe("");
+    expect(new NetworkBuilder().http((h) => h).build().http.denyMessage).toBeUndefined();
+    expect(new NetworkBuilder().http((h) => h.denyMessage("keep")).http((h) => h).build().http.denyMessage).toBe("keep");
+  });
+});
+
+
+describe("restore copy-on-write memory naming", () => {
+  it("keeps forked as a fluent alias and warns only for the deprecated spelling", async () => {
+    const warning = vi.spyOn(process, "emitWarning").mockImplementation(() => {});
+    try {
+      const builder = Sandbox.restore("saved").name("child");
+      expect(builder.cowMemory()).toBe(builder);
+      expect(warning).not.toHaveBeenCalled();
+      expect(builder.forked()).toBe(builder);
+      expect(builder.forked()).toBe(builder);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(warning).toHaveBeenCalledTimes(1);
+      expect(warning.mock.calls[0][0]).toContain("use cowMemory()");
+      expect(warning.mock.calls[0][1]).toBe("DeprecationWarning");
+    } finally {
+      warning.mockRestore();
+    }
+  });
+});
+
+describe("SandboxBuilder TLS shortcut", () => {
+  it("enables interception through the native builder without resetting TLS options", async () => {
+    const defaults = await Sandbox.builder("tls-defaults").image("alpine")
+      .interceptTls()
+      .build();
+    expect(defaults.network.tls.enabled).toBe(true);
+
+    const config = await Sandbox.builder("tls-shortcut").image("alpine")
+      .network(n => n.tls(t => t.bypass("pinned.example.com")))
+      .interceptTls()
+      .build();
+
+    expect(config.network.tls.enabled).toBe(true);
+    expect(config.network.tls.bypass).toEqual(["pinned.example.com"]);
   });
 });

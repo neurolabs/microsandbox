@@ -2,8 +2,12 @@ use microsandbox::sandbox::{DestroyOptions, RestartOptions, SandboxHandle, Sandb
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
+use crate::jobs::{JsJob, job_error, json, list_options};
+
 use crate::error::to_napi_error;
+use crate::mount_builder::JsMountBuilder;
 use crate::sandbox::Sandbox;
+use crate::storage::{StorageItemUsageJs, item_to_js};
 use crate::types::*;
 
 //--------------------------------------------------------------------------------------------------
@@ -45,6 +49,23 @@ impl JsSandboxHandle {
 
 #[napi]
 impl JsSandboxHandle {
+    /// Retrieve a retained managed job in this sandbox.
+    #[napi]
+    pub async fn get_job(&self, id: String) -> Result<JsJob> {
+        let sb = &self.inner;
+        Ok(JsJob {
+            inner: sb.get_job(id).await.map_err(job_error)?,
+        })
+    }
+
+    /// List bounded managed-job metadata without creating processes.
+    #[napi]
+    pub async fn list_jobs(&self, all: bool, limit: u32, cursor: Option<String>) -> Result<String> {
+        let options = list_options(all, limit, cursor)?;
+        let sb = &self.inner;
+        json(sb.list_jobs_with(|_| options).await.map_err(job_error)?)
+    }
+
     /// Sandbox name. Names are limited to 128 UTF-8 bytes.
     #[napi(getter)]
     pub fn name(&self) -> String {
@@ -80,6 +101,13 @@ impl JsSandboxHandle {
     pub async fn refresh(&self) -> Result<JsSandboxHandle> {
         let handle = self.inner.refresh().await.map_err(to_napi_error)?;
         Ok(JsSandboxHandle::from_rust(handle))
+    }
+
+    /// Observe this sandbox's managed directory through its captured backend.
+    #[napi(js_name = "storageUsage")]
+    pub async fn storage_usage(&self) -> Result<StorageItemUsageJs> {
+        let report = self.inner.storage_usage().await.map_err(to_napi_error)?;
+        Ok(item_to_js(report))
     }
 
     /// Creation timestamp as ms since Unix epoch.
@@ -127,6 +155,25 @@ impl JsSandboxHandle {
     pub async fn modify(&self, options: Option<SandboxModifyOptions>) -> Result<String> {
         let builder = crate::sandbox::configure_modify(self.inner.modify(), options.as_ref())?;
         crate::sandbox::run_modify(builder, crate::sandbox::modify_dry_run(options.as_ref())).await
+    }
+
+    /// Compact root and owned-data disk prefixes of a running or stopped sandbox.
+    #[napi]
+    pub async fn compact(
+        &self,
+        layers: Option<f64>,
+        dry_run: Option<bool>,
+        disk: Option<String>,
+        root_disk_only: Option<bool>,
+    ) -> Result<String> {
+        crate::sandbox::run_compact(
+            self.inner.compact(),
+            layers,
+            dry_run.unwrap_or(false),
+            disk,
+            root_disk_only.unwrap_or(false),
+        )
+        .await
     }
 
     /// Start the sandbox (attached mode) — returns a live Sandbox handle.
@@ -180,13 +227,122 @@ impl JsSandboxHandle {
 
     /// Stop the sandbox gracefully.
     ///
-    /// Lets the sandbox finish writing any pending data to disk before
-    /// it exits, so files written inside the sandbox aren't lost across
-    /// a later restart. Waits 10_000 ms by default before force-kill;
-    /// override with `stopWithTimeout(timeoutMs)`.
+    /// Wait indefinitely for the targeted runtime to finish gracefully and release
+    /// ownership. No implicit kill; use `stopWithTimeout` for a bounded wait.
     #[napi]
     pub async fn stop(&self) -> Result<()> {
         self.inner.stop().await.map_err(to_napi_error)
+    }
+
+    /// @deprecated Use fork for live execution duplication.
+    #[napi(ts_return_type = "Promise<Sandbox>")]
+    pub fn branch<'env>(
+        &self,
+        env: &'env Env,
+        name: String,
+        record_integrity: Option<bool>,
+        guest_flush: Option<String>,
+        volumes: Option<Vec<&mut JsMountBuilder>>,
+    ) -> Result<PromiseRaw<'env, Sandbox>> {
+        self.fork(env, name, record_integrity, guest_flush, volumes)
+    }
+
+    /// @deprecated Use forkMany for live execution duplication.
+    #[napi(ts_return_type = "Promise<Array<JsBranchOutcome>>")]
+    pub fn branch_many<'env>(
+        &self,
+        env: &'env Env,
+        names: Vec<String>,
+        record_integrity: Option<bool>,
+        guest_flush: Option<String>,
+        volumes: Option<Vec<&mut JsMountBuilder>>,
+    ) -> Result<PromiseRaw<'env, Vec<crate::sandbox::JsBranchOutcome>>> {
+        self.fork_many(env, names, record_integrity, guest_flush, volumes)
+    }
+
+    /// Create an independent local CoW child without a durable full snapshot.
+    #[napi(ts_return_type = "Promise<Sandbox>")]
+    pub fn fork<'env>(
+        &self,
+        env: &'env Env,
+        name: String,
+        record_integrity: Option<bool>,
+        guest_flush: Option<String>,
+        volumes: Option<Vec<&mut JsMountBuilder>>,
+    ) -> Result<PromiseRaw<'env, Sandbox>> {
+        // Capture mounts and local paths before the async operation starts.
+        let volumes = JsMountBuilder::take_fork_volumes(
+            volumes.unwrap_or_default(),
+            self.inner.backend_kind().as_str() == "local",
+        );
+        let mut builder = self.inner.fork(name);
+
+        env.spawn_future(async move {
+            let volumes = volumes?;
+            builder =
+                builder.guest_flush(crate::snapshot_builder::guest_flush_policy(guest_flush)?);
+            if record_integrity.unwrap_or(false) {
+                builder = builder.record_integrity();
+            }
+            for (guest, mount) in volumes {
+                builder = builder.volume(guest, |_| mount);
+            }
+            Ok(Sandbox::from_rust(
+                builder.fork().await.map_err(to_napi_error)?,
+            ))
+        })
+    }
+
+    /// Capture once and return individual child startup outcomes.
+    #[napi(ts_return_type = "Promise<Array<JsBranchOutcome>>")]
+    pub fn fork_many<'env>(
+        &self,
+        env: &'env Env,
+        names: Vec<String>,
+        record_integrity: Option<bool>,
+        guest_flush: Option<String>,
+        volumes: Option<Vec<&mut JsMountBuilder>>,
+    ) -> Result<PromiseRaw<'env, Vec<crate::sandbox::JsBranchOutcome>>> {
+        // Capture mounts and local paths before the async operation starts.
+        let volumes = JsMountBuilder::take_fork_volumes(
+            volumes.unwrap_or_default(),
+            self.inner.backend_kind().as_str() == "local",
+        );
+        let mut builder = self.inner.fork_many(names);
+
+        env.spawn_future(async move {
+            let volumes = volumes?;
+            builder =
+                builder.guest_flush(crate::snapshot_builder::guest_flush_policy(guest_flush)?);
+            if record_integrity.unwrap_or(false) {
+                builder = builder.record_integrity();
+            }
+            for (guest, mount) in volumes {
+                builder = builder.volume(guest, |_| mount);
+            }
+            Ok(crate::sandbox::branch_outcomes(
+                builder.fork().await.map_err(to_napi_error)?,
+            ))
+        })
+    }
+
+    /// Explicit resident pause through host control.
+    #[napi]
+    pub async fn pause(&self, guest_flush: Option<String>) -> Result<()> {
+        if guest_flush.is_some() {
+            return self
+                .inner
+                .pause_with_guest_flush(crate::snapshot_builder::guest_flush_policy(guest_flush)?)
+                .await
+                .map_err(to_napi_error);
+        }
+        self.inner.pause().await.map_err(to_napi_error)
+    }
+
+    /// Explicit resident resume through host control.
+    #[napi]
+    pub async fn resume(&self) -> Result<()> {
+        self.inner.resume().await.map_err(to_napi_error)
     }
 
     /// Request graceful shutdown without waiting.
@@ -195,8 +351,8 @@ impl JsSandboxHandle {
         self.inner.request_stop().await.map_err(to_napi_error)
     }
 
-    /// Stop the sandbox gracefully with an explicit timeout in
-    /// milliseconds before escalation.
+    /// One graceful-completion budget in milliseconds. Timeout rejects without killing;
+    /// zero expires before dispatch.
     #[napi]
     pub async fn stop_with_timeout(&self, timeout_ms: u32) -> Result<()> {
         let timeout = std::time::Duration::from_millis(timeout_ms.into());
@@ -318,7 +474,7 @@ impl JsSandboxHandle {
         crate::sandbox::spawn_log_stream_from_stream(stream).await
     }
 
-    /// Snapshot this (stopped) sandbox under a bare name.
+    /// Snapshot this sandbox's disk under a bare name, preserving its running/paused state.
     ///
     /// Resolves under `~/.microsandbox/snapshots/<name>/`. Move
     /// artifacts with `Snapshot.save`/`Snapshot.load`.

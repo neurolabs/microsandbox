@@ -5,15 +5,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
+use microsandbox::SandboxConfigPatch;
 use microsandbox::sandbox::{
-    DiskImageFormat, EnvVar, HandoffInit, HostPermissions, MountBuilder, NetworkSpecPatch, Patch,
-    PullPolicy, Rlimit, RlimitResource, SandboxBuilder, SandboxConfigPatch, SandboxPolicyPatch,
-    SandboxResourcesPatch, SandboxRuntimeOptionsPatch, SecurityProfile, StatVirtualization,
-    VolumeMount,
+    DiskImageFormat, EnvVar, GuestClockPolicy, HandoffInit, HostPermissions, MountBuilder, Patch,
+    PullPolicy, Rlimit, RlimitResource, SandboxBuilder, SandboxPolicyPatch, SandboxResourcesPatch,
+    SandboxRuntimeOptionsPatch, SandboxSpecPatch, SecurityProfile, StatVirtualization, VolumeMount,
 };
 #[cfg(feature = "net")]
 use microsandbox::sandbox::{
-    DnsConfigPatch, NetworkPolicy, NetworkProfile, SecretsConfigPatch, TlsConfigPatch,
+    DnsConfigPatch, HttpConfigPatch, NetworkPolicy, NetworkProfile, NetworkSpecPatch,
+    SecretsConfigPatch, TlsConfigPatch,
 };
 use microsandbox_image::RegistryAuth;
 use microsandbox_types_macros::ConfigPatch;
@@ -45,7 +46,7 @@ const MAX_CONFIG_BYTES: usize = 16 * 1024 * 1024;
 pub struct ResolvedSandboxConfig {
     #[cfg(test)]
     input: SandboxConfigInput,
-    config_patch: SandboxConfigPatch,
+    config_patch: SandboxSpecPatch,
     config_scripts: BTreeMap<String, String>,
     image: Option<ResolvedImage>,
     registry_auth: Option<RegistryAuth>,
@@ -110,6 +111,7 @@ struct SandboxConfigInput {
     shell: Option<String>,
     user: Option<String>,
     hostname: Option<String>,
+    guest_clock: Option<GuestClockPolicy>,
     security: Option<SecurityInput>,
     entrypoint: Option<Vec<String>>,
     cmd: Option<Vec<String>>,
@@ -126,6 +128,7 @@ struct SandboxConfigInput {
     network: Option<NetworkInput>,
     #[config_patch(merge_with = merge_secrets)]
     secrets: Option<BTreeMap<String, SecretInput>>,
+    secret_violation_action: Option<microsandbox_types::SecretViolationAction>,
     #[config_patch(merge)]
     scripts: Option<BTreeMap<String, String>>,
     ports: Option<Vec<String>>,
@@ -148,6 +151,7 @@ struct RuntimeConfigInput {
     shell: Option<String>,
     user: Option<String>,
     hostname: Option<String>,
+    guest_clock: Option<GuestClockPolicy>,
     security: Option<SecurityInput>,
     entrypoint: Option<Vec<String>>,
     cmd: Option<Vec<String>>,
@@ -372,7 +376,7 @@ struct AppendPatchInput {
 #[serde(untagged)]
 enum NetworkInput {
     Preset(NetworkPreset),
-    Object(NetworkConfigInput),
+    Object(Box<NetworkConfigInput>),
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -394,8 +398,21 @@ struct NetworkConfigInput {
     dns: Option<DnsInput>,
     #[config_patch(nested)]
     tls: Option<TlsInput>,
+    strict: Option<bool>,
     trust_host_cas: Option<bool>,
-    max_connections: Option<usize>,
+    #[serde(alias = "max_connections")]
+    max_tcp_connections: Option<usize>,
+    max_udp_connections: Option<usize>,
+    tcp_accept_queue_size: Option<u32>,
+    #[config_patch(nested)]
+    http: Option<HttpInput>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, ConfigPatch)]
+#[serde(default, deny_unknown_fields)]
+struct HttpInput {
+    deny_response: Option<bool>,
+    deny_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, ConfigPatch)]
@@ -419,8 +436,12 @@ struct TlsInput {
 #[serde(default, deny_unknown_fields)]
 struct SecretInput {
     value: Option<SecretValueInput>,
+    placeholder: Option<String>,
     allow: Option<Vec<String>>,
-    inject: Option<Vec<SecretInjectionInput>>,
+    #[config_patch(nested)]
+    substitution: Option<SecretSubstitutionInput>,
+    passthrough: Option<Vec<String>>,
+    violation_action: Option<microsandbox_types::SecretViolationAction>,
     require_tls_identity: Option<bool>,
 }
 
@@ -435,12 +456,13 @@ enum SecretValueInput {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum SecretInjectionInput {
-    Headers,
-    BasicAuth,
-    QueryParams,
+#[derive(Debug, Clone, Default, Deserialize, ConfigPatch)]
+#[serde(default, deny_unknown_fields)]
+struct SecretSubstitutionInput {
+    headers: Option<bool>,
+    header_fields: Option<Vec<String>>,
+    query: Option<bool>,
+    body: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -458,7 +480,7 @@ impl SandboxConfigInput {
         if let Some(ports) = self.ports.take() {
             let network = self
                 .network
-                .get_or_insert_with(|| NetworkInput::Object(NetworkConfigInput::default()));
+                .get_or_insert_with(|| NetworkInput::Object(Box::default()));
             network.object_mut().ports = Some(match network.object_mut().ports.take() {
                 Some(mut nested) => {
                     nested.extend(ports);
@@ -477,16 +499,16 @@ impl NetworkInput {
                 policy: Some(policy),
                 ..NetworkConfigInput::default()
             },
-            Self::Object(input) => input,
+            Self::Object(input) => *input,
         }
     }
 
     fn object_mut(&mut self) -> &mut NetworkConfigInput {
         if let Self::Preset(policy) = self {
-            *self = Self::Object(NetworkConfigInput {
+            *self = Self::Object(Box::new(NetworkConfigInput {
                 policy: Some(*policy),
                 ..NetworkConfigInput::default()
-            });
+            }));
         }
         let Self::Object(input) = self else {
             unreachable!("preset was normalized to an object")
@@ -537,7 +559,7 @@ impl ResolvedSandboxConfig {
             None => builder,
         };
         let mut builder = builder
-            .overlay(self.config_patch.clone())
+            .overlay(SandboxConfigPatch::new().spec(self.config_patch.clone()))
             .config_scripts(self.config_scripts.clone());
         if let Some(auth) = self.registry_auth.clone() {
             builder = builder.registry(|registry| registry.auth(auth));
@@ -662,7 +684,7 @@ pub fn resolve(sources: &SandboxConfigSources) -> anyhow::Result<ResolvedSandbox
                 reject_scoped_wrapper(&source.path, "network", "--net-conf")?;
                 let network = load_typed::<NetworkConfigInput>(&source.path, "network config")?;
                 SandboxConfigInput {
-                    network: Some(NetworkInput::Object(network)),
+                    network: Some(NetworkInput::Object(Box::new(network))),
                     ..SandboxConfigInput::default()
                 }
             }
@@ -684,6 +706,7 @@ pub fn resolve(sources: &SandboxConfigSources) -> anyhow::Result<ResolvedSandbox
                     shell: scoped.shell,
                     user: scoped.user,
                     hostname: scoped.hostname,
+                    guest_clock: scoped.guest_clock,
                     security: scoped.security,
                     entrypoint: scoped.entrypoint,
                     cmd: scoped.cmd,
@@ -737,14 +760,19 @@ pub fn resolve(sources: &SandboxConfigSources) -> anyhow::Result<ResolvedSandbox
         validate_script_name(name)?;
     }
 
-    let mut config_patch = materialize_config_patch(&input)?;
+    let config_patch = materialize_config_patch(&input)?;
     #[cfg(feature = "net")]
-    {
-        let network = materialize_network_patch(input.network.as_ref(), input.secrets.as_ref())?;
-        config_patch = config_patch.network(network);
-    }
+    let config_patch = {
+        let network = materialize_network_patch(
+            input.network.as_ref(),
+            input.secrets.as_ref(),
+            input.secret_violation_action.as_ref(),
+        )?;
+        config_patch.network(network)
+    };
     #[cfg(not(feature = "net"))]
-    if input.network.is_some() || input.secrets.is_some() {
+    if input.network.is_some() || input.secrets.is_some() || input.secret_violation_action.is_some()
+    {
         anyhow::bail!("network and secret config require an msb build with networking enabled");
     }
 
@@ -1133,8 +1161,8 @@ fn bind_mount_separator(spec: &str) -> Option<usize> {
 // Functions: Image and Runtime
 //--------------------------------------------------------------------------------------------------
 
-fn materialize_config_patch(input: &SandboxConfigInput) -> anyhow::Result<SandboxConfigPatch> {
-    let mut config_patch = SandboxConfigPatch::new();
+fn materialize_config_patch(input: &SandboxConfigInput) -> anyhow::Result<SandboxSpecPatch> {
+    let mut config_patch = SandboxSpecPatch::new();
     if let Some(policy) = input.pull_policy {
         config_patch = config_patch.pull_policy(match policy {
             PullPolicyInput::Missing => PullPolicy::IfMissing,
@@ -1191,6 +1219,9 @@ fn materialize_config_patch(input: &SandboxConfigInput) -> anyhow::Result<Sandbo
     }
     if let Some(value) = &input.hostname {
         runtime = runtime.hostname(value.clone());
+    }
+    if let Some(value) = input.guest_clock {
+        runtime = runtime.guest_clock(value);
     }
     if let Some(value) = input.security {
         config_patch = config_patch.security_profile(match value {
@@ -1573,6 +1604,7 @@ fn validate_script_name(name: &str) -> anyhow::Result<()> {
 fn materialize_network_patch(
     input: Option<&NetworkInput>,
     secrets: Option<&BTreeMap<String, SecretInput>>,
+    violation_action: Option<&microsandbox_types::SecretViolationAction>,
 ) -> anyhow::Result<NetworkSpecPatch> {
     use microsandbox_network::dns::Nameserver;
     use microsandbox_network::policy::Action;
@@ -1638,23 +1670,21 @@ fn materialize_network_patch(
     }
 
     if let Some(ports) = input.ports {
-        let ports = ports
-            .iter()
-            .map(|value| {
-                let (host_bind, host_port, guest_port, udp) = parse_port_mapping(value)?;
-                Ok(PublishedPortSpec {
-                    host_port,
-                    guest_port,
-                    protocol: if udp {
-                        PortProtocol::Udp
-                    } else {
-                        PortProtocol::Tcp
+        let mut expanded = Vec::new();
+        for value in ports {
+            for port in parse_port_mapping(&value)? {
+                expanded.push(PublishedPortSpec {
+                    host_port: port.host_port,
+                    guest_port: port.guest_port,
+                    protocol: match port.protocol {
+                        microsandbox_network::config::PortProtocol::Udp => PortProtocol::Udp,
+                        microsandbox_network::config::PortProtocol::Tcp => PortProtocol::Tcp,
                     },
-                    host_bind: host_bind.to_string(),
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        patch = patch.ports(ports);
+                    host_bind: port.host_bind.to_string(),
+                });
+            }
+        }
+        patch = patch.ports(expanded);
     }
     if let Some(dns) = input.dns {
         let mut value = DnsConfigPatch::new();
@@ -1701,14 +1731,42 @@ fn materialize_network_patch(
         }
         patch = patch.tls(value);
     }
-    if let Some(entries) = materialized_secrets {
-        patch = patch.secrets(SecretsConfigPatch::new().secrets(entries));
+    if materialized_secrets.is_some() || violation_action.is_some() {
+        let mut secrets = SecretsConfigPatch::new();
+        if let Some(entries) = materialized_secrets {
+            secrets = secrets.secrets(entries);
+        }
+        if let Some(action) = violation_action {
+            secrets = secrets.violation_action(action.clone());
+        }
+        patch = patch.secrets(secrets);
+    }
+    if let Some(enabled) = input.strict {
+        patch = patch.strict(enabled);
     }
     if let Some(enabled) = input.trust_host_cas {
         patch = patch.trust_host_cas(enabled);
     }
-    if let Some(max) = input.max_connections {
-        patch = patch.max_connections(max);
+    if let Some(max) = input.max_tcp_connections {
+        patch = patch.max_tcp_connections(max);
+    }
+    if let Some(max) = input.max_udp_connections {
+        patch = patch.max_udp_connections(max);
+    }
+    if let Some(size) = input.tcp_accept_queue_size {
+        // Refuse here rather than at launch, where the runtime would reject the whole network.
+        microsandbox_network::config::TcpAcceptQueueSize::try_from(size)?;
+        patch = patch.tcp_accept_queue_size(size);
+    }
+    if let Some(http) = input.http {
+        let mut value = HttpConfigPatch::new();
+        if let Some(enabled) = http.deny_response {
+            value = value.deny_response(enabled);
+        }
+        if let Some(message) = http.deny_message {
+            value = value.deny_message(message);
+        }
+        patch = patch.http(value);
     }
     Ok(patch)
 }
@@ -1718,7 +1776,7 @@ fn materialize_secrets(
     input: &BTreeMap<String, SecretInput>,
 ) -> anyhow::Result<Vec<microsandbox_types::SecretEntry>> {
     use microsandbox::sandbox::SecretSource;
-    use microsandbox_types::{HostPattern, SecretInjection};
+    use microsandbox_types::{HostPattern, SecretSubstitution};
     use zeroize::Zeroizing;
 
     let mut entries = Vec::with_capacity(input.len());
@@ -1739,32 +1797,35 @@ fn materialize_secrets(
             .clone()
             .unwrap_or_default()
             .into_iter()
-            .map(|host| {
-                if host.starts_with("*.") {
-                    HostPattern::Wildcard(host)
-                } else {
-                    HostPattern::Exact(host)
-                }
-            })
+            .map(|host| HostPattern::parse(&host))
             .collect();
-        let injection_scopes = input
-            .inject
+        let passthrough_hosts = input
+            .passthrough
             .clone()
-            .unwrap_or_else(|| vec![SecretInjectionInput::Headers]);
-        let injection = SecretInjection {
-            headers: injection_scopes.contains(&SecretInjectionInput::Headers),
-            basic_auth: injection_scopes.contains(&SecretInjectionInput::BasicAuth),
-            query_params: injection_scopes.contains(&SecretInjectionInput::QueryParams),
-            body: false,
+            .unwrap_or_default()
+            .into_iter()
+            .map(|host| HostPattern::parse(&host))
+            .collect();
+        // Defaults are applied only after all sparse layers have been merged.
+        let substitution = input.substitution.clone().unwrap_or_default();
+        let substitution = SecretSubstitution {
+            headers: substitution.headers.unwrap_or(true),
+            header_fields: substitution.header_fields.clone().unwrap_or_default(),
+            query: substitution.query.unwrap_or(false),
+            body: substitution.body.unwrap_or(false),
         };
         entries.push(microsandbox_types::SecretEntry {
             env_var: name.clone(),
             value,
             source,
-            placeholder: microsandbox_utils::secret::default_placeholder(name),
+            placeholder: input
+                .placeholder
+                .clone()
+                .unwrap_or_else(|| microsandbox_utils::secret::default_placeholder(name)),
             allowed_hosts,
-            injection,
-            on_violation: None,
+            substitution,
+            passthrough_hosts,
+            violation_action: input.violation_action.clone(),
             require_tls_identity: input.require_tls_identity.unwrap_or(true),
         });
     }
@@ -1785,6 +1846,119 @@ fn parse_duration_millis(value: &str) -> anyhow::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_config_tcp_aliases_reject_duplicate_names() {
+        for key in ["max_connections", "max_tcp_connections"] {
+            let config: NetworkConfigInput = serde_json::from_value(serde_json::json!({
+                key: 0, "max_udp_connections": 7
+            }))
+            .unwrap();
+            assert_eq!(config.max_tcp_connections, Some(0));
+            assert_eq!(config.max_udp_connections, Some(7));
+        }
+        assert!(
+            serde_json::from_value::<NetworkConfigInput>(serde_json::json!({
+                "max_connections": 0, "max_tcp_connections": 64
+            }))
+            .is_err()
+        );
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn network_config_tcp_accept_queue_size_is_validated_before_launch() {
+        let input = |value: u32| -> NetworkInput {
+            serde_json::from_value(serde_json::json!({ "tcp_accept_queue_size": value })).unwrap()
+        };
+        let mut network = microsandbox_types::NetworkSpec::default();
+        materialize_network_patch(Some(&input(4096)), None, None)
+            .unwrap()
+            .apply_to(&mut network);
+        assert_eq!(network.tcp_accept_queue_size, Some(4096));
+
+        for invalid in [0, 2_147_483_648] {
+            let error = materialize_network_patch(Some(&input(invalid)), None, None).unwrap_err();
+            assert!(
+                error.to_string().contains("TCP accept queue size"),
+                "{invalid}: {error}"
+            );
+        }
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn published_port_ranges_lower_from_yaml_and_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = write_config(
+            dir.path(),
+            "ports.yaml",
+            r#"
+image: alpine
+ports: ["8000-8002:80-82"]
+network:
+  policy: open
+  ports: ["0.0.0.0:10240-11264:10240-11264/udp"]
+"#,
+        );
+        let sources = SandboxConfigSources::default().source(SandboxConfigKind::Root, root);
+        let resolved = resolve(&sources).unwrap();
+        let builder = resolved.apply(SandboxBuilder::new("port-ranges")).unwrap();
+        let opts = crate::commands::common::SandboxOpts {
+            port: vec!["[::1]:9000-9001:90-91/tcp".to_owned()],
+            ..Default::default()
+        };
+        let builder =
+            crate::commands::common::apply_sandbox_opts_after_config(builder, &opts).unwrap();
+        let config = resolved
+            .image(None, None)
+            .unwrap()
+            .apply(builder)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let ports = &config.spec.network.ports;
+        assert_eq!(ports.len(), 1030);
+        for (offset, port) in ports[..1025].iter().enumerate() {
+            assert_eq!(port.host_port, 10240 + offset as u16);
+            assert_eq!(port.guest_port, 10240 + offset as u16);
+            assert_eq!(port.host_bind, "0.0.0.0");
+            assert_eq!(port.protocol, microsandbox_types::PortProtocol::Udp);
+        }
+        for (offset, port) in ports[1025..1028].iter().enumerate() {
+            assert_eq!(port.host_port, 8000 + offset as u16);
+            assert_eq!(port.guest_port, 80 + offset as u16);
+            assert_eq!(port.host_bind, "127.0.0.1");
+            assert_eq!(port.protocol, microsandbox_types::PortProtocol::Tcp);
+        }
+        for (offset, port) in ports[1028..].iter().enumerate() {
+            assert_eq!(port.host_port, 9000 + offset as u16);
+            assert_eq!(port.guest_port, 90 + offset as u16);
+            assert_eq!(port.host_bind, "::1");
+            assert_eq!(port.protocol, microsandbox_types::PortProtocol::Tcp);
+        }
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn published_port_ranges_reject_invalid_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        for (spec, expected) in [
+            ("8000-8002:80-81", "equal lengths"),
+            ("8000-8002:82-80/udp", "guest port range is reversed"),
+        ] {
+            for contents in [
+                format!("network:\n  ports: [\"{spec}\"]\n"),
+                format!("ports: [\"{spec}\"]\n"),
+            ] {
+                let root = write_config(dir.path(), "ports.yaml", &contents);
+                let sources = SandboxConfigSources::default().source(SandboxConfigKind::Root, root);
+                let error = resolve(&sources).unwrap_err();
+                assert!(error.to_string().contains(expected), "{error}");
+            }
+        }
+    }
 
     fn write_config(dir: &Path, name: &str, contents: &str) -> PathBuf {
         let path = dir.join(name);
@@ -1813,6 +1987,7 @@ workdir: "/lower"
 shell: "/bin/sh"
 user: "lower"
 hostname: "lower"
+guest_clock: sync
 security: default
 entrypoint: ["lower-entrypoint"]
 cmd: ["lower-command"]
@@ -1848,6 +2023,7 @@ workdir: "/higher"
 shell: "/bin/bash"
 user: "higher"
 hostname: "higher"
+guest_clock: "off"
 security: restricted
 entrypoint: ["higher-entrypoint"]
 cmd: ["higher-command"]
@@ -1906,6 +2082,7 @@ registry: { username: higher, password_env: PATH }
             shell,
             user,
             hostname,
+            guest_clock,
             security,
             entrypoint,
             cmd,
@@ -1917,6 +2094,7 @@ registry: { username: higher, password_env: PATH }
             patches,
             network,
             secrets,
+            secret_violation_action,
             scripts,
             ports,
         } = resolved.input;
@@ -1939,6 +2117,7 @@ registry: { username: higher, password_env: PATH }
         assert_eq!(shell.as_deref(), Some("/bin/bash"));
         assert_eq!(user.as_deref(), Some("higher"));
         assert_eq!(hostname.as_deref(), Some("higher"));
+        assert_eq!(guest_clock, Some(GuestClockPolicy::Off));
         assert!(matches!(security, Some(SecurityInput::Restricted)));
         assert_eq!(entrypoint.as_deref().unwrap(), ["higher-entrypoint"]);
         assert_eq!(cmd.as_deref().unwrap(), ["higher-command"]);
@@ -1969,6 +2148,7 @@ registry: { username: higher, password_env: PATH }
         ));
         assert!(network.is_none());
         assert!(secrets.is_none());
+        assert!(secret_violation_action.is_none());
         assert_eq!(scripts.unwrap()["inherited"], "echo lower");
         assert!(ports.is_none());
     }
@@ -2064,12 +2244,13 @@ network:
     verify_upstream: false
     block_quic: true
   trust_host_cas: true
-  max_connections: 10
+  max_tcp_connections: 10
 secrets:
   TOKEN:
     value: lower
     allow: ["lower.example.com"]
-    inject: [headers]
+    substitution:
+      headers: false
     require_tls_identity: false
   KEEP:
     value: keep
@@ -2086,8 +2267,9 @@ dns:
   nameservers: ["1.1.1.1"]
 tls:
   bypass: ["higher.example.com"]
+strict: true
 trust_host_cas: false
-max_connections: 20
+max_tcp_connections: 20
 "#,
         );
         let ports = write_config(dir.path(), "ports.yaml", "ports: [\"9000:9000\"]\n");
@@ -2097,7 +2279,8 @@ max_connections: 20
             r#"
 TOKEN:
   value: "${PATH}"
-  inject: [query_params]
+  substitution:
+    query: true
 ADD:
   value: add
   allow: ["add.example.com"]
@@ -2129,8 +2312,9 @@ ADD:
         assert_eq!(tls.bypass.as_deref().unwrap(), ["higher.example.com"]);
         assert_eq!(tls.verify_upstream, Some(false));
         assert_eq!(tls.block_quic, Some(true));
+        assert_eq!(network.strict, Some(true));
         assert_eq!(network.trust_host_cas, Some(false));
-        assert_eq!(network.max_connections, Some(20));
+        assert_eq!(network.max_tcp_connections, Some(20));
 
         let secrets = input.secrets.unwrap();
         let token = &secrets["TOKEN"];
@@ -2139,10 +2323,9 @@ ADD:
             Some(SecretValueInput::Environment { ref env }) if env == "PATH"
         ));
         assert_eq!(token.allow.as_deref().unwrap(), ["lower.example.com"]);
-        assert_eq!(
-            token.inject.as_deref().unwrap(),
-            [SecretInjectionInput::QueryParams]
-        );
+        let substitution = token.substitution.as_ref().unwrap();
+        assert_eq!(substitution.headers, Some(false));
+        assert_eq!(substitution.query, Some(true));
         assert_eq!(token.require_tls_identity, Some(false));
         assert!(matches!(
             secrets["KEEP"].value,
@@ -2194,7 +2377,18 @@ allow: ["scoped.example.com"]
             .source(SandboxConfigKind::Runtime, runtime)
             .source(SandboxConfigKind::Network, network);
 
-        let resolved = resolve(&sources).unwrap();
+        let resolved = resolve(&sources);
+        // The same input must fail explicitly without networking, not drop its policy.
+        if !cfg!(feature = "net") {
+            assert!(
+                resolved
+                    .unwrap_err()
+                    .to_string()
+                    .contains("networking enabled")
+            );
+            return;
+        }
+        let resolved = resolved.unwrap();
         let env = resolved.input.env.unwrap();
         assert_eq!(env.get("KEEP").map(String::as_str), Some("root"));
         assert_eq!(env.get("CHANGE").map(String::as_str), Some("scoped"));
@@ -2529,7 +2723,11 @@ scripts:
 network:
   policy: public
   allow: ["api.openai.com"]
-  max_connections: 64
+  strict: true
+  max_tcp_connections: 64
+  http:
+    deny_response: true
+    deny_message: "Blocked: {host}"
 secrets:
   TOKEN:
     value: "literal-test-value"
@@ -2537,7 +2735,17 @@ secrets:
 "#,
         );
         let sources = SandboxConfigSources::default().source(SandboxConfigKind::Root, root);
-        let resolved = resolve(&sources).unwrap();
+        let resolved = resolve(&sources);
+        if !cfg!(feature = "net") {
+            assert!(
+                resolved
+                    .unwrap_err()
+                    .to_string()
+                    .contains("networking enabled")
+            );
+            return;
+        }
+        let resolved = resolved.unwrap();
         let image = resolved.image(None, None).unwrap();
         let builder = resolved.apply(SandboxBuilder::new("config-test")).unwrap();
         let config = image.apply(builder).unwrap().build().await.unwrap();
@@ -2551,7 +2759,13 @@ secrets:
             config.spec.runtime.scripts.get("start").unwrap(),
             "#!/bin/bash\npython app.py\n"
         );
-        assert_eq!(config.spec.network.max_connections, Some(64));
+        assert_eq!(config.spec.network.max_tcp_connections, Some(64));
+        assert!(config.spec.network.http.deny_response);
+        assert_eq!(
+            config.spec.network.http.deny_message.as_deref(),
+            Some("Blocked: {host}")
+        );
+        assert!(config.spec.network.strict);
         assert_eq!(config.spec.network.ports.len(), 0);
         assert!(config.spec.network.tls.as_ref().unwrap().enabled);
         assert!(config.spec.network.dns.is_none());
@@ -2577,34 +2791,150 @@ secrets:
             r#"
 TOKEN:
   value: "${HOST_TOKEN}"
-  inject: [headers, basic_auth]
+  substitution:
+    headers: false
+    body: true
+  passthrough: [api.anthropic.com]
 "#,
         );
         let sources = SandboxConfigSources::default()
             .source(SandboxConfigKind::Root, root)
             .source(SandboxConfigKind::Secrets, scoped);
 
-        let resolved = resolve(&sources).unwrap();
+        let resolved = resolve(&sources);
+        if !cfg!(feature = "net") {
+            assert!(
+                resolved
+                    .unwrap_err()
+                    .to_string()
+                    .contains("networking enabled")
+            );
+            return;
+        }
+        let resolved = resolved.unwrap();
         let secret = &resolved.input.secrets.unwrap()["TOKEN"];
         assert_eq!(
             secret.allow.as_deref(),
             Some(["api.example.com".to_string()].as_slice())
         );
         assert_eq!(secret.require_tls_identity, Some(false));
+        let substitution = secret.substitution.as_ref().unwrap();
+        assert_eq!(substitution.headers, Some(false));
+        assert_eq!(substitution.body, Some(true));
         assert_eq!(
-            secret.inject.as_deref(),
-            Some(
-                [
-                    SecretInjectionInput::Headers,
-                    SecretInjectionInput::BasicAuth,
-                ]
-                .as_slice()
-            )
+            secret.passthrough.as_deref(),
+            Some(["api.anthropic.com".to_string()].as_slice())
         );
         assert!(matches!(
             secret.value,
             Some(SecretValueInput::Environment { ref env }) if env == "HOST_TOKEN"
         ));
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn partial_secret_layers_preserve_policy_until_materialization() {
+        use microsandbox_types::{SecretSource, SecretViolationAction};
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = write_config(
+            dir.path(),
+            "base.yaml",
+            r#"
+secret_violation_action: block-and-terminate
+secrets:
+  TOKEN:
+    placeholder: custom-placeholder
+    allow: [a.example]
+    substitution: { headers: false, query: true }
+    passthrough: [b.example]
+    violation_action: block
+    require_tls_identity: false
+"#,
+        );
+        let higher = write_config(
+            dir.path(),
+            "higher.yaml",
+            r#"
+secret_violation_action: block-and-log
+secrets:
+  TOKEN:
+    value: { $msb_env: HOST_TOKEN }
+    substitution: { body: true }
+"#,
+        );
+        let resolved = resolve(
+            &SandboxConfigSources::default()
+                .source(SandboxConfigKind::Root, base)
+                .source(SandboxConfigKind::Root, higher),
+        )
+        .unwrap();
+        let mut spec = microsandbox_types::SandboxSpec::default();
+        resolved.config_patch.apply_to(&mut spec);
+        let secrets = spec.network.secrets.unwrap();
+        assert_eq!(secrets.violation_action, SecretViolationAction::BlockAndLog);
+        let secret = &secrets.secrets[0];
+        assert_eq!(secret.source, Some(SecretSource::env("HOST_TOKEN")));
+        assert!(secret.value.is_empty());
+        assert_eq!(secret.placeholder, "custom-placeholder");
+        assert_eq!(
+            secret.allowed_hosts,
+            vec![microsandbox_types::HostPattern::Exact("a.example".into())]
+        );
+        assert!(!secret.substitution.headers);
+        assert!(secret.substitution.query);
+        assert!(secret.substitution.body);
+        assert_eq!(
+            secret.passthrough_hosts,
+            vec![microsandbox_types::HostPattern::Exact("b.example".into())]
+        );
+        assert_eq!(secret.violation_action, Some(SecretViolationAction::Block));
+        assert!(!secret.require_tls_identity);
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn action_only_secret_patch_keeps_existing_entries() {
+        let patch = materialize_network_patch(
+            None,
+            None,
+            Some(&microsandbox_types::SecretViolationAction::BlockAndTerminate),
+        )
+        .unwrap();
+        let mut network = microsandbox_types::NetworkSpec {
+            secrets: Some(microsandbox_types::SecretsConfig {
+                secrets: vec![
+                    serde_json::from_value(serde_json::json!({
+                        "env_var": "TOKEN", "placeholder": "$TOKEN",
+                    }))
+                    .unwrap(),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        patch.apply_to(&mut network);
+        let secrets = network.secrets.unwrap();
+        assert_eq!(secrets.secrets.len(), 1);
+        assert_eq!(
+            secrets.violation_action,
+            microsandbox_types::SecretViolationAction::BlockAndTerminate
+        );
+        assert!(network.tls.is_none());
+    }
+
+    #[cfg(not(feature = "net"))]
+    #[test]
+    fn action_only_config_requires_networking() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = write_config(
+            dir.path(),
+            "action.yaml",
+            "secret_violation_action: block-and-terminate\n",
+        );
+        let error = resolve(&SandboxConfigSources::default().source(SandboxConfigKind::Root, root))
+            .unwrap_err();
+        assert!(error.to_string().contains("networking enabled"));
     }
 
     #[test]
