@@ -216,21 +216,15 @@ pub(crate) use crate::backends::shared::platform::vol_path;
 pub(crate) fn do_lookup(fs: &PassthroughFs, parent: u64, name: &CStr) -> io::Result<Entry> {
     crate::backends::shared::name_validation::validate_name(name)?;
 
-    // Determine the child's type (without following a symlink) to support
-    // dir-only deny patterns. If the type cannot be determined, treat the entry
-    // as a directory so a dir-only rule still hides it rather than being skipped
-    // on a transient stat failure.
     let parent_fd = get_inode_fd(fs, parent)?;
-    let is_dir = if fs.deny.has_dir_only_patterns() {
-        match platform::fstatat_nofollow(parent_fd.raw(), name) {
-            Ok(st) => platform::mode_file_type(st.st_mode) == platform::MODE_DIR,
-            Err(_) => true,
-        }
-    } else {
-        false
-    };
 
-    if fs.deny_matches_name(parent, name.to_bytes(), is_dir) {
+    // Name-only and path-only patterns do not depend on the entry type, so they
+    // can be decided before opening anything. Directory-only patterns need the
+    // type of the object actually returned, so each platform lookup resolves it
+    // from the opened object and denies there (see `do_lookup_linux` and
+    // `do_lookup_macos`); checking a separate stat here would let a concurrent
+    // file-to-directory replacement skip the rule.
+    if !fs.deny.has_dir_only_patterns() && fs.deny_matches_name(parent, name.to_bytes(), false) {
         return Err(platform::enoent());
     }
 
@@ -238,7 +232,7 @@ pub(crate) fn do_lookup(fs: &PassthroughFs, parent: u64, name: &CStr) -> io::Res
     return do_lookup_linux(fs, parent, parent_fd.raw(), name);
 
     #[cfg(target_os = "macos")]
-    return do_lookup_macos(fs, parent_fd.raw(), name);
+    return do_lookup_macos(fs, parent, parent_fd.raw(), name);
 }
 
 /// Linux lookup: open → statx(AT_EMPTY_PATH) → patched_stat (3 syscalls).
@@ -287,6 +281,19 @@ fn do_lookup_linux(
     }
 
     let st = platform::statx_to_stat64(&stx);
+
+    // Directory-only deny patterns must be evaluated against the type of the
+    // object the handle actually references, not a separate stat. The `statx`
+    // above is on the opened `O_PATH` fd, so the decision and the returned entry
+    // cannot disagree even under concurrent host replacement.
+    if fs.deny.has_dir_only_patterns() {
+        let is_dir = platform::mode_file_type(st.st_mode) == platform::MODE_DIR;
+        if fs.deny_matches_name(parent, name.to_bytes(), is_dir) {
+            unsafe { libc::close(fd) };
+            return Err(platform::enoent());
+        }
+    }
+
     let mnt_id = stx.stx_mnt_id;
     let alt_key = InodeAltKey::new(st.st_ino, st.st_dev, mnt_id);
     let alias = NamespaceAlias::new(parent, name.to_bytes());
@@ -347,8 +354,24 @@ fn do_lookup_linux(
 /// path scheme references files by device+inode identity, making it
 /// stable across renames — similar to Linux's `/proc/self/fd/N`.
 #[cfg(target_os = "macos")]
-fn do_lookup_macos(fs: &PassthroughFs, parent_fd: i32, name: &CStr) -> io::Result<Entry> {
+fn do_lookup_macos(
+    fs: &PassthroughFs,
+    parent: u64,
+    parent_fd: i32,
+    name: &CStr,
+) -> io::Result<Entry> {
     let st = platform::fstatat_nofollow(parent_fd, name)?;
+
+    // Directory-only deny patterns are evaluated against the object this single
+    // stat (and the `/.vol` open below, which references the same device+inode)
+    // resolves, so the decision and the returned entry cannot disagree.
+    if fs.deny.has_dir_only_patterns() {
+        let is_dir = platform::mode_file_type(st.st_mode) == platform::MODE_DIR;
+        if fs.deny_matches_name(parent, name.to_bytes(), is_dir) {
+            return Err(platform::enoent());
+        }
+    }
+
     let alt_key = InodeAltKey::new(platform::stat_ino(&st), platform::stat_dev(&st));
 
     // Open a real fd for xattr access via /.vol/dev/ino.

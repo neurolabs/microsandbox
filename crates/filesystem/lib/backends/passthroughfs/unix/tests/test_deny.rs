@@ -441,6 +441,28 @@ fn test_deny_dir_only_lookup_serves_same_named_file() {
     assert_ne!(entry.inode, 0);
 }
 
+/// A dir-only path pattern is decided from the opened entry, so under an active
+/// path pattern it still hides the directory and spares a same-named file
+/// outside the pattern's path.
+#[test]
+fn test_deny_dir_only_path_pattern_lookup() {
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec!["sub/node_modules/".to_string()],
+        ..cfg
+    });
+    sb.host_create_dir("sub");
+    sb.host_create_dir("sub/node_modules");
+    sb.host_create_dir("other");
+    sb.host_create_file("other/node_modules", b"not a dir");
+
+    let sub = sb.lookup_root("sub").unwrap();
+    TestSandbox::assert_errno(sb.lookup(sub.inode, "node_modules"), LINUX_ENOENT);
+
+    // The same-named file outside the pattern's path is served.
+    let other = sb.lookup_root("other").unwrap();
+    assert_ne!(sb.lookup(other.inode, "node_modules").unwrap().inode, 0);
+}
+
 /// A dir-only pattern allows creating a same-named file but rejects mkdir.
 #[test]
 fn test_deny_dir_only_mkdir_rejected_but_file_create_allowed() {

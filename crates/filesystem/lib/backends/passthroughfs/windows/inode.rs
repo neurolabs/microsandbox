@@ -241,21 +241,30 @@ impl PassthroughFs {
             return Ok(init_entry(self.cfg.entry_timeout, self.cfg.attr_timeout));
         }
 
-        // Determine the child's type so a dir-only deny pattern like
-        // `node_modules/` hides the directory but not a same-named file. Only
-        // needed when a dir-only pattern is active. If the child cannot be
-        // stat'ed, treat it as a directory so a dir-only rule still hides it
-        // rather than being skipped on a transient stat failure.
         let path = self.child_path(parent, name)?;
-        let is_dir = if self.deny.has_dir_only_patterns() {
-            self.safe_metadata(&path)
-                .map(|m| m.file_type().is_dir())
-                .unwrap_or(true)
-        } else {
-            false
-        };
 
-        if self.deny_matches_name(parent, name, is_dir) {
+        // A dir-only deny pattern (`node_modules/`) needs the child's type.
+        // Resolve it from the same metadata used to build the returned entry, so
+        // a concurrent file-to-directory replacement cannot skip the rule. If the
+        // child cannot be stat'ed, treat it as a directory so a dir-only rule
+        // still hides it rather than being skipped on a transient stat failure.
+        if self.deny.has_dir_only_patterns() {
+            let metadata = self.safe_metadata(&path);
+            let is_dir = metadata
+                .as_ref()
+                .map(|m| m.file_type().is_dir())
+                .unwrap_or(true);
+            if self.deny_matches_name(parent, name, is_dir) {
+                return Err(linux_error(LINUX_ENOENT));
+            }
+            let metadata = metadata?;
+            let data = self.intern_path(path)?;
+            return self.entry_from_metadata(&metadata, data.as_ref());
+        }
+
+        // Name-only and path-only patterns do not depend on the entry type, so
+        // they are decided before the path is interned.
+        if self.deny_matches_name(parent, name, false) {
             return Err(linux_error(LINUX_ENOENT));
         }
 
