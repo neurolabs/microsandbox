@@ -693,49 +693,10 @@ fn test_deny_path_pattern_fails_closed_on_unresolvable_parent() {
 // Tests: known limitations pinned as #[ignore] (behavior documented, not yet enforced)
 //--------------------------------------------------------------------------------------------------
 
-/// Pins the H1 ancestor-rename laundering gap: renaming an ancestor directory
-/// moves a denied path-pattern match to a non-denied name.
-///
-/// `deny: ["sub/.env"]` is location-based. Renaming `sub` -> `x` succeeds
-/// (neither `sub` nor `x` matches the pattern), and the subsequent lookup of
-/// `x/.env` reconstructs the path from the new anchor, so the file is served.
-/// This is the documented confidentiality limitation of path patterns on a
-/// writable mount (see docs/sandboxes/volumes.mdx); it is intentionally
-/// `#[ignore]`d because the bypass is current behavior, not a bug to fail on.
-#[test]
-#[ignore = "known limitation: path patterns are location-based and laundered by ancestor rename"]
-fn test_deny_ancestor_rename_launders_path_pattern() {
-    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["sub/.env".to_string()],
-        ..cfg
-    });
-    sb.host_create_dir("sub");
-    sb.host_create_file("sub/.env", b"secret");
-
-    // The denied path is hidden before the rename.
-    let sub = sb.lookup_root("sub").unwrap();
-    TestSandbox::assert_errno(sb.lookup(sub.inode, ".env"), LINUX_ENOENT);
-
-    // Renaming the ancestor launders the pattern: neither 'sub' nor 'x'
-    // matches 'sub/.env', so the rename is allowed and the file is served
-    // under the new anchor.
-    sb.fs
-        .rename(
-            sb.ctx(),
-            ROOT_INODE,
-            &TestSandbox::cstr("sub"),
-            ROOT_INODE,
-            &TestSandbox::cstr("x"),
-            0,
-        )
-        .unwrap();
-    let x = sb.lookup_root("x").unwrap();
-    let entry = sb.lookup(x.inode, ".env");
-    assert!(
-        !entry.is_ok(),
-        "known limitation: laundered .env is currently served"
-    );
-}
+// The ancestor-rename laundering gap is closed at configuration time: a path
+// pattern (`sub/.env`) is rejected on a writable mount (see the SDK/runtime
+// validators), so it can only be configured on a read-only mount, where the
+// guest cannot rename. Only name-based gaps remain below.
 
 /// Pins the symlink-target gap: deny matching checks the entry name, not the
 /// resolved symlink target.

@@ -177,6 +177,18 @@ impl DenyList {
 /// the process, so concurrent builders on the same mount root do not collide.
 static CASE_PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Whether the mount should match deny patterns case-insensitively.
+///
+/// On Windows this is always `true`. NTFS supports per-directory case
+/// sensitivity that a mount-root probe cannot observe, so matching the whole
+/// mount case-insensitively guarantees a differently-cased name can never
+/// bypass a deny pattern; a case-sensitive NTFS directory may over-match
+/// `.env` versus `.ENV`, which is the safe direction.
+#[cfg(target_os = "windows")]
+fn mount_is_case_insensitive(_root: &Path, _readonly: bool) -> bool {
+    true
+}
+
 /// Detect whether the filesystem holding `root` respectively the folder 'root'
 /// is case-insensitive.
 ///
@@ -198,6 +210,7 @@ static CASE_PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// over-matching only hides a few differently-cased names that almost never
 /// coexist, whereas under-matching on a case-insensitive host would let a
 /// pattern like `.env` be bypassed by requesting `.ENV`.
+#[cfg(not(target_os = "windows"))]
 fn mount_is_case_insensitive(root: &Path, readonly: bool) -> bool {
     if readonly {
         return !ro_fs_is_case_sensitive(root);
@@ -245,9 +258,11 @@ fn ro_fs_is_case_sensitive(root: &Path) -> bool {
         return false;
     }
     // Known case-sensitive filesystem magic numbers (ext2/3/4, xfs, btrfs,
-    // tmpfs, reiserfs, jfs, f2fs, bcachefs, nilfs2, ocfs2). Everything else
-    // (overlayfs, vfat/exfat/ntfs, remote/fuseblk/cifs/nfs, unknown, future
-    // types) is treated as case-insensitive.
+    // tmpfs, reiserfs, jfs, f2fs, bcachefs, nilfs2, ocfs2, overlayfs). Everything
+    // else (vfat/exfat/ntfs, remote/fuseblk/cifs/nfs, unknown, future types) is
+    // treated as case-insensitive, because those filesystems' case behavior is
+    // server- or configuration-dependent and cannot be positively established
+    // without a write probe. Over-matching is the safe direction.
     matches!(
         st.f_type as u32,
         0x0000_EF53 // ext2/3/4
@@ -260,6 +275,7 @@ fn ro_fs_is_case_sensitive(root: &Path) -> bool {
             | 0xCA45_1A4E // bcachefs
             | 0x0000_3434 // nilfs2
             | 0x7461_636F // ocfs2
+            | 0x794C_7630 // overlayfs
     )
 }
 
