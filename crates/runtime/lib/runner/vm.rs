@@ -3632,6 +3632,21 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
         );
     }
 
+    // Path deny patterns (`sub/.env`) are matched against the entry's
+    // mount-relative path, so a writable guest can rename an ancestor directory
+    // to launder them. Reject them here; name-only and directory-only patterns
+    // stay valid, and a read-only mount cannot rename.
+    if !readonly
+        && let Some(pattern) = deny
+            .iter()
+            .find(|pattern| pattern.trim_end_matches('/').contains('/'))
+    {
+        return Err(format!(
+            "deny pattern {pattern:?} is a path pattern, which a writable mount can bypass by \
+             renaming an ancestor directory; use a name-only pattern, or mark the mount `ro`"
+        ));
+    }
+
     Ok(ParsedMountSpec {
         tag: tag.to_string(),
         host_path: host_path.to_string(),
@@ -4273,7 +4288,9 @@ mod tests {
 
     #[test]
     fn test_parse_mount_spec_deny_repeatable() {
-        let p = parse_mount_spec("foo:/host/data:deny=.env,deny=*.log,deny=sub/secret").unwrap();
+        // Path patterns require a read-only mount.
+        let p = parse_mount_spec("foo:/host/data:ro,deny=.env,deny=*.log,deny=sub/secret").unwrap();
+        assert!(p.readonly);
         assert_eq!(p.deny, vec![".env", "*.log", "sub/secret"]);
     }
 
@@ -4313,6 +4330,20 @@ mod tests {
             err.contains("empty deny pattern"),
             "expected empty-pattern rejection, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_parse_mount_spec_rejects_path_deny_on_writable_mount() {
+        let err = parse_mount_spec("foo:/host/data:deny=sub/.env").unwrap_err();
+        assert!(
+            err.contains("path pattern"),
+            "expected path-pattern rejection, got: {err}"
+        );
+
+        // Read-only mounts cannot rename an ancestor, so path patterns are valid.
+        let p = parse_mount_spec("foo:/host/data:ro,deny=sub/.env").unwrap();
+        assert_eq!(p.deny, vec!["sub/.env".to_string()]);
+        assert!(p.readonly);
     }
 
     #[test]

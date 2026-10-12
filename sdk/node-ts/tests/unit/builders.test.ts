@@ -372,6 +372,8 @@ describe("MountBuilder", () => {
   it("propagates deny on a bind mount", () => {
     const m = new MountBuilder("/data")
       .bind("/host/data")
+      // Path patterns (`sub/secret`) require a read-only mount.
+      .readonly()
       .deny([".env", "sub/secret"])
       .build();
     expect(m).toMatchObject({

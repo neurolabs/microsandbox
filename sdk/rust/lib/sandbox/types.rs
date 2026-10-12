@@ -601,6 +601,9 @@ impl MountBuilder {
         for pattern in &self.deny {
             validate_deny_pattern(pattern)?;
         }
+        if !self.options.readonly {
+            reject_writable_path_patterns(&self.deny)?;
+        }
         if self.disk_format.is_some() && !is_disk {
             return Err(crate::MicrosandboxError::InvalidConfig(
                 ".format() is only valid for disk image mounts".into(),
@@ -1349,6 +1352,9 @@ fn validate_volume_mount(mount: &VolumeMount) -> crate::MicrosandboxResult<()> {
             for pattern in deny {
                 validate_deny_pattern(pattern)?;
             }
+            if !options.readonly {
+                reject_writable_path_patterns(deny)?;
+            }
         }
         VolumeMount::Named {
             name,
@@ -1436,6 +1442,37 @@ fn validate_deny_pattern(pattern: &str) -> crate::MicrosandboxResult<()> {
     if pattern.trim() != pattern {
         return Err(crate::MicrosandboxError::InvalidConfig(format!(
             "deny pattern must not have leading or trailing whitespace: {pattern:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether a deny pattern targets a mount-relative path (an interior `/`).
+///
+/// A trailing `/` only marks a directory-only pattern (`node_modules/`), which
+/// still matches by component name, so it does not make the pattern a path
+/// pattern.
+fn is_path_deny_pattern(pattern: &str) -> bool {
+    pattern.trim_end_matches('/').contains('/')
+}
+
+/// Reject path deny patterns on a writable mount.
+///
+/// Path patterns (`sub/.env`, `**/env.secret`) are matched against the entry's
+/// reconstructed mount-relative path, so a guest with a writable mount can
+/// rename an ancestor directory and make the denied path stop matching. Refuse
+/// them at configuration time rather than accept a rule a writable guest can
+/// launder. Name-only (`.env`) and directory-only (`node_modules/`) patterns
+/// match anywhere and stay valid, and read-only mounts cannot rename, so path
+/// patterns remain valid there.
+fn reject_writable_path_patterns(patterns: &[String]) -> crate::MicrosandboxResult<()> {
+    if let Some(pattern) = patterns
+        .iter()
+        .find(|pattern| is_path_deny_pattern(pattern))
+    {
+        return Err(crate::MicrosandboxError::InvalidConfig(format!(
+            "deny pattern {pattern:?} is a path pattern, which a writable mount can bypass by \
+             renaming an ancestor directory; use a name-only pattern, or mark the mount read-only"
         )));
     }
     Ok(())
@@ -1765,6 +1802,8 @@ mod tests {
     fn test_mount_builder_deny_on_bind() {
         let mount = MountBuilder::new("/data")
             .bind("/host/data")
+            // Path patterns (`sub/secret`) require a read-only mount.
+            .readonly()
             .deny([".env", "*.log", "sub/secret"])
             .build()
             .unwrap();
@@ -1831,6 +1870,31 @@ mod tests {
                 "pattern {bad:?} should be rejected, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn test_mount_builder_rejects_path_deny_on_writable_mount() {
+        let err = MountBuilder::new("/data")
+            .bind("/host/data")
+            .deny(["sub/.env"])
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("path pattern"), "{err}");
+
+        // Read-only mounts cannot rename an ancestor, so path patterns stay valid.
+        MountBuilder::new("/data")
+            .bind("/host/data")
+            .readonly()
+            .deny(["sub/.env"])
+            .build()
+            .unwrap();
+
+        // Name-only and directory-only patterns match anywhere and stay valid.
+        MountBuilder::new("/data")
+            .bind("/host/data")
+            .deny([".env", "node_modules/"])
+            .build()
+            .unwrap();
     }
 
     #[test]
@@ -2035,6 +2099,42 @@ mod tests {
             follow_root_symlinks: false,
             quota_mib: None,
             deny: vec![".env".to_string(), "node_modules/".to_string()],
+        };
+
+        validate_volume_mounts(std::slice::from_mut(&mut mount)).unwrap();
+    }
+
+    #[test]
+    fn test_validate_volume_mounts_rejects_path_deny_on_writable_bind() {
+        let mut mount = VolumeMount::Bind {
+            host: PathBuf::from("/host/data"),
+            guest: "/data".to_string(),
+            options: MountOptions::default(),
+            stat_virtualization: StatVirtualization::Strict,
+            host_permissions: HostPermissions::Private,
+            follow_root_symlinks: false,
+            quota_mib: None,
+            deny: vec!["sub/.env".to_string()],
+        };
+
+        let err = validate_volume_mounts(std::slice::from_mut(&mut mount)).unwrap_err();
+        assert!(err.to_string().contains("path pattern"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_volume_mounts_accepts_path_deny_on_readonly_bind() {
+        let mut mount = VolumeMount::Bind {
+            host: PathBuf::from("/host/data"),
+            guest: "/data".to_string(),
+            options: MountOptions {
+                readonly: true,
+                ..MountOptions::default()
+            },
+            stat_virtualization: StatVirtualization::Strict,
+            host_permissions: HostPermissions::Private,
+            follow_root_symlinks: false,
+            quota_mib: None,
+            deny: vec!["sub/.env".to_string()],
         };
 
         validate_volume_mounts(std::slice::from_mut(&mut mount)).unwrap();

@@ -5447,7 +5447,7 @@ mod tests {
         let config = SandboxBuilder::new("test")
             .image("/tmp/rootfs")
             .volume("/guest/secret.txt", |m| {
-                m.bind(host_file.as_path()).deny(["sub/.env"])
+                m.bind(host_file.as_path()).deny([".env"])
             })
             .build()
             .await
@@ -5637,7 +5637,9 @@ mod tests {
         let config = SandboxBuilder::new("test")
             .image("/tmp/rootfs")
             .volume("/data", |m| {
-                m.bind("/host/data").deny([".env", "sub/secret"])
+                // `sub/secret` is a path pattern, which is only valid on a
+                // read-only mount; the mount stays writable elsewhere.
+                m.bind("/host/data").readonly().deny([".env", "sub/secret"])
             })
             .build()
             .await
@@ -5646,7 +5648,7 @@ mod tests {
         let rendered = render_args(&config);
         let data_tag = super::guest_mount_tag("/data");
         let expected = format!(
-            "{data_tag}:/host/data:quota={},deny=.env,deny=sub/secret",
+            "{data_tag}:/host/data:ro,quota={},deny=.env,deny=sub/secret",
             crate::sandbox::config::DEFAULT_BIND_QUOTA_MIB
         );
         assert!(
