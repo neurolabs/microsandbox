@@ -262,28 +262,30 @@ impl DynFileSystem for PassthroughFs {
             // dir-only patterns, so gate on that too and skip the redundant pass
             // otherwise.
             // When the filesystem reports no file identity (FAT32/exFAT, some
-            // network volumes) the source's type at move time cannot be verified.
-            // On such filesystems this guard makes a rename fail closed (EBUSY)
-            // only when the destination collides with a dir-only pattern and the
-            // source was decided to be a file, because that is the one case a swap
-            // could turn into a directory landing at a denied name. Ordinary
-            // renames between non-denied paths, and renames of a same-named file
-            // away from a dir-only pattern, are unaffected: FAT/exFAT keeps nearly
-            // full rename support except for the narrow destination-collision case.
-            // The window between this re-check and the path-based rename below is
-            // irreducible: nothing pins the source through the move, so a fast
-            // enough external writer can still swap a directory past this final
-            // check. That residual risk is accepted, matching the Linux and macOS
-            // backends, where no rename-conditional-on-inode operation exists and
-            // the same window cannot be closed at all (upstream virtiofsd accepts
-            // the same race).
-            let after_identity = file_identity(&self.safe_metadata(&old_path)?);
+            // network volumes) the source's identity at move time cannot be
+            // verified, so identity comparison is unavailable. A directory-only
+            // pattern distinguishes files from directories, so the type is the
+            // only property this policy depends on: re-read the source's type and
+            // fail closed (EBUSY) only when it actually resolved to a directory
+            // and the destination collides with a dir-only pattern. A source that
+            // is still a file is permitted, matching directory-only semantics and
+            // the Linux/macOS backends, instead of rejecting every file-to-denied
+            // rename on such filesystems. The window between this re-check and the
+            // path-based rename below is irreducible: nothing pins the source
+            // through the move, so a fast enough external writer can still swap a
+            // directory past this final check. That residual risk is accepted,
+            // matching the Linux and macOS backends, where no
+            // rename-conditional-on-inode operation exists and the same window
+            // cannot be closed at all (upstream virtiofsd accepts the same race).
+            let after_meta = self.safe_metadata(&old_path)?;
+            let after_identity = file_identity(&after_meta);
+            let after_is_dir = after_meta.file_type().is_dir();
             let dir_denied = !source_is_dir
                 && self.deny.has_dir_only_patterns()
                 && self.deny_matches_name(newdir, newname, true);
             match (file_identity(&source_meta), after_identity) {
                 (Some(before), Some(after)) if before != after => continue,
-                (None, _) | (_, None) if dir_denied => {
+                (None, _) | (_, None) if dir_denied && after_is_dir => {
                     return Err(linux_error(LINUX_EBUSY));
                 }
                 _ => {}

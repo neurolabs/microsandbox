@@ -340,8 +340,11 @@ pub(crate) fn do_rename(
             {
                 return Err(platform::eacces());
             }
+            let mut exchange_dest_key = None;
             if fs.deny.has_dir_only_patterns() {
-                let dest_is_dir = platform::fstatat_nofollow(new_fd.raw(), newname)
+                let dest_st = platform::fstatat_nofollow(new_fd.raw(), newname).ok();
+                let dest_is_dir = dest_st
+                    .as_ref()
                     .map(|st| platform::mode_file_type(st.st_mode) == platform::MODE_DIR)
                     .unwrap_or(false);
                 if dest_is_dir
@@ -354,11 +357,22 @@ pub(crate) fn do_rename(
                 // exchanging a file at a dir-only-denied name with a directory at
                 // an allowed name would otherwise land the directory at the
                 // denied name.
-                if flags & RENAME_EXCHANGE != 0
-                    && dest_is_dir
-                    && fs.deny_matches_name_in_dir(old_comps.as_deref(), oldname.to_bytes(), true)
-                {
-                    return Err(platform::eacces());
+                if flags & RENAME_EXCHANGE != 0 {
+                    if dest_is_dir
+                        && fs.deny_matches_name_in_dir(
+                            old_comps.as_deref(),
+                            oldname.to_bytes(),
+                            true,
+                        )
+                    {
+                        return Err(platform::eacces());
+                    }
+                    // Pin the destination's identity as well, so an external
+                    // writer swapping in a directory is caught by the re-check
+                    // below rather than landing at the denied source name.
+                    exchange_dest_key = dest_st
+                        .as_ref()
+                        .map(|st| (platform::stat_ino(st), platform::stat_dev(st)));
                 }
             }
 
@@ -369,6 +383,19 @@ pub(crate) fn do_rename(
                     if platform::stat_ino(&st) == platform::stat_ino(&source_st)
                         && platform::stat_dev(&st) == platform::stat_dev(&source_st) => {}
                 _ => continue,
+            }
+
+            // The exchange destination must likewise still refer to the object we
+            // checked its type from. A non-exchange rename replaces the
+            // destination with the source, so only the source identity matters
+            // there.
+            if let Some((dest_ino, dest_dev)) = exchange_dest_key {
+                match platform::fstatat_nofollow(new_fd.raw(), newname) {
+                    Ok(st)
+                        if platform::stat_ino(&st) == dest_ino
+                            && platform::stat_dev(&st) == dest_dev => {}
+                    _ => continue,
+                }
             }
 
             let target_probe_fd = unsafe {
@@ -520,8 +547,11 @@ pub(crate) fn do_rename(
             {
                 return Err(platform::eacces());
             }
+            let mut exchange_dest_key = None;
             if fs.deny.has_dir_only_patterns() {
-                let dest_is_dir = platform::fstatat_nofollow(new_fd.raw(), newname)
+                let dest_st = platform::fstatat_nofollow(new_fd.raw(), newname).ok();
+                let dest_is_dir = dest_st
+                    .as_ref()
                     .map(|st| platform::mode_file_type(st.st_mode) == platform::MODE_DIR)
                     .unwrap_or(false);
                 if dest_is_dir
@@ -535,11 +565,22 @@ pub(crate) fn do_rename(
                 // an allowed name would otherwise land the directory at the
                 // denied name. Linux RENAME_EXCHANGE = 2; `flags` is translated
                 // to macOS renameatx_np flags below.
-                if flags & 2 != 0
-                    && dest_is_dir
-                    && fs.deny_matches_name_in_dir(old_comps.as_deref(), oldname.to_bytes(), true)
-                {
-                    return Err(platform::eacces());
+                if flags & 2 != 0 {
+                    if dest_is_dir
+                        && fs.deny_matches_name_in_dir(
+                            old_comps.as_deref(),
+                            oldname.to_bytes(),
+                            true,
+                        )
+                    {
+                        return Err(platform::eacces());
+                    }
+                    // Pin the destination's identity as well, so an external
+                    // writer swapping in a directory is caught by the re-check
+                    // below rather than landing at the denied source name.
+                    exchange_dest_key = dest_st
+                        .as_ref()
+                        .map(|st| (platform::stat_ino(st), platform::stat_dev(st)));
                 }
             }
 
@@ -549,6 +590,19 @@ pub(crate) fn do_rename(
                     if platform::stat_ino(&st) == platform::stat_ino(&source_st)
                         && platform::stat_dev(&st) == platform::stat_dev(&source_st) => {}
                 _ => continue,
+            }
+
+            // The exchange destination must likewise still refer to the object we
+            // checked its type from. A non-exchange rename replaces the
+            // destination with the source, so only the source identity matters
+            // there.
+            if let Some((dest_ino, dest_dev)) = exchange_dest_key {
+                match platform::fstatat_nofollow(new_fd.raw(), newname) {
+                    Ok(st)
+                        if platform::stat_ino(&st) == dest_ino
+                            && platform::stat_dev(&st) == dest_dev => {}
+                    _ => continue,
+                }
             }
 
             let ret = if flags == 0 {

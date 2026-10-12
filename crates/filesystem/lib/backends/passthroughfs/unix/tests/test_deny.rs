@@ -635,6 +635,34 @@ fn test_deny_dir_only_rename_exchange_two_files_allowed() {
     sb.lookup_root("allowed.txt").unwrap();
 }
 
+/// RENAME_EXCHANGE of two directories at allowed names passes the dir-only
+/// checks: neither endpoint is denied, so the destination identity re-check
+/// must not block the swap.
+#[test]
+fn test_deny_dir_only_rename_exchange_two_dirs_allowed() {
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec!["node_modules/".to_string()],
+        ..cfg
+    });
+
+    sb.fuse_mkdir_root("one").unwrap();
+    sb.fuse_mkdir_root("two").unwrap();
+
+    sb.fs
+        .rename(
+            sb.ctx(),
+            ROOT_INODE,
+            &TestSandbox::cstr("one"),
+            ROOT_INODE,
+            &TestSandbox::cstr("two"),
+            2, // RENAME_EXCHANGE
+        )
+        .unwrap();
+
+    sb.lookup_root("one").unwrap();
+    sb.lookup_root("two").unwrap();
+}
+
 /// Renaming a directory onto an already-hidden file returns EACCES.
 ///
 /// A basename pattern such as `.env` matches both files and directories, so
