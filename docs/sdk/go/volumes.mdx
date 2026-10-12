@@ -973,7 +973,7 @@ Tuning struct for [`Mount.Bind`](#mount-bind), [`Mount.Named`](#mount-named), an
 | `Nosuid` | `bool` | Ignore setuid and setgid privilege elevation from files on the mount |
 | `Nodev` | `bool` | Ignore device files on the mount |
 | `QuotaMiB` | `uint32` | Guest-write quota in MiB, bounding growth beyond the host directory's existing contents; zero keeps the protective default (bind mounts only; named volumes use [`NamedVolumeOptions.QuotaMiB`](#namedvolumeoptions)) |
-| `Deny` | `[]string` | Host-side deny-list of gitignore-style patterns (e.g. `.env`, `sub/secret`). Matching entries are hidden from the guest and writes to them are forbidden. Bind mounts only |
+| `Deny` | `[]string` | Host-side deny-list of gitignore-style patterns (e.g. `.env`, `sub/secret`). Matching entries are hidden from the guest and writes to them are forbidden. Directory bind mounts only |
 | `StatVirtualization` | `StatVirtualization` | Per-mount stat-virtualization policy (virtiofs only) |
 | `HostPermissions` | `HostPermissions` | Per-mount host-permission propagation policy (virtiofs only) |
 | `Owner` | `*MountOwner` | Paired guest uid/gid fallback for host files without a per-file override; nil keeps the runtime fallback |

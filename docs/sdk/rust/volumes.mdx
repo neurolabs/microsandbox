@@ -1446,7 +1446,7 @@ Ignore device files on this mount.
 fn deny(self, patterns: impl IntoIterator<Item = impl Into<String>>) -> Self
 ```
 
-Hide host paths matching gitignore-style patterns from the guest. Matching entries are invisible (ENOENT) and writes to them are forbidden (EACCES). Patterns are relative to the mount root and may be names (`.env`, `*.log`) or paths (`sub/secret`). Valid only for bind mounts.
+Hide host paths matching gitignore-style patterns from the guest. Matching entries are invisible (ENOENT) and writes to them are forbidden (EACCES). Patterns are relative to the mount root and may be names (`.env`, `*.log`) or paths (`sub/secret`). Valid only for directory bind mounts; a host file bind has no namespace to filter and rejects them.
 
 <p className="msb-label">Parameters</p>
 
