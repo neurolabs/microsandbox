@@ -217,12 +217,15 @@ pub(crate) fn do_lookup(fs: &PassthroughFs, parent: u64, name: &CStr) -> io::Res
     crate::backends::shared::name_validation::validate_name(name)?;
 
     // Determine the child's type (without following a symlink) to support
-    // dir-only deny patterns.
+    // dir-only deny patterns. If the type cannot be determined, treat the entry
+    // as a directory so a dir-only rule still hides it rather than being skipped
+    // on a transient stat failure.
     let parent_fd = get_inode_fd(fs, parent)?;
     let is_dir = if fs.deny.has_dir_only_patterns() {
-        platform::fstatat_nofollow(parent_fd.raw(), name)
-            .map(|st| platform::mode_file_type(st.st_mode) == platform::MODE_DIR)
-            .unwrap_or(false)
+        match platform::fstatat_nofollow(parent_fd.raw(), name) {
+            Ok(st) => platform::mode_file_type(st.st_mode) == platform::MODE_DIR,
+            Err(_) => true,
+        }
     } else {
         false
     };

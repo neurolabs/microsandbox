@@ -454,7 +454,8 @@ fn read_dir_entries(fd: i32) -> io::Result<Vec<PassthroughDirEntry>> {
 
         // When the filesystem did not supply a dirent type, resolve it via
         // `fstatat` to support dir-only deny patterns.
-        let file_type = resolve_dirent_type(libc::dirfd(dirp), entry.d_type as u32, name);
+        let file_type =
+            resolve_dirent_type(unsafe { libc::dirfd(dirp) }, entry.d_type as u32, name);
 
         entries.push(PassthroughDirEntry {
             inode: entry.d_ino,

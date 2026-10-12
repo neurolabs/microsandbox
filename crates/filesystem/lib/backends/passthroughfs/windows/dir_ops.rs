@@ -98,7 +98,9 @@ impl PassthroughFs {
             validate_component(name)?;
 
             let deny_is_dir = if self.deny.has_dir_only_patterns() {
-                entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                // Fail closed: unknown type is treated as a directory so a
+                // dir-only rule still hides the entry.
+                entry.file_type().map(|t| t.is_dir()).unwrap_or(true)
             } else {
                 false
             };
