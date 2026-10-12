@@ -562,6 +562,17 @@ impl DynFileSystem for PassthroughFs {
         if !metadata.file_type().is_dir() {
             return Err(linux_error(LINUX_ENOTDIR));
         }
+        // Windows inodes are path-backed, so `opendir` re-resolves the live path.
+        // Re-apply the directory-only deny rule: a host writer could have replaced
+        // an allowed file at a dir-only-denied name with a directory after lookup
+        // vouched for it, and opening it would expose the hidden contents. The
+        // mount root is never denied.
+        if inode != ROOT_INODE
+            && self.deny.has_dir_only_patterns()
+            && self.deny_matches_path(&data.path(), true)
+        {
+            return Err(linux_error(LINUX_ENOENT));
+        }
 
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         self.dir_handles.write().unwrap().insert(

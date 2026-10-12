@@ -277,36 +277,63 @@ impl PassthroughFs {
             return true;
         };
 
-        let Some(rel) = parent_data.path.strip_prefix(&self.root) else {
-            // Fail closed: a parent path outside the mount root cannot be
-            // matched against a path pattern, so it must deny, never allow.
+        // Fail closed: a parent path outside the mount root, or a name that
+        // cannot be decoded to UTF-8, cannot be matched against a path pattern.
+        let Some(rel_parent) = relative_path_string(&parent_data.path, &self.root) else {
             return true;
         };
-        let mut rel_str = String::new();
-        for component in rel.components() {
-            if let Component::Normal(part) = component {
-                if !rel_str.is_empty() {
-                    rel_str.push('/');
-                }
-                rel_str.push_str(&part.to_string_lossy());
-            }
-        }
         let Ok(name_str) = std::str::from_utf8(name_bytes) else {
-            // Fail closed: a name that cannot be decoded to UTF-8 cannot be
-            // matched against a path pattern, so it must deny, never allow.
             return true;
         };
-        if !rel_str.is_empty() {
-            rel_str.push('/');
+        self.deny.matches_relative(&rel_parent, name_str, is_dir)
+    }
+
+    /// Whether the entry at `path` (a host path under the mount root) is denied,
+    /// given its type.
+    ///
+    /// Path-backed backends re-resolve an entry by path on inode-scoped
+    /// operations: `opendir` on Windows re-reads the live directory, so it must
+    /// re-apply the deny rule to avoid exposing a directory that replaced an
+    /// allowed file at a directory-only-denied name. Fails closed when the path
+    /// cannot be matched.
+    pub(super) fn deny_matches_path(&self, path: &Path, is_dir: bool) -> bool {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return true;
+        };
+        if !self.deny.needs_path_reconstruction() {
+            return self.deny.matches_basename(name.as_bytes(), is_dir);
         }
-        rel_str.push_str(name_str);
-        self.deny.matches_path(rel_str.as_bytes(), is_dir)
+        let Some(parent) = path.parent() else {
+            return true;
+        };
+        let Some(rel_parent) = relative_path_string(parent, &self.root) else {
+            return true;
+        };
+        self.deny.matches_relative(&rel_parent, name, is_dir)
     }
 }
 
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+/// The mount-relative path of `path` under `root`, as a `/`-separated string.
+///
+/// Returns `None` when `path` is not lexically under `root`, so a deny check can
+/// fail closed. The root itself yields the empty string.
+fn relative_path_string(path: &Path, root: &Path) -> Option<String> {
+    let rel = path.strip_prefix(root).ok()?;
+    let mut rel_str = String::new();
+    for component in rel.components() {
+        if let Component::Normal(part) = component {
+            if !rel_str.is_empty() {
+                rel_str.push('/');
+            }
+            rel_str.push_str(&part.to_string_lossy());
+        }
+    }
+    Some(rel_str)
+}
 
 fn validate_component(name: &CStr) -> io::Result<&str> {
     let component = name.to_str().map_err(|_| linux_error(LINUX_EINVAL))?;

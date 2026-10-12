@@ -2247,6 +2247,20 @@ fn volume_mount(
             "deny is only valid for bind mounts",
         ));
     }
+    // A path pattern (`sub/.env`) is matched against the entry's mount-relative
+    // path, so a writable guest can rename an ancestor directory to launder it.
+    // Reject it here, in step with the identical checks in the Rust SDK and the
+    // runtime, rather than relying on the later Rust `MountBuilder::build`.
+    if !readonly
+        && let Some(pattern) = deny
+            .iter()
+            .find(|pattern| pattern.trim_end_matches('/').contains('/'))
+    {
+        return Err(FfiError::invalid_argument(format!(
+            "deny pattern {pattern:?} is a path pattern, which a writable mount can bypass by \
+             renaming an ancestor directory; use a name-only pattern, or mark the mount read-only"
+        )));
+    }
 
     let mb = microsandbox::sandbox::MountBuilder::new(guest_path);
     Ok({
@@ -8295,6 +8309,44 @@ mod tests {
             "got: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn apply_volume_rejects_writable_path_deny_pattern() {
+        let builder = microsandbox::sandbox::SandboxBuilder::new("test").image("alpine");
+        let spec = MountSpec {
+            bind: Some("/host/data".to_string()),
+            deny: vec!["sub/secret".to_string()],
+            ..Default::default()
+        };
+
+        let err = match apply_volume(builder, "/data", &spec) {
+            Ok(_) => panic!("path deny on a writable mount should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.message.contains("path pattern"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn apply_volume_allows_readonly_path_deny_and_writable_name_only_deny() {
+        let readonly = MountSpec {
+            bind: Some("/host/data".to_string()),
+            readonly: true,
+            deny: vec!["sub/secret".to_string()],
+            ..Default::default()
+        };
+        let builder = microsandbox::sandbox::SandboxBuilder::new("test").image("alpine");
+        apply_volume(builder, "/data", &readonly)
+            .unwrap_or_else(|error| panic!("{}", error.message));
+
+        let name_only = MountSpec {
+            bind: Some("/host/data".to_string()),
+            deny: vec![".env".to_string(), "node_modules/".to_string()],
+            ..Default::default()
+        };
+        let builder = microsandbox::sandbox::SandboxBuilder::new("test").image("alpine");
+        apply_volume(builder, "/data", &name_only)
+            .unwrap_or_else(|error| panic!("{}", error.message));
     }
 
     #[test]

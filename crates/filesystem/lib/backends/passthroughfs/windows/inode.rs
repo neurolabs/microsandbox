@@ -226,8 +226,20 @@ impl PassthroughFs {
 
     pub(super) fn child_path(&self, parent: u64, name: &CStr) -> io::Result<PathBuf> {
         let name = validate_component(name)?;
-        let parent = self.inode(parent)?;
-        Ok(parent.path().join(name))
+        let data = self.inode(parent)?;
+        // Windows inodes cache a path and are never revalidated against the live
+        // filesystem. A host writer can replace an allowed file with a directory
+        // at a directory-only-denied name after lookup vouched for it; re-apply
+        // the rule to the parent's live path so the stale inode cannot anchor a
+        // read or write inside the now-hidden directory. The mount root is never
+        // denied.
+        if parent != ROOT_INODE
+            && self.deny.has_dir_only_patterns()
+            && self.deny_matches_path(&data.path(), true)
+        {
+            return Err(linux_error(LINUX_ENOENT));
+        }
+        Ok(data.path().join(name))
     }
 
     pub(super) fn entry_for_path(&self, path: PathBuf) -> io::Result<Entry> {

@@ -1816,6 +1816,78 @@ fn deny_readdir_omits_entries() {
     );
 }
 
+/// A directory whose inode was obtained while it was an allowed *file* at a
+/// directory-only-denied name must not become openable if a concurrent host
+/// writer replaces it with a directory before `opendir`.
+///
+/// Lookup is the only name-taking gate, but Windows inodes are path-backed, so
+/// `opendir` re-resolves the live path and must re-apply the directory-only
+/// rule; otherwise the replacement directory's contents are exposed.
+#[test]
+fn deny_dir_only_opendir_rechecks_replaced_directory() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join("node_modules"), b"file").unwrap();
+    let fs = fs_for_deny(&temp.path, vec!["node_modules/".to_string()]);
+
+    // A directory-only pattern allows the existing file, so lookup succeeds.
+    let entry = fs.lookup(context(), ROOT_INODE, c"node_modules").unwrap();
+
+    // Race: the host replaces the allowed file with a directory.
+    std::fs::remove_file(temp.path.join("node_modules")).unwrap();
+    std::fs::create_dir(temp.path.join("node_modules")).unwrap();
+
+    expect_errno(
+        fs.opendir(context(), entry.inode, LINUX_O_DIRECTORY as u32),
+        LINUX_ENOENT,
+    );
+}
+
+/// The same stale path-backed inode must not serve as a parent anchor for
+/// `lookup`; otherwise the children of a directory that replaced an allowed
+/// file at a directory-only-denied name are readable without `opendir`.
+#[test]
+fn deny_dir_only_child_lookup_rechecks_replaced_parent() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join("node_modules"), b"file").unwrap();
+    let fs = fs_for_deny(&temp.path, vec!["node_modules/".to_string()]);
+
+    let entry = fs.lookup(context(), ROOT_INODE, c"node_modules").unwrap();
+
+    // Race: the host replaces the allowed file with a directory holding a child.
+    std::fs::remove_file(temp.path.join("node_modules")).unwrap();
+    std::fs::create_dir(temp.path.join("node_modules")).unwrap();
+    std::fs::write(temp.path.join("node_modules").join("secret"), b"hidden").unwrap();
+
+    expect_errno(fs.lookup(context(), entry.inode, c"secret"), LINUX_ENOENT);
+}
+
+/// Writes anchored on the replaced parent are rejected too, not just reads.
+#[test]
+fn deny_dir_only_create_in_replaced_parent_rejected() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join("node_modules"), b"file").unwrap();
+    let fs = fs_for_deny(&temp.path, vec!["node_modules/".to_string()]);
+
+    let entry = fs.lookup(context(), ROOT_INODE, c"node_modules").unwrap();
+
+    std::fs::remove_file(temp.path.join("node_modules")).unwrap();
+    std::fs::create_dir(temp.path.join("node_modules")).unwrap();
+
+    expect_errno(
+        fs.create(
+            context(),
+            entry.inode,
+            c"new.txt",
+            S_IFREG | 0o644,
+            false,
+            (LINUX_O_CREAT | LINUX_O_RDWR) as u32,
+            0,
+            Extensions::default(),
+        ),
+        LINUX_ENOENT,
+    );
+}
+
 /// A nested path pattern hides the matching path but not its siblings.
 #[test]
 fn deny_path_pattern_nested() {

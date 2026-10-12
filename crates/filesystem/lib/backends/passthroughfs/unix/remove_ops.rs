@@ -15,6 +15,51 @@ use crate::{
 };
 
 //--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+/// Expected state of an atomic exchange (`RENAME_EXCHANGE`/`RENAME_SWAP`)
+/// destination, captured when its type drives a directory-only deny decision.
+///
+/// The destination is re-read immediately before the move and the whole
+/// check-and-move is retried when it no longer matches. A destination that was
+/// absent must still be absent: a directory appearing in that window would
+/// otherwise be swapped onto a dir-only-denied source name, and a non-exchange
+/// rename never needs this because it always replaces the destination with the
+/// source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExchangeDest {
+    /// The destination did not resolve when its type was assessed.
+    Absent,
+    /// The destination resolved with this host `(ino, dev)` identity.
+    Present { ino: u64, dev: u64 },
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+impl ExchangeDest {
+    /// Capture the expectation from the destination's pre-move identity, if it
+    /// was present.
+    fn capture(identity: Option<(u64, u64)>) -> Self {
+        match identity {
+            Some((ino, dev)) => Self::Present { ino, dev },
+            None => Self::Absent,
+        }
+    }
+
+    /// Whether a freshly read destination identity (absent when `None`) still
+    /// satisfies this expectation.
+    fn still_matches(self, current: Option<(u64, u64)>) -> bool {
+        match self {
+            Self::Absent => current.is_none(),
+            Self::Present { ino, dev } => current == Some((ino, dev)),
+        }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
 
@@ -340,7 +385,7 @@ pub(crate) fn do_rename(
             {
                 return Err(platform::eacces());
             }
-            let mut exchange_dest_key = None;
+            let mut exchange_dest = None;
             if fs.deny.has_dir_only_patterns() {
                 let dest_st = platform::fstatat_nofollow(new_fd.raw(), newname).ok();
                 let dest_is_dir = dest_st
@@ -367,12 +412,15 @@ pub(crate) fn do_rename(
                     {
                         return Err(platform::eacces());
                     }
-                    // Pin the destination's identity as well, so an external
-                    // writer swapping in a directory is caught by the re-check
-                    // below rather than landing at the denied source name.
-                    exchange_dest_key = dest_st
-                        .as_ref()
-                        .map(|st| (platform::stat_ino(st), platform::stat_dev(st)));
+                    // Pin the destination as well, so an external writer swapping
+                    // in a directory (or creating one at an absent name) is caught
+                    // by the re-check below rather than landing at the denied
+                    // source name.
+                    exchange_dest = Some(ExchangeDest::capture(
+                        dest_st
+                            .as_ref()
+                            .map(|st| (platform::stat_ino(st), platform::stat_dev(st))),
+                    ));
                 }
             }
 
@@ -385,16 +433,17 @@ pub(crate) fn do_rename(
                 _ => continue,
             }
 
-            // The exchange destination must likewise still refer to the object we
-            // checked its type from. A non-exchange rename replaces the
-            // destination with the source, so only the source identity matters
-            // there.
-            if let Some((dest_ino, dest_dev)) = exchange_dest_key {
-                match platform::fstatat_nofollow(new_fd.raw(), newname) {
-                    Ok(st)
-                        if platform::stat_ino(&st) == dest_ino
-                            && platform::stat_dev(&st) == dest_dev => {}
-                    _ => continue,
+            // An exchange destination must still match what we checked: a
+            // non-exchange rename replaces the destination with the source, so
+            // only the source identity matters there, but an exchange moves the
+            // destination onto the source name and must not let a directory
+            // appear at (or replace) a dir-only-denied destination.
+            if let Some(expected) = exchange_dest {
+                let current = platform::fstatat_nofollow(new_fd.raw(), newname)
+                    .ok()
+                    .map(|st| (platform::stat_ino(&st), platform::stat_dev(&st)));
+                if !expected.still_matches(current) {
+                    continue;
                 }
             }
 
@@ -547,7 +596,7 @@ pub(crate) fn do_rename(
             {
                 return Err(platform::eacces());
             }
-            let mut exchange_dest_key = None;
+            let mut exchange_dest = None;
             if fs.deny.has_dir_only_patterns() {
                 let dest_st = platform::fstatat_nofollow(new_fd.raw(), newname).ok();
                 let dest_is_dir = dest_st
@@ -575,12 +624,15 @@ pub(crate) fn do_rename(
                     {
                         return Err(platform::eacces());
                     }
-                    // Pin the destination's identity as well, so an external
-                    // writer swapping in a directory is caught by the re-check
-                    // below rather than landing at the denied source name.
-                    exchange_dest_key = dest_st
-                        .as_ref()
-                        .map(|st| (platform::stat_ino(st), platform::stat_dev(st)));
+                    // Pin the destination as well, so an external writer swapping
+                    // in a directory (or creating one at an absent name) is caught
+                    // by the re-check below rather than landing at the denied
+                    // source name.
+                    exchange_dest = Some(ExchangeDest::capture(
+                        dest_st
+                            .as_ref()
+                            .map(|st| (platform::stat_ino(st), platform::stat_dev(st))),
+                    ));
                 }
             }
 
@@ -592,16 +644,17 @@ pub(crate) fn do_rename(
                 _ => continue,
             }
 
-            // The exchange destination must likewise still refer to the object we
-            // checked its type from. A non-exchange rename replaces the
-            // destination with the source, so only the source identity matters
-            // there.
-            if let Some((dest_ino, dest_dev)) = exchange_dest_key {
-                match platform::fstatat_nofollow(new_fd.raw(), newname) {
-                    Ok(st)
-                        if platform::stat_ino(&st) == dest_ino
-                            && platform::stat_dev(&st) == dest_dev => {}
-                    _ => continue,
+            // An exchange destination must still match what we checked: a
+            // non-exchange rename replaces the destination with the source, so
+            // only the source identity matters there, but an exchange moves the
+            // destination onto the source name and must not let a directory
+            // appear at (or replace) a dir-only-denied destination.
+            if let Some(expected) = exchange_dest {
+                let current = platform::fstatat_nofollow(new_fd.raw(), newname)
+                    .ok()
+                    .map(|st| (platform::stat_ino(&st), platform::stat_dev(&st)));
+                if !expected.still_matches(current) {
+                    continue;
                 }
             }
 
@@ -647,4 +700,33 @@ pub(crate) fn do_rename(
     }
 
     Ok(())
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::ExchangeDest;
+
+    /// An initially-absent exchange destination must be treated as stale once
+    /// anything appears at the name: the move could otherwise land a directory
+    /// at a dir-only-denied source name.
+    #[test]
+    fn exchange_dest_absent_is_stale_when_destination_appears() {
+        assert!(ExchangeDest::Absent.still_matches(None));
+        assert!(!ExchangeDest::Absent.still_matches(Some((1, 2))));
+    }
+
+    /// A present exchange destination must match by identity, and any removal or
+    /// replacement is stale.
+    #[test]
+    fn exchange_dest_present_is_stale_on_identity_change_or_removal() {
+        let expected = ExchangeDest::capture(Some((5, 7)));
+        assert!(expected.still_matches(Some((5, 7))));
+        assert!(!expected.still_matches(Some((5, 8))));
+        assert!(!expected.still_matches(Some((6, 7))));
+        assert!(!expected.still_matches(None));
+    }
 }

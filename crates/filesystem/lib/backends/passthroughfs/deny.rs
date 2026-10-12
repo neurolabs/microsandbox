@@ -10,11 +10,18 @@
 //! Cross-platform: the matcher lives at the passthrough level so both the
 //! Unix and Windows passthrough backends can use it.
 //!
-//! Deny is enforced only at name-taking entry points (lookup, create, mkdir,
+//! Deny is enforced at name-taking entry points (lookup, create, mkdir,
 //! unlink, rename, readdir, ...). Inode-scoped operations that reuse an already
 //! resolved inode (`open` for write, `setattr`, `write`) are deliberately not
 //! deny-checked: lookup returns `ENOENT` for a denied name, so the guest can
-//! never obtain the inode of a hidden entry in the first place.
+//! normally never obtain the inode of a hidden entry in the first place.
+//!
+//! That assumption breaks when a concurrent host writer changes an entry's
+//! type after lookup vouched for it. The Windows backend caches an absolute
+//! path per inode, so `opendir` and every operation that uses an inode as a
+//! parent re-apply the directory-only rule to the live path (see
+//! `PassthroughFs::child_path` and `opendir`); the Unix backends revalidate
+//! inode identity on reopen instead.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -162,6 +169,30 @@ impl DenyList {
     /// [`Self::matches_basename`].
     pub(crate) fn matches_path(&self, rel: &[u8], is_dir: bool) -> bool {
         self.is_ignored(name_as_path(rel), is_dir)
+    }
+
+    /// Whether a single entry `name` directly under the mount-relative directory
+    /// `rel_parent` matches the deny list.
+    ///
+    /// `rel_parent` is the parent directory's path relative to the mount root,
+    /// using `/` separators, or the empty string for the root itself. Equivalent
+    /// to matching the joined relative path, so path patterns see the entry's
+    /// true location while component-only patterns keep the basename fast path.
+    ///
+    /// Used by the Windows passthrough backend, whose path-backed inodes
+    /// re-resolve an entry by path on inode-scoped operations.
+    #[cfg(windows)]
+    pub(crate) fn matches_relative(&self, rel_parent: &str, name: &str, is_dir: bool) -> bool {
+        if !self.needs_path_reconstruction {
+            return self.matches_basename(name.as_bytes(), is_dir);
+        }
+        let mut rel = String::with_capacity(rel_parent.len() + name.len() + 1);
+        rel.push_str(rel_parent);
+        if !rel.is_empty() {
+            rel.push('/');
+        }
+        rel.push_str(name);
+        self.matches_path(rel.as_bytes(), is_dir)
     }
 
     fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {

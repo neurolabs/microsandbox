@@ -238,10 +238,22 @@ def test_bind_serializes_deny() -> None:
     mc = MountConfig(
         kind=MountKind.BIND,
         bind="/host/data",
+        readonly=True,
         deny=[".env", "sub/secret"],
     )
     d = mc._to_dict()
     assert d["deny"] == [".env", "sub/secret"]
+
+
+def test_writable_bind_rejects_path_deny_pattern() -> None:
+    mc = MountConfig(kind=MountKind.BIND, bind="/host/data", deny=["sub/secret"])
+    with pytest.raises(ValueError, match="is a path pattern"):
+        mc._to_dict()
+
+
+def test_writable_bind_accepts_name_and_dir_only_deny() -> None:
+    mc = MountConfig(kind=MountKind.BIND, bind="/host/data", deny=[".env", "node_modules/"])
+    assert mc._to_dict()["deny"] == [".env", "node_modules/"]
 
 
 def test_bind_omits_deny_when_empty_or_none() -> None:

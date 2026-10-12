@@ -869,7 +869,27 @@ class MountConfig:
 
         if self.deny and self.kind != MountKind.BIND:
             raise ValueError(f"deny is only valid for BIND mounts (got kind={self.kind.value})")
+        if self.deny and self.kind == MountKind.BIND and not self.readonly:
+            _reject_writable_path_patterns(self.deny)
         return d
+
+
+def _reject_writable_path_patterns(patterns: list[str]) -> None:
+    """Reject path deny patterns on a writable mount.
+
+    A path pattern (``sub/.env``) is matched against each entry's mount-relative
+    path, so a guest that can write the mount can rename an ancestor directory
+    and launder the rule. Name-only (``.env``) and directory-only
+    (``node_modules/``) patterns match anywhere and stay valid, and a read-only
+    mount cannot rename. Mirrors the Rust SDK and runtime validators.
+    """
+    for pattern in patterns:
+        if "/" in pattern.rstrip("/"):
+            raise ValueError(
+                f"deny pattern {pattern!r} is a path pattern, which a writable mount "
+                "can bypass by renaming an ancestor directory; use a name-only "
+                "pattern, or mark the mount read-only"
+            )
 
 
 def _enum_value(value: enum.Enum, expected: type[enum.Enum], field_name: str) -> str:
