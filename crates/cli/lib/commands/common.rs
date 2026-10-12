@@ -365,6 +365,11 @@ pub struct SandboxOpts {
     #[arg(long, value_name = "DEPTH", value_parser = clap::value_parser!(u32).range(1..=i64::from(i32::MAX)))]
     pub tcp_accept_queue_size: Option<u32>,
 
+    /// Maximum active inbound TCP connections across published ports; zero is unlimited.
+    #[cfg(feature = "net")]
+    #[arg(long)]
+    pub max_inbound_tcp_connections: Option<usize>,
+
     /// Disable all network access by default. Sugar for `--net-default deny`.
     /// Combine with `--net-rule allow@<target>` entries to build an
     /// allowlist; without rules, the guest has no network reachability.
@@ -643,6 +648,13 @@ pub struct SandboxOpts {
     /// and stored only as a source reference, never inlined in the sandbox
     /// config. Inline `ENV=VALUE@HOST` is rejected; export the value and use
     /// `ENV[:OPTIONS]@HOST[,HOST...]`.
+    ///
+    /// OPTIONS are comma-separated: `no-headers`, `headers=[FIELD,...]`,
+    /// `query`, `body`, `passthrough=HOST`, or `passthrough=[HOST,...]`.
+    /// Headers are substituted by default; query and body substitution are off.
+    /// `headers=*` selects all headers. Passthrough sends the placeholder unchanged.
+    ///
+    /// Example: `--secret 'GH_TOKEN:passthrough=api.anthropic.com@github.com,api.github.com'`.
     #[cfg(feature = "net")]
     #[arg(long)]
     pub secret: Vec<String>,
@@ -868,6 +880,7 @@ impl SandboxOpts {
             || self.max_tcp_connections.is_some()
             || self.max_udp_connections.is_some()
             || self.tcp_accept_queue_size.is_some()
+            || self.max_inbound_tcp_connections.is_some()
             || self.net_strict.is_some()
             || self.trust_host_cas
             || self.tls_intercept
@@ -1123,6 +1136,7 @@ impl SandboxOpts {
             || self.max_tcp_connections.is_some()
             || self.max_udp_connections.is_some()
             || self.tcp_accept_queue_size.is_some()
+            || self.max_inbound_tcp_connections.is_some()
             || self.net_strict.is_some()
             || self.trust_host_cas
             || self.proxy.is_some()
@@ -2647,6 +2661,7 @@ fn apply_network_opts(
         let max_conn = opts.max_tcp_connections.or(opts.max_connections);
         let max_udp_conn = opts.max_udp_connections;
         let tcp_accept_queue_size = opts.tcp_accept_queue_size;
+        let max_inbound_tcp_connections = opts.max_inbound_tcp_connections;
         let ipv4_pool = opts
             .net_ipv4_pool
             .as_deref()
@@ -2710,6 +2725,9 @@ fn apply_network_opts(
             }
             if let Some(max) = max_udp_conn {
                 n = n.max_udp_connections(max);
+            }
+            if let Some(value) = max_inbound_tcp_connections {
+                n = n.max_inbound_tcp_connections(value);
             }
             if let Some(size) = tcp_accept_queue_size {
                 n = n.tcp_accept_queue_size(size);
