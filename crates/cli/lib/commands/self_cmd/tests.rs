@@ -277,6 +277,9 @@ async fn rollback_schema_steps_through_latest_migrations() {
     .unwrap();
     Migrator::up(db.inner(), None).await.unwrap();
 
+    // The newest compatibility marker guards persisted bind-mount deny lists.
+    rollback_schema(db.inner(), 1).await.unwrap();
+
     // With no clock policies to preserve, rollback removes the catalog compatibility marker.
     rollback_schema(db.inner(), 1).await.unwrap();
 
