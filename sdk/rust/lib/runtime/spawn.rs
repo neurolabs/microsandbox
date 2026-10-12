@@ -2478,7 +2478,10 @@ fn resolve_file_mounts(
 ) -> MicrosandboxResult<HashMap<String, (String, String)>> {
     let mut file_mounts = HashMap::new();
     for mount in &config.spec.mounts {
-        let VolumeMount::Bind { host, guest, .. } = mount else {
+        let VolumeMount::Bind {
+            host, guest, deny, ..
+        } = mount
+        else {
             continue;
         };
         if let Some(binding) = config.checkpoint_restore.as_ref().and_then(|restore| {
@@ -2490,6 +2493,7 @@ fn resolve_file_mounts(
             // A missing or type-changed export must retain its captured transport,
             // never be reclassified from a file facade into a directory share.
             if let Some(filename) = &binding.filename {
+                reject_deny_on_file_bind(guest, deny)?;
                 file_mounts.insert(guest.clone(), (filename.clone(), binding.mount.tag.clone()));
             }
             continue;
@@ -2498,6 +2502,7 @@ fn resolve_file_mounts(
             continue;
         }
 
+        reject_deny_on_file_bind(guest, deny)?;
         let filename = host
             .file_name()
             .and_then(OsStr::to_str)
@@ -2511,6 +2516,21 @@ fn resolve_file_mounts(
         file_mounts.insert(guest.clone(), (filename, guest_mount_tag(guest)));
     }
     Ok(file_mounts)
+}
+
+/// Reject a deny list on a bind that resolves to a single host file.
+///
+/// File binds use the single-file backend, which exposes exactly one entry and
+/// has no namespace to filter, so a deny rule would be silently ignored.
+/// Refuse it rather than start the sandbox with weaker protection than the
+/// caller asked for.
+fn reject_deny_on_file_bind(guest: &str, deny: &[String]) -> MicrosandboxResult<()> {
+    if deny.is_empty() {
+        return Ok(());
+    }
+    Err(MicrosandboxError::InvalidConfig(format!(
+        "deny patterns are not supported for a host file bind at {guest:?}; mount its parent directory to hide entries by pattern"
+    )))
 }
 
 /// Push a `--mount tag:host_path[:ro]` arg pair.
@@ -2567,10 +2587,11 @@ fn push_dir_mount_arg_with_tag(
         opts.push(format!("quota={mib}"));
     }
     for p in deny {
-        // Trim the pattern so a value like `" .env"` renders as `deny=.env`
-        // rather than a literal-space pattern `deny= .env`, matching the CLI
-        // and runtime, which trim option tokens on parse.
-        opts.push(format!("deny={}", p.trim()));
+        // Emit the pattern verbatim. `validate_deny_pattern` rejects leading or
+        // trailing whitespace because the runtime trims option tokens; trimming
+        // here would silently reinterpret a value like `" !secret"` as the
+        // allow rule `!secret`.
+        opts.push(format!("deny={p}"));
     }
     append_option_block(&mut arg, opts);
     mounts.push(arg);
@@ -2587,7 +2608,6 @@ fn push_file_mount_arg(
     stat_virtualization: StatVirtualization,
     host_permissions: HostPermissions,
     quota_mib: u32,
-    deny: &[String],
 ) {
     let mut arg = format!("{tag}:{}", host_file.display());
     let mut opts = mount_option_tokens(options);
@@ -2602,12 +2622,6 @@ fn push_file_mount_arg(
         options.override_gid,
     );
     opts.push(format!("quota={quota_mib}"));
-    for p in deny {
-        // Trim the pattern so a value like `" .env"` renders as `deny=.env`
-        // rather than a literal-space pattern `deny= .env`, matching the CLI
-        // and runtime, which trim option tokens on parse.
-        opts.push(format!("deny={}", p.trim()));
-    }
     append_option_block(&mut arg, opts);
     mounts.push(FileMountConfig {
         mount: arg,
@@ -3073,7 +3087,9 @@ fn machine_cli_args(
             } => {
                 if let Some((filename, tag)) = file_mounts.get(guest) {
                     // File binds receive the same default-on host disk
-                    // protection as directory binds.
+                    // protection as directory binds. Deny lists are rejected for
+                    // file binds in `resolve_file_mounts`, since `SingleFileFs`
+                    // exposes exactly one file and cannot filter by name.
                     let quota = quota_mib.unwrap_or(crate::sandbox::config::DEFAULT_BIND_QUOTA_MIB);
                     push_file_mount_arg(
                         &mut launch.file_mounts,
@@ -3084,7 +3100,6 @@ fn machine_cli_args(
                         *stat_virtualization,
                         *host_permissions,
                         quota,
-                        deny,
                     );
                     launch.bootstrap.file_mounts.push(BootstrapFileMount {
                         tag: tag.clone(),
@@ -3360,7 +3375,9 @@ mod tests {
         AUTO_BLOCK_WRITEBACK_LIMIT_BYTES, MIN_BLOCK_WRITEBACK_LIMIT_BYTES,
         auto_block_writeback_pool_bytes, resolve_linux_block_writeback_policy,
     };
-    use super::{block_writeback_policy, is_owned_restored_disk, machine_cli_args};
+    use super::{
+        block_writeback_policy, is_owned_restored_disk, machine_cli_args, resolve_file_mounts,
+    };
     use crate::{
         LogLevel,
         backend::LocalBackend,
@@ -5419,6 +5436,29 @@ mod tests {
         ));
         // MSB_DIR_MOUNTS should NOT contain the file mount.
         assert!(!rendered.iter().any(|a| a.starts_with("MSB_DIR_MOUNTS=")));
+    }
+
+    #[tokio::test]
+    async fn resolve_file_mounts_rejects_deny_on_file_bind() {
+        let dir = tempdir().unwrap();
+        let host_file = dir.path().join("secret.txt");
+        std::fs::write(&host_file, b"secret").unwrap();
+
+        let config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .volume("/guest/secret.txt", |m| {
+                m.bind(host_file.as_path()).deny(["sub/.env"])
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let err = resolve_file_mounts(&config).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("deny patterns are not supported for a host file bind"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

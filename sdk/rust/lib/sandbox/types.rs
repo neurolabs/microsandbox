@@ -501,7 +501,8 @@ impl MountBuilder {
     ///
     /// Matching entries are invisible (ENOENT) and writes to them are forbidden
     /// (EACCES). Patterns are relative to the mount root and may be component
-    /// names (`.env`, `*.log`) or paths (`sub/secret`). Valid only for bind mounts.
+    /// names (`.env`, `*.log`) or paths (`sub/secret`). Valid only for directory
+    /// bind mounts; a host file bind has no namespace to filter and rejects them.
     pub fn deny(mut self, patterns: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.deny.extend(patterns.into_iter().map(Into::into));
         self
@@ -1410,6 +1411,9 @@ fn validate_host_path_wire_safe(path: &Path, label: &str) -> crate::Microsandbox
 /// The block is comma-joined and the spec is colon-split, so any of those
 /// separators (or a newline/NUL, which would corrupt gitignore parsing) must
 /// be rejected up front rather than silently attenuating other mount options.
+/// Leading or trailing whitespace is rejected too: the runtime trims option
+/// tokens, so a value like `" !secret"` would otherwise be silently
+/// reinterpreted as the allow rule `!secret`.
 ///
 /// Keep this in sync with the identical validators in
 /// `crates/runtime/lib/vm.rs` (`validate_deny_pattern`) and
@@ -1427,6 +1431,11 @@ fn validate_deny_pattern(pattern: &str) -> crate::MicrosandboxResult<()> {
     {
         return Err(crate::MicrosandboxError::InvalidConfig(format!(
             "deny pattern must not contain ',', ':', newline, or NUL: {pattern:?}"
+        )));
+    }
+    if pattern.trim() != pattern {
+        return Err(crate::MicrosandboxError::InvalidConfig(format!(
+            "deny pattern must not have leading or trailing whitespace: {pattern:?}"
         )));
     }
     Ok(())
@@ -1806,6 +1815,22 @@ mod tests {
             err.to_string().contains("must not be empty"),
             "empty pattern should be rejected, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_mount_builder_deny_rejects_surrounding_whitespace() {
+        for bad in [" .env", ".env ", " !secret", "\tsecret"] {
+            let err = MountBuilder::new("/data")
+                .bind("/host/data")
+                .deny([bad])
+                .build()
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("must not have leading or trailing whitespace"),
+                "pattern {bad:?} should be rejected, got: {err}"
+            );
+        }
     }
 
     #[test]

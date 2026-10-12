@@ -3651,7 +3651,10 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
 /// The option block is comma-joined and the spec is colon-split, so a `,` or
 /// `:` in a pattern would either fail the whole spawn or — worse — silently
 /// attenuate other mount protections. A newline/NUL would corrupt gitignore
-/// parsing. Validate here so the runtime never accepts an injectable pattern.
+/// parsing. Leading or trailing whitespace is rejected too: option tokens are
+/// trimmed, so a value like `" !secret"` would otherwise be silently
+/// reinterpreted as the allow rule `!secret`. Validate here so the runtime
+/// never accepts an injectable pattern.
 ///
 /// Keep this in sync with the identical validators in
 /// `sdk/rust/lib/sandbox/types.rs` and `sdk/go/native/src/lib.rs`.
@@ -3662,6 +3665,11 @@ fn validate_deny_pattern(value: &str) -> Result<(), String> {
     if value.contains(',') || value.contains(':') || value.contains('\n') || value.contains('\0') {
         return Err(format!(
             "deny pattern must not contain ',', ':', newline, or NUL: {value:?}"
+        ));
+    }
+    if value.trim() != value {
+        return Err(format!(
+            "deny pattern must not have leading or trailing whitespace: {value:?}"
         ));
     }
     Ok(())
@@ -4304,6 +4312,18 @@ mod tests {
         assert!(
             err.contains("empty deny pattern"),
             "expected empty-pattern rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_mount_spec_rejects_deny_with_leading_whitespace() {
+        // Option tokens are trimmed, but whitespace inside the value (after `=`)
+        // survives and must be rejected so `" !secret"` cannot silently become
+        // the allow rule `!secret`.
+        let err = parse_mount_spec("foo:/host/data:deny= !secret").unwrap_err();
+        assert!(
+            err.contains("leading or trailing whitespace"),
+            "expected whitespace rejection, got: {err}"
         );
     }
 

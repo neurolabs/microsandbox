@@ -699,7 +699,8 @@ class MountConfig:
     #: Must be set together with ``override_gid``. BIND/NAMED mounts only.
     override_uid: int | None = None
     override_gid: int | None = None
-    #: Host-side deny-list of gitignore-style patterns (BIND mounts only).
+    #: Host-side deny-list of gitignore-style patterns (directory binds only;
+    #: a host file bind rejects them because it has no namespace to filter).
     deny: list[str] | None = None
     #: Backing kind for storage allocated and removed with the sandbox.
     owned_kind: VolumeKind | None = None

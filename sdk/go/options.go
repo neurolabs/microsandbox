@@ -1834,7 +1834,9 @@ type MountOptions struct {
 	// Deny is a host-side deny-list of gitignore-style patterns for a bind mount.
 	// Matching entries are hidden from the guest (ENOENT) and writes to them are
 	// forbidden (EACCES). Patterns are relative to the mount root and may be
-	// component names (".env", "*.log") or paths ("sub/secret"). Bind mounts only.
+	// component names (".env", "*.log") or paths ("sub/secret"). Directory bind
+	// mounts only; a host file bind rejects them because it has no namespace to
+	// filter.
 	Deny []string
 }
 

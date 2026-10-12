@@ -2061,6 +2061,11 @@ fn validate_deny_pattern(pattern: &str) -> Result<(), FfiError> {
             "deny pattern must not contain ',', ':', newline, or NUL: {pattern:?}"
         )));
     }
+    if pattern.trim() != pattern {
+        return Err(FfiError::invalid_argument(format!(
+            "deny pattern must not have leading or trailing whitespace: {pattern:?}"
+        )));
+    }
     Ok(())
 }
 
@@ -8148,6 +8153,28 @@ mod tests {
             };
             assert!(
                 err.message.contains("must not contain"),
+                "pattern {bad:?} got: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn apply_volume_rejects_deny_with_surrounding_whitespace() {
+        for bad in [" .env", ".env ", " !secret"] {
+            let builder = microsandbox::sandbox::SandboxBuilder::new("test").image("alpine");
+            let spec = MountSpec {
+                bind: Some("/host/data".to_string()),
+                deny: vec![bad.to_string()],
+                ..Default::default()
+            };
+
+            let err = match apply_volume(builder, "/data", &spec) {
+                Ok(_) => panic!("deny pattern {bad:?} should be rejected"),
+                Err(err) => err,
+            };
+            assert!(
+                err.message.contains("leading or trailing whitespace"),
                 "pattern {bad:?} got: {}",
                 err.message
             );
