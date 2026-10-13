@@ -712,6 +712,33 @@ mod tests {
     }
 
     #[test]
+    fn path_pattern_is_anchored_at_mount_root() {
+        // A pattern containing a `/` is anchored at the mount root in gitignore
+        // semantics: `dir/secret` matches only the root-level `dir/secret`, and a
+        // leading `/` pins the name to the root, so `/foo` does not match a
+        // component boundary such as `foobar` nor a nested `a/foo`.
+        let list = deny(&["dir/secret"]);
+        assert!(list.matches_path(b"dir/secret", false));
+        assert!(!list.matches_path(b"x/dir/secret", false));
+        assert!(!list.matches_path(b"dir/secret/extra", false));
+
+        let rooted = deny(&["/foo"]);
+        assert!(rooted.matches_path(b"foo", false));
+        assert!(!rooted.matches_path(b"foobar", false));
+        assert!(!rooted.matches_path(b"a/foo", false));
+    }
+
+    #[test]
+    fn empty_path_matches_nothing() {
+        // An empty relative path is never a real entry and does not match a
+        // concrete pattern. (A catch-all `*` denies it, the fail-closed
+        // direction, but production never passes an empty path.)
+        let list = deny(&["dir/secret", ".env", "node_modules/"]);
+        assert!(!list.matches_path(b"", false));
+        assert!(!list.matches_path(b"", true));
+    }
+
+    #[test]
     fn bracket_pattern_matches() {
         let list = deny(&["[a-z]"]);
         assert!(list.matches_basename(b"a", false));

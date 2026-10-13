@@ -282,6 +282,35 @@ fn test_deny_readdir_omits_entries() {
     assert!(has_visible, "visible.txt should be in readdir");
 }
 
+/// Denied entries are omitted from readdirplus too.
+#[test]
+fn test_deny_readdirplus_omits_entries() {
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec![".env".to_string(), "*.log".to_string()],
+        ..cfg
+    });
+    sb.host_create_file(".env", b"hidden");
+    sb.host_create_file("data.log", b"hidden");
+    sb.host_create_file("visible.txt", b"ok");
+
+    let handle = sb.fuse_opendir(ROOT_INODE).unwrap();
+    let entries = sb
+        .fs
+        .readdirplus(sb.ctx(), ROOT_INODE, handle, 65536, 0)
+        .unwrap();
+
+    let names: Vec<&[u8]> = entries.iter().map(|(de, _)| de.name).collect();
+    assert!(
+        !names.contains(&b".env".as_slice()),
+        ".env should be hidden from readdirplus"
+    );
+    assert!(
+        !names.contains(&b"data.log".as_slice()),
+        "data.log should be hidden from readdirplus"
+    );
+    assert!(names.contains(&b"visible.txt".as_slice()));
+}
+
 //--------------------------------------------------------------------------------------------------
 // Tests: unlink/rmdir EACCES
 //--------------------------------------------------------------------------------------------------
@@ -541,7 +570,9 @@ fn test_deny_dir_only_mkdir_rejected_but_file_create_allowed() {
     sb.fuse_mkdir_root("other_dir").unwrap();
 }
 
-/// A dir-only pattern omits the directory from readdir but keeps a same-named file.
+/// A dir-only pattern omits a directory from readdir but keeps a same-named
+/// file: `node_modules/` matches directories only, so a file named
+/// `node_modules` stays visible.
 #[test]
 fn test_deny_dir_only_readdir_keeps_same_named_file() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
@@ -551,6 +582,9 @@ fn test_deny_dir_only_readdir_keeps_same_named_file() {
     sb.host_create_dir("node_modules");
     sb.host_create_dir("visible_dir");
     sb.host_create_file("visible.txt", b"ok");
+    // A same-named *file* in a subdirectory must stay visible.
+    sb.host_create_dir("sub");
+    sb.host_create_file("sub/node_modules", b"not a dir");
 
     let handle = sb.fuse_opendir(ROOT_INODE).unwrap();
     let entries = sb
@@ -565,6 +599,19 @@ fn test_deny_dir_only_readdir_keeps_same_named_file() {
     );
     assert!(names.contains(&b"visible_dir".as_slice()));
     assert!(names.contains(&b"visible.txt".as_slice()));
+
+    // The same-named file one level down is kept.
+    let sub = sb.lookup_root("sub").unwrap();
+    let sub_handle = sb.fuse_opendir(sub.inode).unwrap();
+    let sub_entries = sb
+        .fs
+        .readdir(sb.ctx(), sub.inode, sub_handle, 4096, 0)
+        .unwrap();
+    let sub_names: Vec<&[u8]> = sub_entries.iter().map(|e| &e.name[..]).collect();
+    assert!(
+        sub_names.contains(&b"node_modules".as_slice()),
+        "a file named node_modules must not be hidden by 'node_modules/'"
+    );
 }
 
 /// A dir-only pattern rejects renaming a directory to the denied name but
@@ -862,8 +909,13 @@ fn builder_rejects_path_pattern_on_writable_mount() {
 //--------------------------------------------------------------------------------------------------
 
 /// Directly exercises `decide_rename_deny`: a fresh source identity proceeds, a
-/// stale one retries. Covers the extraction's Retry branch without needing a
-/// concurrent writer (or macOS).
+/// stale one retries, and a denied endpoint is denied. Covers the extraction's
+/// Proceed/Retry/Deny branches without needing a concurrent writer (or macOS).
+///
+/// The exchange-destination `Retry` re-check inside the same call cannot be
+/// triggered without a concurrent writer mutating the destination between the
+/// capture and the re-check; its `ExchangeDest::still_matches` logic is covered
+/// by the unit tests in `remove_ops`.
 #[test]
 fn test_decide_rename_deny_proceeds_and_retries_on_stale_source() {
     use super::super::inode;
@@ -909,6 +961,26 @@ fn test_decide_rename_deny_proceeds_and_retries_on_stale_source() {
     assert!(matches!(
         decide_rename_deny(&sb.fs, old, new, 0, &stale).unwrap(),
         RenameDecision::Retry
+    ));
+
+    // A denied endpoint (the path pattern `sub/.env` matches `sub/.env`)
+    // -> deny, decided from the fresh source identity.
+    let denied_name = TestSandbox::cstr(".env");
+    let denied = RenameEndpoint {
+        fd: &sub_fd,
+        dir: sub_inode,
+        name: denied_name.as_c_str(),
+    };
+    let current = platform::fstat(keep_fd.raw()).unwrap();
+    assert!(matches!(
+        decide_rename_deny(&sb.fs, denied, new, 0, &current).unwrap(),
+        RenameDecision::Deny
+    ));
+
+    // A denied destination is also a deny.
+    assert!(matches!(
+        decide_rename_deny(&sb.fs, old, denied, 0, &current).unwrap(),
+        RenameDecision::Deny
     ));
 }
 
@@ -968,10 +1040,10 @@ fn do_link_denies_dir_only_rule_using_source_type() {
 /// A symlink whose target is denied does not expose the target.
 ///
 /// The link entry itself is served (deny matches the entry name, and `link` is
-/// allowed), but following the link is a fresh lookup of the target name, which
-/// deny rejects. So the target's contents stay unreachable; only the link
-/// entry's existence is observable, which is the same name-based limitation as
-/// any allowed name.
+/// allowed), but following the link resolves the target name, which is a fresh
+/// lookup that deny rejects with `ENOENT`. The target's contents stay
+/// unreachable; only the link entry's existence is observable, which is the
+/// same name-based limitation as any allowed name.
 #[test]
 fn test_deny_symlink_to_denied_target_does_not_expose_target() {
     use std::os::unix::fs::symlink;
@@ -983,8 +1055,13 @@ fn test_deny_symlink_to_denied_target_does_not_expose_target() {
     symlink(".env", sb.root.join("link")).unwrap();
 
     // The link entry is served: its own name `link` is not denied.
-    assert!(sb.lookup_root("link").is_ok());
+    let link = sb.lookup_root("link").unwrap();
 
-    // Following the link resolves the target name, which is denied.
+    // Traverse the link: read its target, then resolve that target name.
+    let target = sb.fs.readlink(sb.ctx(), link.inode).unwrap();
+    assert_eq!(target, b".env", "the link points at the denied target");
+
+    // Following the link is a fresh lookup of the target name, which deny
+    // rejects, so the target's contents stay unreachable.
     TestSandbox::assert_errno(sb.lookup_root(".env"), LINUX_ENOENT);
 }

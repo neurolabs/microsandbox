@@ -1816,6 +1816,35 @@ fn deny_readdir_omits_entries() {
     );
 }
 
+/// Denied entries are omitted from readdirplus too (parity with the unix
+/// `test_deny_readdirplus_omits_entries` test).
+#[test]
+fn deny_readdirplus_omits_entries() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join(".env"), b"hidden").unwrap();
+    std::fs::write(temp.path.join("data.log"), b"hidden").unwrap();
+    std::fs::write(temp.path.join("visible.txt"), b"ok").unwrap();
+    let fs = fs_for_deny(&temp.path, vec![".env".to_string(), "*.log".to_string()]);
+
+    let (handle, _) = fs
+        .opendir(context(), ROOT_INODE, LINUX_O_DIRECTORY as u32)
+        .unwrap();
+    let entries = fs
+        .readdirplus(context(), ROOT_INODE, handle.unwrap(), 4096, 0)
+        .unwrap();
+
+    let names: Vec<&[u8]> = entries.iter().map(|(de, _)| de.name).collect();
+    assert!(
+        !names.contains(&b".env".as_slice()),
+        ".env should be hidden from readdirplus"
+    );
+    assert!(
+        !names.contains(&b"data.log".as_slice()),
+        "data.log should be hidden from readdirplus"
+    );
+    assert!(names.contains(&b"visible.txt".as_slice()));
+}
+
 /// A directory whose inode was obtained while it was an allowed *file* at a
 /// directory-only-denied name must not become openable if a concurrent host
 /// writer replaces it with a directory before `opendir`.
