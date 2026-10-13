@@ -1015,15 +1015,7 @@ fn default_oci_tmpfs_size_mib(memory_mib: u32) -> u32 {
 }
 
 fn guest_mount_is(mount: &VolumeMount, path: &str) -> bool {
-    match mount {
-        VolumeMount::Bind { guest, .. }
-        | VolumeMount::Named { guest, .. }
-        | VolumeMount::Owned { guest, .. }
-        | VolumeMount::Tmpfs { guest, .. }
-        | VolumeMount::DiskImage { guest, .. } => {
-            Utf8UnixPath::new(guest).normalize() == Utf8UnixPath::new(path).normalize()
-        }
-    }
+    Utf8UnixPath::new(mount.guest()).normalize() == Utf8UnixPath::new(path).normalize()
 }
 
 pub(crate) fn sandbox_log_level_from_runtime(level: LogLevel) -> SandboxLogLevel {

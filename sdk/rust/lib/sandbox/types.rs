@@ -1386,6 +1386,11 @@ fn validate_volume_mount(mount: &VolumeMount) -> crate::MicrosandboxResult<()> {
                 validate_fstype(fstype)?;
             }
         }
+        _ => {
+            return Err(crate::MicrosandboxError::InvalidConfig(
+                "unrecognized volume mount variant; this SDK version cannot validate it".into(),
+            ));
+        }
     }
     Ok(())
 }

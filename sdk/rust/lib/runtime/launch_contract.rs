@@ -498,6 +498,7 @@ impl LaunchContract {
                 VolumeMount::Owned { options, .. }
                 | VolumeMount::Tmpfs { options, .. }
                 | VolumeMount::DiskImage { options, .. } => (options, false),
+                _ => return unsupported("unrecognized volume mount"),
             };
             if (self.patch < 7 && follow_root_symlinks)
                 || (self.patch < 15

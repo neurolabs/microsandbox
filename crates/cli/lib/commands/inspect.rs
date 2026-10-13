@@ -390,6 +390,7 @@ pub async fn run(args: InspectArgs) -> anyhow::Result<()> {
                             format.as_str()
                         );
                     }
+                    _ => {}
                 }
             }
         }

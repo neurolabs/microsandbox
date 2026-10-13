@@ -647,12 +647,15 @@ fn reject_dropped_cloud_create_fields(config: &SandboxConfig) -> MicrosandboxRes
         return Err(unsupported("sandbox-owned volumes"));
     }
     if config.spec.mounts.iter().any(|mount| {
-        let options = match mount {
-            microsandbox_types::VolumeMount::Bind { options, .. }
-            | microsandbox_types::VolumeMount::Owned { options, .. }
-            | microsandbox_types::VolumeMount::Named { options, .. }
-            | microsandbox_types::VolumeMount::Tmpfs { options, .. }
-            | microsandbox_types::VolumeMount::DiskImage { options, .. } => options,
+        let options = if let microsandbox_types::VolumeMount::Bind { options, .. }
+        | microsandbox_types::VolumeMount::Owned { options, .. }
+        | microsandbox_types::VolumeMount::Named { options, .. }
+        | microsandbox_types::VolumeMount::Tmpfs { options, .. }
+        | microsandbox_types::VolumeMount::DiskImage { options, .. } = mount
+        {
+            options
+        } else {
+            return false;
         };
         options.override_uid.is_some() || options.override_gid.is_some()
     }) {

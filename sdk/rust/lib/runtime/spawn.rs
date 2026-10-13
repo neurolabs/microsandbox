@@ -3231,6 +3231,15 @@ fn machine_cli_args(
                     flags: bootstrap_mount_flags(*options),
                 });
             }
+            _ => {
+                // `VolumeMount` is non-exhaustive across crates. Launch preflight
+                // rejects any variant this builder does not understand, so an
+                // unrecognized mount must not reach here.
+                debug_assert!(
+                    false,
+                    "unrecognized volume mount reached launch argument builder"
+                );
+            }
         }
     }
 

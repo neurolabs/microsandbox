@@ -388,6 +388,7 @@ pub enum OwnedVolumeStorage {
 
 /// A volume mount specification for a sandbox.
 #[derive(Clone)]
+#[non_exhaustive]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(tag = "type"))]
@@ -1578,6 +1579,27 @@ impl VolumeMount {
         match self {
             Self::Named { create, .. } => create.as_ref(),
             _ => None,
+        }
+    }
+
+    /// Construct a bind mount with protective defaults.
+    ///
+    /// Use this instead of a `Bind { .. }` struct literal so a future field
+    /// cannot break external callers. Every optional field takes its
+    /// serialized default: default mount options, `strict` stat
+    /// virtualization, `private` host permissions, no root-symlink following,
+    /// no quota, and an empty `deny` list. Chain configuration through the
+    /// returned value's public fields or the sandbox builder afterward.
+    pub fn bind(host: impl Into<PathBuf>, guest: impl Into<String>) -> Self {
+        Self::Bind {
+            host: host.into(),
+            guest: guest.into(),
+            options: MountOptions::default(),
+            stat_virtualization: StatVirtualization::Strict,
+            host_permissions: HostPermissions::Private,
+            follow_root_symlinks: false,
+            quota_mib: None,
+            deny: Vec::new(),
         }
     }
 }

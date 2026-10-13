@@ -600,6 +600,7 @@ fn to_built_mount(mount: RustVolumeMount) -> JsBuiltVolumeMount {
             override_uid: None,
             override_gid: None,
         },
+        _ => unreachable!("all VolumeMount variants are handled by the Node mount projection"),
     }
 }
 
