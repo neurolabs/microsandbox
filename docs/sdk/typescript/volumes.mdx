@@ -951,6 +951,8 @@ Set the guest owner for bind and directory-backed named mounts when no per-file 
 
 #### <span className="msb-recv">mount.</span><span className="msb-hn">deny()</span>
 
+<Tooltip tip="On microsandbox cloud, bind-mount deny lists are not supported; a non-empty deny list is rejected at creation."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
 ```typescript
 deny(patterns: Array<string>): this
 ```

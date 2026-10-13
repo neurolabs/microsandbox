@@ -1442,6 +1442,8 @@ Ignore device files on this mount.
 
 #### <span className="msb-recv">mount.</span><span className="msb-hn">deny()</span>
 
+<Tooltip tip="On microsandbox cloud, bind-mount deny lists are not supported; a non-empty deny list is rejected at creation."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
 ```rust
 fn deny(self, patterns: impl IntoIterator<Item = impl Into<String>>) -> Self
 ```
