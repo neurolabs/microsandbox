@@ -2176,6 +2176,83 @@ fn unlink_allowed_file_succeeds() {
     assert!(!temp.path.join("plain.txt").exists());
 }
 
+//--------------------------------------------------------------------------------------------------
+// Tests: alternate Windows name aliases
+//--------------------------------------------------------------------------------------------------
+
+/// `.env.` names `.env` after Win32 strips the trailing dot. It must never
+/// resolve onto the hidden file; a validation error or ENOENT both keep the
+/// name hidden.
+#[test]
+fn lookup_denied_name_via_trailing_dot_is_hidden() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join(".env"), b"secret").unwrap();
+    let fs = fs_for_deny(&temp.path, vec![".env".to_string()]);
+
+    match fs.lookup(context(), ROOT_INODE, c".env.") {
+        Ok(_) => panic!("trailing-dot name must not resolve to the hidden file"),
+        Err(error) => assert!(matches!(
+            error.raw_os_error(),
+            Some(LINUX_EINVAL) | Some(LINUX_ENOENT)
+        )),
+    }
+}
+
+/// `.env ` names `.env` after Win32 strips the trailing space; same guarantee.
+#[test]
+fn lookup_denied_name_via_trailing_space_is_hidden() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join(".env"), b"secret").unwrap();
+    let fs = fs_for_deny(&temp.path, vec![".env".to_string()]);
+
+    match fs.lookup(context(), ROOT_INODE, c".env ") {
+        Ok(_) => panic!("trailing-space name must not resolve to the hidden file"),
+        Err(error) => assert!(matches!(
+            error.raw_os_error(),
+            Some(LINUX_EINVAL) | Some(LINUX_ENOENT)
+        )),
+    }
+}
+
+/// A denied long name reached through its 8.3 short alias (`NODE_M~1`) is
+/// hidden. Short names are only generated on volumes with
+/// `NtfsDisable8dot3NameCreation` disabled; the backend denies any `~`+digit
+/// component while a deny list is active (over-match, fail closed), so the
+/// guarantee holds even where the volume generates no short name.
+#[test]
+fn lookup_denied_long_name_via_short_alias_is_hidden() {
+    let temp = TempDir::new();
+    std::fs::create_dir(temp.path.join("node_modules")).unwrap();
+    let fs = fs_for_deny(&temp.path, vec!["node_modules/".to_string()]);
+
+    expect_errno(fs.lookup(context(), ROOT_INODE, c"NODE_M~1"), LINUX_ENOENT);
+}
+
+/// Creating a denied name through a trailing-dot form is rejected.
+#[test]
+fn create_denied_name_via_trailing_dot_is_rejected() {
+    let temp = TempDir::new();
+    let fs = fs_for_deny(&temp.path, vec![".env".to_string()]);
+
+    let result = fs.create(
+        context(),
+        ROOT_INODE,
+        c".env.",
+        S_IFREG | 0o644,
+        false,
+        (LINUX_O_CREAT | LINUX_O_RDWR) as u32,
+        0,
+        Extensions::default(),
+    );
+    match result {
+        Ok(_) => panic!("trailing-dot create must be rejected"),
+        Err(error) => assert!(matches!(
+            error.raw_os_error(),
+            Some(LINUX_EINVAL) | Some(LINUX_EACCES)
+        )),
+    }
+}
+
 #[test]
 fn no_override_falls_back_to_configured_default_owner() {
     let temp = TempDir::new();

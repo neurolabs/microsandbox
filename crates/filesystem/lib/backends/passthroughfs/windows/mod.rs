@@ -5,6 +5,7 @@
 //! virtio-fs while keeping guest metadata private and rejecting Windows path
 //! features that could escape the mount root.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ffi::{CStr, OsString};
 use std::fs::{File, FileTimes, OpenOptions as StdOpenOptions};
@@ -268,6 +269,18 @@ impl PassthroughFs {
         if name_bytes == b"." || name_bytes == b".." {
             return false;
         }
+        // A component that could be an 8.3 short-name alias (`NODE_M~1`) must
+        // not name a denied long name. Resolving the long name needs the live
+        // child path and `GetLongPathNameW`, which is not available on every
+        // volume; fail closed instead by denying any `~`+digit component while
+        // a deny list is active. This over-matches — a legitimately named
+        // `report~1` is hidden too — in the safe direction required for NTFS.
+        if !self.deny.is_empty()
+            && let Ok(component) = canonical_component(name)
+            && short_name_alias(component.as_ref())
+        {
+            return true;
+        }
         if !self.deny.needs_path_reconstruction() {
             return self.deny.matches_basename(name_bytes, is_dir);
         }
@@ -347,8 +360,40 @@ fn validate_component(name: &CStr) -> io::Result<&str> {
     {
         return Err(linux_error(LINUX_EPERM));
     }
+    // Win32 strips a trailing dot or space from a name before it reaches the
+    // filesystem, so `.env.` or `node_modules ` would resolve to a *different*
+    // node than the component spells. Reject such a component rather than let
+    // it address a denied (or any) entry under a surprising name.
+    if component.ends_with('.') || component.ends_with(' ') {
+        return Err(linux_error(LINUX_EINVAL));
+    }
 
     Ok(component)
+}
+
+/// Map a guest-supplied component to the on-disk name a deny decision must use.
+///
+/// The current implementation validates the component and returns it unchanged:
+/// Win32 alternate names (8.3 short names) are handled by a fail-closed
+/// over-match in [`PassthroughFs::deny_matches_name`], because resolving the
+/// long name requires a live child path and `GetLongPathNameW` is not available
+/// on every volume. The [`Cow`] return leaves room for a future long-name
+/// resolver without changing callers.
+fn canonical_component(name: &CStr) -> io::Result<Cow<'_, str>> {
+    validate_component(name).map(Cow::Borrowed)
+}
+
+/// Whether `component` could be an 8.3 short-name alias.
+///
+/// Short names encode a `~` followed by one or more decimal digits (for example
+/// `NODE_M~1`). Any component of that shape is treated as a possible alias and
+/// denied while a deny list is active, so a denied long name can never be
+/// reached through its short form. See [`PassthroughFs::deny_matches_name`].
+fn short_name_alias(component: &str) -> bool {
+    component
+        .as_bytes()
+        .windows(2)
+        .any(|pair| pair[0] == b'~' && pair[1].is_ascii_digit())
 }
 
 fn is_reserved_name(component: &str) -> bool {
