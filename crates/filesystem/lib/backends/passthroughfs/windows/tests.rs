@@ -2293,6 +2293,54 @@ fn windows_restore_reapplies_deny_to_aliases() {
     );
 }
 
+//--------------------------------------------------------------------------------------------------
+// Tests: inode-scoped deny coherence
+//--------------------------------------------------------------------------------------------------
+
+/// A path-backed inode whose allowed file was replaced by a directory at a
+/// directory-only-denied name must not have its attributes mutated.
+#[test]
+fn setattr_on_replaced_dir_only_denied_path_is_refused() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join("node_modules"), b"file").unwrap();
+    let fs = fs_for_deny(&temp.path, vec!["node_modules/".to_string()]);
+    let entry = fs.lookup(context(), ROOT_INODE, c"node_modules").unwrap();
+
+    std::fs::remove_file(temp.path.join("node_modules")).unwrap();
+    std::fs::create_dir(temp.path.join("node_modules")).unwrap();
+
+    let attr = stat64 {
+        st_mode: S_IFDIR | 0o755,
+        ..Default::default()
+    };
+    match fs.setattr(context(), entry.inode, attr, None, SetattrValid::MODE) {
+        Ok(_) => panic!("setattr must not mutate a hidden replacement directory"),
+        Err(error) => assert!(matches!(
+            error.raw_os_error(),
+            Some(LINUX_EACCES) | Some(LINUX_ENOENT)
+        )),
+    }
+}
+
+/// A directory that replaced an allowed file at a directory-only-denied name
+/// must not have its contents exposed through `opendir`.
+#[test]
+fn opendir_after_replacement_dir_does_not_expose_contents() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join("node_modules"), b"file").unwrap();
+    let fs = fs_for_deny(&temp.path, vec!["node_modules/".to_string()]);
+    let entry = fs.lookup(context(), ROOT_INODE, c"node_modules").unwrap();
+
+    std::fs::remove_file(temp.path.join("node_modules")).unwrap();
+    std::fs::create_dir(temp.path.join("node_modules")).unwrap();
+    std::fs::write(temp.path.join("node_modules").join("secret"), b"hidden").unwrap();
+
+    expect_errno(
+        fs.opendir(context(), entry.inode, LINUX_O_DIRECTORY as u32),
+        LINUX_ENOENT,
+    );
+}
+
 #[test]
 fn no_override_falls_back_to_configured_default_owner() {
     let temp = TempDir::new();

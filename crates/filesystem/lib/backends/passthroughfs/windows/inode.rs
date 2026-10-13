@@ -224,6 +224,33 @@ impl PassthroughFs {
         Ok(data)
     }
 
+    /// Re-apply the directory-only deny rule to an inode's live path.
+    ///
+    /// Windows inodes cache a path and are not revalidated against the live
+    /// filesystem. A host writer could replace an allowed file at a
+    /// directory-only-denied name with a directory after lookup vouched for it;
+    /// an inode-scoped mutation must not then act on the hidden replacement.
+    /// The mount root and pinned (`retained`) objects are exempt. Fails closed:
+    /// an unreadable live path is treated as a directory.
+    pub(super) fn reject_dir_only_denied_live_path(&self, inode: u64) -> io::Result<()> {
+        if inode == ROOT_INODE || !self.deny.has_dir_only_patterns() {
+            return Ok(());
+        }
+        let data = self.inode(inode)?;
+        if data.retained.lock().unwrap().is_some() {
+            return Ok(());
+        }
+        let path = data.path();
+        let is_dir = self
+            .safe_metadata(&path)
+            .map(|metadata| metadata.file_type().is_dir())
+            .unwrap_or(true);
+        if self.deny_matches_path(&path, is_dir) {
+            return Err(linux_error(LINUX_ENOENT));
+        }
+        Ok(())
+    }
+
     pub(super) fn child_path(&self, parent: u64, name: &CStr) -> io::Result<PathBuf> {
         let name = validate_component(name)?;
         let data = self.inode(parent)?;

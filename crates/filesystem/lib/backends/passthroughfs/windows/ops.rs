@@ -74,6 +74,11 @@ impl DynFileSystem for PassthroughFs {
         handle: Option<u64>,
         valid: SetattrValid,
     ) -> io::Result<(stat64, Duration)> {
+        // A path-backed inode can be replaced on the host after lookup. Re-apply
+        // the directory-only deny rule before mutating attributes through the
+        // stale path, so a hidden replacement directory is not exposed or
+        // modified. `opendir` and `child_path` already re-check the same way.
+        self.reject_dir_only_denied_live_path(inode)?;
         self.do_setattr(inode, attr, handle, valid)
     }
 
