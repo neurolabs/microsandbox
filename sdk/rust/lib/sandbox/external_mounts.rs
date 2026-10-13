@@ -163,6 +163,41 @@ fn reject_weakened_deny(
     Ok(())
 }
 
+/// Refuse a branch child whose explicit mounts weaken a source bind's deny list.
+///
+/// A local branch clears the source's external binds, so a child that does not
+/// inherit resources must re-declare each deny-bearing bind with a deny list at
+/// least as strict as the source's. Callers skip this when the child inherits
+/// resources, because the source mount (including its deny list) is reconnected.
+pub(crate) fn require_preserved_bind_deny(
+    source_mounts: &[VolumeMount],
+    destination_mounts: &[VolumeMount],
+) -> MicrosandboxResult<()> {
+    let mut source = source_mounts.to_vec();
+    canonicalize_volume_mounts(&mut source)?;
+
+    let policies: Vec<ExternalMountPolicy> = source
+        .iter()
+        .filter_map(|mount| match mount {
+            VolumeMount::Bind { guest, deny, .. } if !deny.is_empty() => {
+                Some(ExternalMountPolicy {
+                    guest_path: guest.clone(),
+                    deny: deny.clone(),
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    if policies.is_empty() {
+        return Ok(());
+    }
+
+    let mut destination = destination_mounts.to_vec();
+    canonicalize_volume_mounts(&mut destination)?;
+
+    reject_weakened_deny(&destination, Some(&policies))
+}
+
 /// Reconnect only user-selected bindings or an exact locally recorded source binding.
 pub(crate) async fn resolve_external_mounts(
     local: &LocalBackend,

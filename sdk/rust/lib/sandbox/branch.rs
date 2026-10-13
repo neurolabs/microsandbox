@@ -403,6 +403,12 @@ pub(super) async fn prepare_branch(
     }
     // Owned declarations contain no source host path. Retain them as the required inventory
     // until capture proves that every one has independent child backing; clear external mounts.
+    let source_mounts = config.spec.mounts.clone();
+    if !options.restore_resources.inherit {
+        // A local branch clears the source's external binds, so a child that does not inherit
+        // resources must re-declare any deny-bearing bind rather than silently dropping its policy.
+        crate::sandbox::require_preserved_bind_deny(&source_mounts, &options.spec.mounts)?;
+    }
     config
         .spec
         .mounts
@@ -754,5 +760,39 @@ mod tests {
             .volume("/data", |v| v.bind("/host/data"))
             .volume("/data", |v| v.disk("/images/seed.img"));
         assert_disk_mount(&builder.inner.config.clone().into_config());
+    }
+
+    #[test]
+    fn branch_of_deny_bearing_source_requires_redeclaration() {
+        use crate::sandbox::{HostPermissions, MountOptions, StatVirtualization, VolumeMount};
+        use std::path::PathBuf;
+
+        let bind = |guest: &str, deny: &[&str]| VolumeMount::Bind {
+            host: PathBuf::from("/host/data"),
+            guest: guest.into(),
+            options: MountOptions::default(),
+            stat_virtualization: StatVirtualization::Strict,
+            host_permissions: HostPermissions::Private,
+            follow_root_symlinks: false,
+            quota_mib: None,
+            deny: deny.iter().map(|pattern| (*pattern).to_string()).collect(),
+        };
+
+        let source = vec![bind("/data", &[".env"])];
+
+        // A plain child bind drops the deny list and must be refused.
+        let plain = vec![bind("/data", &[])];
+        assert!(crate::sandbox::require_preserved_bind_deny(&source, &plain).is_err());
+
+        // Re-declaring the same deny list is accepted.
+        crate::sandbox::require_preserved_bind_deny(&source, &source).unwrap();
+
+        // A stricter child deny list is accepted.
+        let stricter = vec![bind("/data", &[".env", "*.log"])];
+        crate::sandbox::require_preserved_bind_deny(&source, &stricter).unwrap();
+
+        // A source without deny imposes no requirement on the child.
+        let plain_source = vec![bind("/data", &[])];
+        crate::sandbox::require_preserved_bind_deny(&plain_source, &plain).unwrap();
     }
 }
