@@ -25,7 +25,7 @@
 
 use std::io;
 use std::path::Path;
-#[cfg(unix)]
+#[cfg(not(target_os = "windows"))]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -85,6 +85,15 @@ pub(crate) struct DenyList {
     has_dir_only_patterns: bool,
     /// Whether the list has no patterns (matches nothing).
     empty: bool,
+}
+
+/// RAII guard for the case-sensitivity probe file.
+///
+/// Removes the probe on drop so an early `?` return (for example a failed
+/// write) still cleans up, leaving no artifact in the user's host directory.
+#[cfg(not(target_os = "windows"))]
+struct ProbeFile {
+    path: PathBuf,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -257,6 +266,17 @@ impl DenyList {
 }
 
 //--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(not(target_os = "windows"))]
+impl Drop for ProbeFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
 
@@ -340,22 +360,26 @@ fn mount_is_case_insensitive(root: &Path, readonly: bool) -> bool {
     let seq = CASE_PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
     let probe_name = format!("{CASE_PROBE_PREFIX}-{}-{seq}", std::process::id());
     let validation_name = format!("{}-{}-{seq}", CASE_VALIDATION_PREFIX, std::process::id());
-    let probe = root.join(&probe_name);
+    let probe = ProbeFile {
+        path: root.join(&probe_name),
+    };
     let validation = root.join(&validation_name);
 
     let result = (|| -> std::io::Result<bool> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&probe)?;
+            .open(&probe.path)?;
         std::io::Write::write_all(&mut file, b"probe")?;
         // If the case-flipped name resolves, the same file was found by a
         // differently-cased name, so the filesystem is case-insensitive.
         let insensitive = std::fs::symlink_metadata(&validation).is_ok();
-        std::fs::remove_file(&probe)?;
         Ok(insensitive)
     })();
 
+    // The `ProbeFile` guard removes the probe on drop, so an early `?` return
+    // above cannot leave an artifact behind. A failed probe defaults to
+    // case-insensitive (over-match), never error.
     result.unwrap_or(true)
 }
 
@@ -461,6 +485,40 @@ mod tests {
         let _ = mount_is_case_insensitive(root.path(), false);
         let empty = std::fs::read_dir(root.path()).unwrap().count();
         assert_eq!(empty, 0);
+    }
+
+    #[test]
+    fn case_probe_leaves_no_artifact_on_write_failure() {
+        // A probe write that cannot complete must not leave a file behind in the
+        // user's host directory. `root` is a regular file here, so creating the
+        // probe beneath it fails with ENOTDIR.
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+
+        let _ = mount_is_case_insensitive(&blocker, false);
+
+        let names: Vec<std::ffi::OsString> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("blocker")]);
+    }
+
+    #[test]
+    fn probe_file_guard_removes_file_on_drop() {
+        // The RAII guard must remove the probe file on every exit path,
+        // including an early `?` return from the write/probe sequence.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe");
+        std::fs::write(&path, b"x").unwrap();
+
+        {
+            let _guard = ProbeFile { path: path.clone() };
+            assert!(path.exists());
+        }
+
+        assert!(!path.exists(), "ProbeFile must remove its file on drop");
     }
 
     #[test]
