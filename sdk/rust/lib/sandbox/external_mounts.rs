@@ -9,6 +9,7 @@ use microsandbox_runtime::{
 };
 use microsandbox_types::{
     ExternalMountRestorePolicy, VolumeKind, VolumeMount, canonicalize_volume_mounts,
+    snapshot::ExternalMountPolicy,
 };
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
@@ -34,8 +35,16 @@ pub(crate) fn require_recorded_mounts(
     manifest: &Manifest,
 ) -> MicrosandboxResult<()> {
     let guest_paths = manifest.external_mounts().map_err(integrity)?;
+    let policies = manifest.external_mount_policies().map_err(integrity)?;
+    if policies.is_none() && !guest_paths.is_empty() {
+        tracing::warn!(
+            mounts = guest_paths.len(),
+            "snapshot records external mounts without a captured deny policy; \
+             a restored deny list cannot be compared and is accepted as unknown"
+        );
+    }
 
-    require_guest_mounts(config, guest_paths)
+    require_guest_mounts(config, guest_paths, policies)
 }
 
 /// Guest paths of the external bind mounts a checkpoint captured (owned directories are restored
@@ -69,14 +78,24 @@ pub(crate) fn external_bind_guest_paths(
 pub(crate) fn require_guest_mounts(
     config: &SandboxConfig,
     guest_paths: Vec<String>,
+    captured_policies: Option<Vec<ExternalMountPolicy>>,
 ) -> MicrosandboxResult<()> {
-    if !config.restore_resources.require_complete {
+    let has_policies = captured_policies
+        .as_ref()
+        .is_some_and(|policies| !policies.is_empty());
+    if !config.restore_resources.require_complete && !has_policies {
         return Ok(());
     }
 
     // The backend canonicalizes mounts later; compare the same form (`/data/` is `/data`).
     let mut mounts = config.spec.mounts.clone();
     canonicalize_volume_mounts(&mut mounts)?;
+
+    reject_weakened_deny(&mounts, captured_policies.as_deref())?;
+
+    if !config.restore_resources.require_complete {
+        return Ok(());
+    }
 
     // Only host-backed kinds satisfy a recorded path; tmpfs or owned mounts would
     // restart with empty state in place of the captured host binding.
@@ -102,6 +121,46 @@ pub(crate) fn require_guest_mounts(
     } else {
         Err(missing_disk_mounts(missing))
     }
+}
+
+/// Refuse a destination deny list that is not at least as strict as the captured one.
+///
+/// Only bind mounts carry a deny list; a destination that remaps a captured bind
+/// to a non-bind or drops one of its patterns would re-expose a path the source
+/// hid. A stricter (superset) deny list is accepted. `None` means the capture
+/// predates policy recording and is treated as unknown, never as an empty list.
+fn reject_weakened_deny(
+    mounts: &[VolumeMount],
+    captured_policies: Option<&[ExternalMountPolicy]>,
+) -> MicrosandboxResult<()> {
+    let Some(policies) = captured_policies else {
+        return Ok(());
+    };
+
+    for policy in policies {
+        let Some(destination) = mounts
+            .iter()
+            .find(|mount| mount.guest() == policy.guest_path)
+        else {
+            continue;
+        };
+        let destination_deny: &[String] = match destination {
+            VolumeMount::Bind { deny, .. } => deny,
+            _ => &[],
+        };
+        if !policy
+            .deny
+            .iter()
+            .all(|pattern| destination_deny.contains(pattern))
+        {
+            return Err(MicrosandboxError::InvalidConfig(format!(
+                "restore would weaken bind-mount deny policy at {}; re-declare the deny list",
+                policy.guest_path
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// Reconnect only user-selected bindings or an exact locally recorded source binding.
@@ -551,7 +610,7 @@ mod tests {
         };
         let unmapped = config(SandboxBuilder::new("restore"), true);
 
-        let refusal = require_guest_mounts(&unmapped, paths.clone()).unwrap_err();
+        let refusal = require_guest_mounts(&unmapped, paths.clone(), None).unwrap_err();
         let error = refusal.to_string();
         let MicrosandboxError::MissingRestoreBindings { missing, restore } = refusal else {
             panic!("an unmapped disk restore must report missing bindings");
@@ -571,7 +630,7 @@ mod tests {
         );
 
         let Err(MicrosandboxError::MissingRestoreBindings { missing, restore }) =
-            require_guest_mounts(&tmpfs, paths.clone())
+            require_guest_mounts(&tmpfs, paths.clone(), None)
         else {
             panic!("a tmpfs is not a host binding");
         };
@@ -585,8 +644,72 @@ mod tests {
         );
         let opted_out = config(SandboxBuilder::new("restore"), false);
 
-        require_guest_mounts(&mapped, paths.clone()).unwrap();
-        require_guest_mounts(&opted_out, paths).unwrap();
+        require_guest_mounts(&mapped, paths.clone(), None).unwrap();
+        require_guest_mounts(&opted_out, paths, None).unwrap();
+    }
+
+    #[test]
+    fn restore_rejects_bind_that_drops_captured_deny() {
+        let mut config = SandboxBuilder::new("restore")
+            .volume("/data", |m| m.bind("/tmp/d"))
+            .config
+            .into_config();
+        config.restore_resources.require_complete = true;
+        let captured = vec![ExternalMountPolicy {
+            guest_path: "/data".into(),
+            deny: vec![".env".into()],
+        }];
+
+        let refusal =
+            require_guest_mounts(&config, vec!["/data".into()], Some(captured)).unwrap_err();
+        let error = refusal.to_string();
+
+        assert!(
+            error.contains("weaken bind-mount deny policy at /data"),
+            "{error}"
+        );
+        assert!(error.contains("re-declare the deny list"), "{error}");
+    }
+
+    #[test]
+    fn restore_accepts_bind_that_preserves_deny() {
+        let mut config = SandboxBuilder::new("restore")
+            .volume("/data", |m| m.bind("/tmp/d").deny([".env"]))
+            .config
+            .into_config();
+        config.restore_resources.require_complete = true;
+        let captured = vec![ExternalMountPolicy {
+            guest_path: "/data".into(),
+            deny: vec![".env".into()],
+        }];
+
+        require_guest_mounts(&config, vec!["/data".into()], Some(captured)).unwrap();
+    }
+
+    #[test]
+    fn restore_accepts_bind_that_strengthens_deny() {
+        let mut config = SandboxBuilder::new("restore")
+            .volume("/data", |m| m.bind("/tmp/d").deny([".env", "*.log"]))
+            .config
+            .into_config();
+        config.restore_resources.require_complete = true;
+        let captured = vec![ExternalMountPolicy {
+            guest_path: "/data".into(),
+            deny: vec![".env".into()],
+        }];
+
+        require_guest_mounts(&config, vec!["/data".into()], Some(captured)).unwrap();
+    }
+
+    #[test]
+    fn restore_accepts_legacy_manifest_without_policy() {
+        let mut config = SandboxBuilder::new("restore")
+            .volume("/data", |m| m.bind("/tmp/d"))
+            .config
+            .into_config();
+        config.restore_resources.require_complete = true;
+
+        require_guest_mounts(&config, vec!["/data".into()], None).unwrap();
     }
 
     async fn requested_mount() -> VolumeMount {
