@@ -331,4 +331,91 @@ mod tests {
             }
         }
     }
+
+    /// Released v0.6.0 `SandboxSpec` serialization. See `fixtures/README.md` for
+    /// provenance: byte-for-byte copy of
+    /// `git show v0.7.0:sdk/rust/lib/db/fixtures/config-0.6.0.json`, shape-verified
+    /// against tag `v0.6.0`.
+    const RELEASED_V0_6_0: &str = include_str!("fixtures/config-0.6.0.json");
+
+    /// The released configuration extended with the new bind `deny` field, as a
+    /// later release would persist it.
+    fn released_config_with_bind_deny() -> String {
+        let mut value: serde_json::Value = serde_json::from_str(RELEASED_V0_6_0).unwrap();
+        value["mounts"]
+            .as_array_mut()
+            .expect("released fixture has mounts")
+            .push(serde_json::json!({
+                "type": "Bind",
+                "host": "/host/data",
+                "guest": "/data",
+                "deny": [".env"]
+            }));
+        value.to_string()
+    }
+
+    /// Pin the released fixture's provenance assumptions: it is the v0.6.0 shape
+    /// (no `deny`, no boot-capacity fields, released image tag) and predates the
+    /// policy this guard protects.
+    #[test]
+    fn released_fixture_is_v0_6_0_shape_without_deny() {
+        let value: serde_json::Value = serde_json::from_str(RELEASED_V0_6_0).unwrap();
+        assert_eq!(value["name"], "catalog-fixture");
+        assert!(value.pointer("/resources/cpus").is_some());
+        assert!(value.pointer("/resources/max_cpus").is_none());
+        assert!(value.pointer("/deployment_profile").is_none());
+        assert!(value.pointer("/image/Oci").is_some());
+        assert!(
+            value["mounts"]
+                .as_array()
+                .expect("released fixture has mounts")
+                .iter()
+                .all(|mount| mount.get("deny").is_none())
+        );
+    }
+
+    /// A real released v0.6.x configuration that predates deny downgrades cleanly
+    /// across the marker; the marker is the only thing removed.
+    #[tokio::test]
+    async fn released_v0_6_0_fixture_without_deny_downgrades_cleanly() {
+        let db = database(RELEASED_V0_6_0, Some(RELEASED_V0_6_0)).await;
+        let before = saved_state(&db).await;
+
+        Migrator::down(&db, Some(steps_to_deny_marker()))
+            .await
+            .unwrap();
+
+        let after = saved_state(&db).await;
+        assert_eq!(after.0, before.0);
+        assert_eq!(after.1, before.1);
+        assert!(!after.2.iter().any(|id| id == Migration.name()));
+    }
+
+    /// The same released fixture extended with a bind deny list must refuse the
+    /// downgrade through `Migrator::down`, never silently drop the policy.
+    #[tokio::test]
+    async fn released_v0_6_0_fixture_with_added_deny_refuses_downgrade() {
+        let deny = released_config_with_bind_deny();
+        for column in ["config", "active_config"] {
+            let (desired, active) = if column == "config" {
+                (deny.as_str(), RELEASED_V0_6_0)
+            } else {
+                (RELEASED_V0_6_0, deny.as_str())
+            };
+            let db = database(desired, Some(active)).await;
+            let before = saved_state(&db).await;
+
+            let error = Migrator::down(&db, Some(steps_to_deny_marker()))
+                .await
+                .unwrap_err();
+
+            let message = error.to_string();
+            assert!(
+                message.contains("bind_mount_deny_downgrade_unrepresentable"),
+                "{message}"
+            );
+            assert!(message.contains(column), "{message}");
+            assert_eq!(saved_state(&db).await, before);
+        }
+    }
 }
