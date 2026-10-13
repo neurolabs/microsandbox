@@ -791,6 +791,17 @@ mod tests {
         let stricter = vec![bind("/data", &[".env", "*.log"])];
         crate::sandbox::require_preserved_bind_deny(&source, &stricter).unwrap();
 
+        // A child that omits the deny-bearing bind must re-declare it, not silently drop it.
+        let omitted = vec![bind("/other", &[".env"])];
+        let refusal = crate::sandbox::require_preserved_bind_deny(&source, &omitted)
+            .expect_err("an omitted deny-bearing bind must be refused");
+        assert!(
+            refusal
+                .to_string()
+                .contains("re-declare the deny-bearing mount at /data"),
+            "{refusal}"
+        );
+
         // A source without deny imposes no requirement on the child.
         let plain_source = vec![bind("/data", &[])];
         crate::sandbox::require_preserved_bind_deny(&plain_source, &plain).unwrap();

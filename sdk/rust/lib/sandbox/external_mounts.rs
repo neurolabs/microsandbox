@@ -127,8 +127,11 @@ pub(crate) fn require_guest_mounts(
 ///
 /// Only bind mounts carry a deny list; a destination that remaps a captured bind
 /// to a non-bind or drops one of its patterns would re-expose a path the source
-/// hid. A stricter (superset) deny list is accepted. `None` means the capture
-/// predates policy recording and is treated as unknown, never as an empty list.
+/// hid. A stricter (superset) deny list is accepted, but a gitignore negation
+/// (`!name`) re-exposes a name, so a negation the capture did not contain is a
+/// weakening even when every captured positive pattern is still present.
+/// `None` means the capture predates policy recording and is treated as unknown,
+/// never as an empty list.
 fn reject_weakened_deny(
     mounts: &[VolumeMount],
     captured_policies: Option<&[ExternalMountPolicy]>,
@@ -148,11 +151,14 @@ fn reject_weakened_deny(
             VolumeMount::Bind { deny, .. } => deny,
             _ => &[],
         };
-        if !policy
+        let drops_captured = !policy
             .deny
             .iter()
-            .all(|pattern| destination_deny.contains(pattern))
-        {
+            .all(|pattern| destination_deny.contains(pattern));
+        let introduces_negation = destination_deny
+            .iter()
+            .any(|pattern| pattern.starts_with('!') && !policy.deny.contains(pattern));
+        if drops_captured || introduces_negation {
             return Err(MicrosandboxError::InvalidConfig(format!(
                 "restore would weaken bind-mount deny policy at {}; re-declare the deny list",
                 policy.guest_path
@@ -163,12 +169,14 @@ fn reject_weakened_deny(
     Ok(())
 }
 
-/// Refuse a branch child whose explicit mounts weaken a source bind's deny list.
+/// Refuse a branch child whose explicit mounts drop or weaken a source bind's deny list.
 ///
 /// A local branch clears the source's external binds, so a child that does not
 /// inherit resources must re-declare each deny-bearing bind with a deny list at
-/// least as strict as the source's. Callers skip this when the child inherits
-/// resources, because the source mount (including its deny list) is reconnected.
+/// least as strict as the source's. Omitting the mount entirely is refused too:
+/// the source bind is gone, so silently proceeding would drop its policy. Callers
+/// skip this when the child inherits resources, because the source mount
+/// (including its deny list) is reconnected.
 pub(crate) fn require_preserved_bind_deny(
     source_mounts: &[VolumeMount],
     destination_mounts: &[VolumeMount],
@@ -194,6 +202,19 @@ pub(crate) fn require_preserved_bind_deny(
 
     let mut destination = destination_mounts.to_vec();
     canonicalize_volume_mounts(&mut destination)?;
+
+    for policy in &policies {
+        if !destination
+            .iter()
+            .any(|mount| mount.guest() == policy.guest_path)
+        {
+            return Err(MicrosandboxError::InvalidConfig(format!(
+                "branch of a deny-bearing source must re-declare the deny-bearing mount at {}; \
+                 the child omits it",
+                policy.guest_path
+            )));
+        }
+    }
 
     reject_weakened_deny(&destination, Some(&policies))
 }
@@ -734,6 +755,43 @@ mod tests {
         }];
 
         require_guest_mounts(&config, vec!["/data".into()], Some(captured)).unwrap();
+    }
+
+    #[test]
+    fn restore_accepts_bind_that_adds_a_positive_pattern() {
+        let mut config = SandboxBuilder::new("restore")
+            .volume("/data", |m| m.bind("/tmp/d").deny([".env", ".git"]))
+            .config
+            .into_config();
+        config.restore_resources.require_complete = true;
+        let captured = vec![ExternalMountPolicy {
+            guest_path: "/data".into(),
+            deny: vec![".env".into()],
+        }];
+
+        require_guest_mounts(&config, vec!["/data".into()], Some(captured)).unwrap();
+    }
+
+    #[test]
+    fn restore_rejects_destination_negation_that_reopens_captured_deny() {
+        let mut config = SandboxBuilder::new("restore")
+            .volume("/data", |m| m.bind("/tmp/d").deny([".env", "!.env"]))
+            .config
+            .into_config();
+        config.restore_resources.require_complete = true;
+        let captured = vec![ExternalMountPolicy {
+            guest_path: "/data".into(),
+            deny: vec![".env".into()],
+        }];
+
+        let refusal = require_guest_mounts(&config, vec!["/data".into()], Some(captured))
+            .expect_err("a destination negation that reopens .env must be refused");
+        let error = refusal.to_string();
+
+        assert!(
+            error.contains("weaken bind-mount deny policy at /data"),
+            "{error}"
+        );
     }
 
     #[test]
