@@ -913,6 +913,50 @@ fn test_decide_rename_deny_proceeds_and_retries_on_stale_source() {
 }
 
 //--------------------------------------------------------------------------------------------------
+// Tests: hard link uses the source entry's real type
+//--------------------------------------------------------------------------------------------------
+
+/// A dir-only rule must be decided from the hard link source's real type: linking
+/// a directory onto a dir-only-denied name is refused with EACCES before the
+/// host `linkat` (which would otherwise surface EPERM), while a file source is
+/// allowed because `node_modules/` does not match files.
+#[test]
+fn do_link_denies_dir_only_rule_using_source_type() {
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec!["node_modules/".to_string()],
+        ..cfg
+    });
+    sb.host_create_dir("src_dir");
+    let (_entry, _handle) = sb.fuse_create_root("src_file").unwrap();
+
+    let src_dir = sb.lookup_root("src_dir").unwrap();
+    let src_file = sb.lookup_root("src_file").unwrap();
+
+    // Directory source onto the dir-only-denied name -> EACCES (not EPERM).
+    TestSandbox::assert_errno(
+        sb.fs.link(
+            sb.ctx(),
+            src_dir.inode,
+            ROOT_INODE,
+            &TestSandbox::cstr("node_modules"),
+        ),
+        LINUX_EACCES,
+    );
+
+    // File source onto the same name is allowed: `node_modules/` matches only
+    // directories.
+    sb.fs
+        .link(
+            sb.ctx(),
+            src_file.inode,
+            ROOT_INODE,
+            &TestSandbox::cstr("node_modules"),
+        )
+        .unwrap();
+    sb.lookup_root("node_modules").unwrap();
+}
+
+//--------------------------------------------------------------------------------------------------
 // Tests: name-based semantics
 //--------------------------------------------------------------------------------------------------
 

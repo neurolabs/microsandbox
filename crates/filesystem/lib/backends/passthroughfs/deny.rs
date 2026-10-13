@@ -222,7 +222,13 @@ impl DenyList {
     /// to [`Self::matches_path`] instead.
     pub(crate) fn matches_basename(&self, name: &[u8], is_dir: bool) -> bool {
         debug_assert!(!self.needs_path_reconstruction);
-        self.is_ignored(name_as_path(name), is_dir)
+        // `.` and `..` are structural entries; denying them would break path
+        // walks and directory listings. Exempt them here so every caller gets
+        // the guarantee without duplicating the guard.
+        if is_structural_entry(name) {
+            return false;
+        }
+        self.is_ignored_bytes(name, is_dir)
     }
 
     /// Whether the full mount-relative path `rel` (relative to the mount root)
@@ -233,7 +239,10 @@ impl DenyList {
     /// `is_dir` reports whether the entry is a directory; see
     /// [`Self::matches_basename`].
     pub(crate) fn matches_path(&self, rel: &[u8], is_dir: bool) -> bool {
-        self.is_ignored(name_as_path(rel), is_dir)
+        if is_structural_entry(rel) {
+            return false;
+        }
+        self.is_ignored_bytes(rel, is_dir)
     }
 
     /// Whether a single entry `name` directly under the mount-relative directory
@@ -260,8 +269,14 @@ impl DenyList {
         self.matches_path(rel.as_bytes(), is_dir)
     }
 
-    fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
-        matches!(self.matcher.matched(path, is_dir), Match::Ignore(_))
+    fn is_ignored_bytes(&self, bytes: &[u8], is_dir: bool) -> bool {
+        match name_as_path(bytes) {
+            Some(path) => matches!(self.matcher.matched(path, is_dir), Match::Ignore(_)),
+            // A name that cannot be decoded into a path (non-Unix invalid
+            // UTF-8) can never be matched; deny it rather than let it bypass the
+            // deny list. Fail closed.
+            None => true,
+        }
     }
 }
 
@@ -473,20 +488,26 @@ pub(crate) fn join_path(components: &[Vec<u8>]) -> PathBuf {
     path
 }
 
+/// Whether the raw entry bytes are the structural `.` or `..` directory entry.
+fn is_structural_entry(name: &[u8]) -> bool {
+    name == b"." || name == b".."
+}
+
 /// Build a `Path` from raw entry-name bytes.
 ///
 /// On Unix the bytes are used verbatim (arbitrary non-UTF8 names are legal);
-/// elsewhere they are treated lossily. The bytes must not contain a trailing
-/// NUL.
-fn name_as_path(bytes: &[u8]) -> &Path {
+/// elsewhere they are decoded as UTF-8. Returns `None` when a non-Unix name is
+/// not valid UTF-8, so the caller can fail closed instead of matching a lossy
+/// empty path. The bytes must not contain a trailing NUL.
+fn name_as_path(bytes: &[u8]) -> Option<&Path> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        Path::new(std::ffi::OsStr::from_bytes(bytes))
+        Some(Path::new(std::ffi::OsStr::from_bytes(bytes)))
     }
     #[cfg(not(unix))]
     {
-        Path::new(std::str::from_utf8(bytes).unwrap_or(""))
+        std::str::from_utf8(bytes).ok().map(|s| Path::new(s))
     }
 }
 
@@ -633,6 +654,24 @@ mod tests {
         let insensitive = DenyList::build(&[".ENV".to_string()], true).unwrap();
         assert!(insensitive.matches_basename(b".env", false));
         assert!(insensitive.matches_basename(b".Env", false));
+    }
+
+    #[test]
+    fn matcher_never_matches_dot_or_dotdot() {
+        // `.` and `..` are structural directory entries: denying them breaks
+        // path walks and directory listings. The matcher exempts them even for a
+        // catch-all pattern, so a backend need not duplicate the guard.
+        let list = deny(&["*"]);
+        assert!(!list.matches_basename(b".", true));
+        assert!(!list.matches_basename(b"..", true));
+        assert!(!list.matches_path(b".", true));
+        assert!(!list.matches_path(b"..", true));
+        // A non-structural dot-prefixed name is still matched.
+        assert!(list.matches_basename(b".env", false));
+
+        let path_list = deny(&["**/secret"]);
+        assert!(!path_list.matches_path(b".", true));
+        assert!(!path_list.matches_path(b"..", true));
     }
 
     #[test]
