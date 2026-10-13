@@ -571,4 +571,11 @@ mod tests {
         ];
         assert_eq!(deny_suffix(&patterns), " [deny=.env, *.log, sub/secret]");
     }
+
+    #[test]
+    fn inspect_mount_line_renders_deny_suffix() {
+        // The suffix is appended verbatim to the `msb inspect` mount listing.
+        let patterns = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(deny_suffix(&patterns), " [deny=a, b]");
+    }
 }

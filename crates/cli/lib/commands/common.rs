@@ -4715,6 +4715,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mount_dir_and_volume_help_document_deny() {
+        let mut command = SandboxOpts::augment_args(Command::new("test"));
+        let mut help = Vec::new();
+        command.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+
+        assert!(
+            help.contains("deny=<pattern>"),
+            "missing deny help:\n{help}"
+        );
+        // Both `-v/--volume` and `--mount-dir` advertise the option.
+        assert_eq!(help.matches("deny=<pattern>").count(), 2, "{help}");
+    }
+
+    #[tokio::test]
+    async fn dir_mount_deny_comma_ro_parses_as_deny_and_readonly() {
+        let dir = make_temp_dir("msb-mount-dir-deny-ro");
+        let spec = format!("{}:/work:deny=a,ro", dir.display());
+        let mount = build_explicit(&spec, apply_explicit_dir_mount).await;
+        match mount {
+            VolumeMount::Bind { deny, options, .. } => {
+                assert_eq!(deny, vec!["a".to_string()]);
+                assert!(options.readonly);
+            }
+            other => panic!("expected Bind, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dir_mount_deny_second_bare_token_errors() {
+        let dir = make_temp_dir("msb-mount-dir-deny-comma");
+        let spec = format!("{}:/work:deny=a,b", dir.display());
+        let err = match apply_explicit_dir_mount(SandboxBuilder::new("test"), &spec) {
+            Ok(_) => panic!("deny=a,b must error: `b` is not an option token"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("must be a flag or key=value"), "{err}");
+    }
+
     #[tokio::test]
     async fn test_apply_volume_deny_bind_supported() {
         let dir = make_temp_dir("msb-volume-deny");
