@@ -1072,6 +1072,16 @@ fn apply_mount<B: ResourceBuilder>(
         .transpose()?;
     let override_uid = extract_opt::<u32>(mount, "override_uid")?;
     let override_gid = extract_opt::<u32>(mount, "override_gid")?;
+    let deny = extract_opt::<Vec<String>>(mount, "deny")?.unwrap_or_default();
+
+    // A direct native caller can hand this function a dict that never passed
+    // through `MountConfig._to_dict`. Reject `deny` on any non-bind arm here so
+    // it is never silently dropped by the owned/named branches below.
+    if !deny.is_empty() && !mount.contains("bind")? {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "deny is only valid for BIND mounts",
+        ));
+    }
 
     if let Some(kind) = extract_opt::<String>(mount, "owned")? {
         // The selector is exclusive at the native boundary too: callers can
@@ -1146,7 +1156,6 @@ fn apply_mount<B: ResourceBuilder>(
 
     if let Some(bind_path) = extract_opt::<String>(mount, "bind")? {
         let quota_mib = extract_opt::<u32>(mount, "quota_mib")?;
-        let deny = extract_opt::<Vec<String>>(mount, "deny")?.unwrap_or_default();
         Ok(builder.volume(&guest_path, |v| {
             let mut m = v.bind(&bind_path);
             if readonly {

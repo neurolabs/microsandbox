@@ -6,6 +6,9 @@ required.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from microsandbox import (
@@ -20,6 +23,19 @@ from microsandbox import (
     Volume,
     VolumeKind,
 )
+
+
+def _deny_fixture_cases() -> list[dict]:
+    """Load the shared cross-SDK deny-pattern disposition fixture.
+
+    Walk upward from this test file so the fixture is found regardless of the
+    checkout location, failing clearly if it moves.
+    """
+    for directory in Path(__file__).resolve().parents:
+        candidate = directory / "sdk/rust/tests/fixtures/deny/patterns.json"
+        if candidate.is_file():
+            return json.loads(candidate.read_text())
+    raise AssertionError("shared deny fixture not found in any ancestor")
 
 
 def test_bind_default_omits_policies() -> None:
@@ -290,3 +306,108 @@ def test_apply_mount_contract_carries_deny() -> None:
     # apply_mount reads "deny" from this dict; the value must round-trip.
     assert d["bind"] == "/host/data"
     assert d["deny"] == [".env"]
+
+
+def test_mountconfig_positional_order_unchanged() -> None:
+    # `deny` was appended after every pre-existing field, so the 19th positional
+    # argument is still `owned_kind` (not `deny`).
+    m = MountConfig(
+        MountKind.OWNED,  # kind
+        None,  # bind
+        None,  # named
+        None,  # named_mode
+        None,  # named_kind
+        None,  # quota_mib
+        None,  # size_mib
+        False,  # readonly
+        False,  # noexec
+        False,  # nosuid
+        False,  # nodev
+        None,  # disk
+        None,  # format
+        None,  # fstype
+        None,  # stat_virtualization
+        None,  # host_permissions
+        None,  # override_uid
+        None,  # override_gid
+        VolumeKind.DIRECTORY,  # owned_kind
+    )
+    assert m.owned_kind == VolumeKind.DIRECTORY
+    assert m.deny is None
+
+
+def test_mountconfig_rejects_wire_separators() -> None:
+    for bad in ["a,b", "a:b", "a\nb", "a\x00b"]:
+        mc = MountConfig(kind=MountKind.BIND, bind="/host/data", deny=[bad])
+        with pytest.raises(ValueError, match="must not contain"):
+            mc._to_dict()
+
+
+def test_mountconfig_rejects_leading_hash() -> None:
+    mc = MountConfig(kind=MountKind.BIND, bind="/host/data", deny=["#secret"])
+    with pytest.raises(ValueError, match="must not start with '#'"):
+        mc._to_dict()
+    # An escaped literal `#` stays valid.
+    assert MountConfig(kind=MountKind.BIND, bind="/host/data", deny=["\\#x"])._to_dict()[
+        "deny"
+    ] == ["\\#x"]
+
+
+def test_mountconfig_rejects_surrounding_whitespace() -> None:
+    for bad in [" .env", ".env ", " !secret"]:
+        mc = MountConfig(kind=MountKind.BIND, bind="/host/data", deny=[bad])
+        with pytest.raises(ValueError, match="leading or trailing whitespace"):
+            mc._to_dict()
+
+
+def test_mountconfig_rejects_empty_pattern() -> None:
+    mc = MountConfig(kind=MountKind.BIND, bind="/host/data", deny=[""])
+    with pytest.raises(ValueError, match="must not be empty"):
+        mc._to_dict()
+
+
+def test_mountconfig_rejects_non_canonical_patterns() -> None:
+    for bad in ["./secret", "//secret", "a//b", "!", ".", "..", "a/./b", "a/../b"]:
+        mc = MountConfig(kind=MountKind.BIND, bind="/host/data", deny=[bad], readonly=True)
+        with pytest.raises(ValueError):
+            mc._to_dict()
+
+
+def test_mountconfig_accepts_non_canonical_lookalikes() -> None:
+    # Read-only so path-shaped lookalikes stay valid at the pattern level.
+    for ok in ["..foo", "...", "a/..foo/b", "!keep.txt", "node_modules/"]:
+        mc = MountConfig(kind=MountKind.BIND, bind="/host/data", deny=[ok], readonly=True)
+        assert mc._to_dict()["deny"] == [ok]
+
+
+def test_apply_mount_rejects_deny_on_owned_and_named() -> None:
+    # apply_mount consumes this dict; any deny on a non-bind arm must be
+    # rejected at the same boundary that emits it, never silently dropped.
+    for kind, kw in (
+        (MountKind.NAMED, {"named": "vol"}),
+        (MountKind.OWNED, {"owned_kind": VolumeKind.DIRECTORY}),
+    ):
+        mc = MountConfig(kind=kind, deny=[".env"], **kw)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="deny is only valid for BIND"):
+            mc._to_dict()
+
+
+def test_deny_pattern_fixture_dispositions_match_mountconfig_boundary() -> None:
+    cases = _deny_fixture_cases()
+    assert cases, "fixture must not be empty"
+
+    for case in cases:
+        mc = MountConfig(
+            kind=MountKind.BIND,
+            bind="/host/data",
+            readonly=case["readonly"],
+            deny=[case["pattern"]],
+        )
+        expect = case["expect"]
+        if expect == "accept":
+            mc._to_dict()
+        elif expect == "reject":
+            with pytest.raises(ValueError):
+                mc._to_dict()
+        else:
+            raise AssertionError(f"unknown fixture expectation {expect!r}")

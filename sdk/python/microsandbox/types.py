@@ -699,13 +699,16 @@ class MountConfig:
     #: Must be set together with ``override_gid``. BIND/NAMED mounts only.
     override_uid: int | None = None
     override_gid: int | None = None
+    #: Backing kind for storage allocated and removed with the sandbox.
+    owned_kind: VolumeKind | None = None
     #: Host-side deny-list of gitignore-style patterns (directory binds only;
     #: a host file bind rejects them because it has no namespace to filter).
     #: A path pattern (``sub/secret``) requires a read-only mount, since a
     #: writable guest could rename an ancestor directory to bypass it.
+    #:
+    #: Appended after ``owned_kind`` so adding it left the positional field
+    #: order of every pre-existing ``MountConfig`` field unchanged.
     deny: list[str] | None = None
-    #: Backing kind for storage allocated and removed with the sandbox.
-    owned_kind: VolumeKind | None = None
 
     def _to_dict(self) -> dict:
         # Validate every supplied enum before selecting a mount arm. This
@@ -869,11 +872,85 @@ class MountConfig:
                 f"(got kind={self.kind.value})"
             )
 
-        if self.deny and self.kind != MountKind.BIND:
-            raise ValueError(f"deny is only valid for BIND mounts (got kind={self.kind.value})")
-        if self.deny and self.kind == MountKind.BIND and not self.readonly:
-            _reject_writable_path_patterns(self.deny)
+        if self.deny:
+            if self.kind != MountKind.BIND:
+                raise ValueError(f"deny is only valid for BIND mounts (got kind={self.kind.value})")
+            _validate_deny_list(self.deny, self.readonly)
         return d
+
+
+def _validate_deny_list(patterns: list[str], readonly: bool) -> None:
+    """Validate a bind-mount ``deny`` list at the Python boundary.
+
+    Mirrors ``microsandbox_types::validate_deny_list`` exactly so a pattern
+    accepted here is accepted by the Rust SDK, the native bindings, and the
+    runtime, and a rejected one is rejected before it ever reaches ``create``.
+    Python cannot call the Rust validator directly, so the rules are repeated
+    deliberately; the shared fixture consumer test pins them to it.
+    """
+    for pattern in patterns:
+        _validate_deny_pattern(pattern)
+
+    if not readonly:
+        _reject_writable_path_patterns(patterns)
+
+
+def _validate_deny_pattern(pattern: str) -> None:
+    """Reject a single deny pattern that cannot be enforced faithfully.
+
+    See ``microsandbox_types::validate_deny_pattern`` for the rationale behind
+    each rule.
+    """
+    if pattern == "":
+        raise ValueError("deny pattern must not be empty")
+
+    if pattern.startswith("#"):
+        raise ValueError(
+            "deny pattern must not start with '#' (gitignore treats it as a comment; "
+            f"escape a literal '#' as '\\#'): {pattern!r}"
+        )
+
+    if any(separator in pattern for separator in (",", ":", "\n", "\x00")):
+        raise ValueError(f"deny pattern must not contain ',', ':', newline, or NUL: {pattern!r}")
+
+    if pattern.strip() != pattern:
+        raise ValueError(f"deny pattern must not have leading or trailing whitespace: {pattern!r}")
+
+    if pattern in (".", ".."):
+        raise ValueError(
+            "deny pattern must not be '.' or '..'; deny a named entry instead "
+            f"(e.g. 'secret' or 'secret/'): {pattern!r}"
+        )
+
+    if pattern.startswith("//"):
+        raise ValueError(
+            "deny pattern must not start with '//'; write a mount-relative path "
+            f"with a single separator (e.g. 'a/b'): {pattern!r}"
+        )
+
+    if pattern.startswith("./"):
+        raise ValueError(
+            "deny pattern must not start with './'; write the mount-relative path "
+            f"directly (e.g. 'secret' or 'sub/secret'): {pattern!r}"
+        )
+
+    if pattern == "!":
+        raise ValueError(
+            "deny pattern must not be a bare '!'; a negation needs a rule to negate "
+            f"(e.g. '!keep.txt'): {pattern!r}"
+        )
+
+    if "//" in pattern:
+        raise ValueError(
+            "deny pattern must not contain repeated '/'; use a single separator "
+            f"between path components (e.g. 'a/b', 'foo/'): {pattern!r}"
+        )
+
+    if any(component in (".", "..") for component in pattern.split("/")):
+        raise ValueError(
+            "deny pattern must not contain a '.' or '..' path component; path "
+            f"components are matched literally: {pattern!r}"
+        )
 
 
 def _reject_writable_path_patterns(patterns: list[str]) -> None:
