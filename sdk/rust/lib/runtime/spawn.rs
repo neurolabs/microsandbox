@@ -3084,6 +3084,7 @@ fn machine_cli_args(
                 follow_root_symlinks,
                 quota_mib,
                 deny,
+                ..
             } => {
                 if let Some((filename, tag)) = file_mounts.get(guest) {
                     // File binds receive the same default-on host disk

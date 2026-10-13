@@ -2253,16 +2253,7 @@ mod tests {
         let mut config = SandboxConfig {
             spec: SandboxSpec {
                 image: RootfsSource::oci("python:3.12"),
-                mounts: vec![VolumeMount::Bind {
-                    host: "/host/tmp".into(),
-                    guest: "/tmp/".into(),
-                    options: MountOptions::default(),
-                    stat_virtualization: crate::sandbox::StatVirtualization::Strict,
-                    host_permissions: crate::sandbox::HostPermissions::Private,
-                    follow_root_symlinks: false,
-                    quota_mib: None,
-                    deny: Vec::new(),
-                }],
+                mounts: vec![VolumeMount::bind("/host/tmp", "/tmp/")],
                 ..Default::default()
             },
             ..Default::default()
@@ -2282,16 +2273,7 @@ mod tests {
         let mut config = SandboxConfig {
             spec: SandboxSpec {
                 image: RootfsSource::oci("python:3.12"),
-                mounts: vec![VolumeMount::Bind {
-                    host: "/host/tmp".into(),
-                    guest: "/tmp/.".into(),
-                    options: MountOptions::default(),
-                    stat_virtualization: crate::sandbox::StatVirtualization::Strict,
-                    host_permissions: crate::sandbox::HostPermissions::Private,
-                    follow_root_symlinks: false,
-                    quota_mib: None,
-                    deny: Vec::new(),
-                }],
+                mounts: vec![VolumeMount::bind("/host/tmp", "/tmp/.")],
                 ..Default::default()
             },
             ..Default::default()

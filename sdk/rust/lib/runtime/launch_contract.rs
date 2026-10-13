@@ -877,16 +877,13 @@ mod tests {
     #[test]
     fn launch_rejects_bind_deny_for_legacy_runtime() {
         let mut config = SandboxConfig::default();
-        config.spec.mounts = vec![VolumeMount::Bind {
-            host: "/host/data".into(),
-            guest: "/data".into(),
-            options: microsandbox_types::MountOptions::default(),
-            stat_virtualization: microsandbox_types::StatVirtualization::Strict,
-            host_permissions: microsandbox_types::HostPermissions::Private,
-            follow_root_symlinks: false,
-            quota_mib: None,
-            deny: vec![".env".into()],
-        }];
+        config.spec.mounts = vec![
+            crate::sandbox::MountBuilder::new("/data")
+                .bind("/host/data")
+                .deny([".env"])
+                .build()
+                .unwrap(),
+        ];
 
         // A v0.6.x runtime does not accept the `deny=` mount option; the SDK must
         // refuse with an upgrade-required error rather than a generic parse error.

@@ -694,16 +694,27 @@ impl MountBuilder {
                 // boundary so callers get a clear error. Windows drive
                 // prefixes are the one allowed colon shape.
                 validate_host_path_wire_safe(&host, "bind host path")?;
-                VolumeMount::Bind {
-                    host,
-                    guest: self.guest,
-                    options: self.options,
-                    stat_virtualization,
-                    host_permissions,
-                    follow_root_symlinks: self.follow_root_symlinks,
-                    quota_mib: self.quota_mib,
-                    deny: self.deny.clone(),
+                let mut mount = VolumeMount::bind(host, self.guest);
+                match &mut mount {
+                    VolumeMount::Bind {
+                        options,
+                        stat_virtualization: mount_stat,
+                        host_permissions: mount_perms,
+                        follow_root_symlinks,
+                        quota_mib,
+                        deny,
+                        ..
+                    } => {
+                        *options = self.options;
+                        *mount_stat = stat_virtualization;
+                        *mount_perms = host_permissions;
+                        *follow_root_symlinks = self.follow_root_symlinks;
+                        *quota_mib = self.quota_mib;
+                        *deny = self.deny.clone();
+                    }
+                    _ => unreachable!("VolumeMount::bind constructs a Bind mount"),
                 }
+                mount
             }
             MountKind::Named { name, create } => {
                 crate::volume::validate_volume_name(&name)?;
@@ -1567,6 +1578,43 @@ impl From<PathBuf> for ImageSource {
 mod tests {
     use super::*;
 
+    /// Construct a bind mount with explicit fields through the stable
+    /// constructor. `VolumeMount::Bind` is non-exhaustive, so in-repo tests
+    /// configure it by mutating the value returned by [`VolumeMount::bind`].
+    #[allow(clippy::too_many_arguments)]
+    fn bind_mount(
+        host: impl Into<PathBuf>,
+        guest: impl Into<String>,
+        options: MountOptions,
+        stat_virtualization: StatVirtualization,
+        host_permissions: HostPermissions,
+        follow_root_symlinks: bool,
+        quota_mib: Option<u32>,
+        deny: Vec<String>,
+    ) -> VolumeMount {
+        let mut mount = VolumeMount::bind(host, guest);
+        match &mut mount {
+            VolumeMount::Bind {
+                options: mount_options,
+                stat_virtualization: mount_stat,
+                host_permissions: mount_perms,
+                follow_root_symlinks: mount_follow,
+                quota_mib: mount_quota,
+                deny: mount_deny,
+                ..
+            } => {
+                *mount_options = options;
+                *mount_stat = stat_virtualization;
+                *mount_perms = host_permissions;
+                *mount_follow = follow_root_symlinks;
+                *mount_quota = quota_mib;
+                *mount_deny = deny;
+            }
+            _ => unreachable!("VolumeMount::bind constructs a Bind mount"),
+        }
+        mount
+    }
+
     #[test]
     fn owned_mounts_cannot_allocate_replacements_during_restore() {
         for mount in [
@@ -1988,16 +2036,16 @@ mod tests {
 
     #[test]
     fn test_validate_volume_mounts_rejects_direct_bind_deny_separators() {
-        let mut mount = VolumeMount::Bind {
-            host: PathBuf::from("/host/data"),
-            guest: "/data".to_string(),
-            options: MountOptions::default(),
-            stat_virtualization: StatVirtualization::Strict,
-            host_permissions: HostPermissions::Private,
-            follow_root_symlinks: false,
-            quota_mib: None,
-            deny: vec!["secret,ro".to_string()],
-        };
+        let mut mount = bind_mount(
+            "/host/data",
+            "/data",
+            MountOptions::default(),
+            StatVirtualization::Strict,
+            HostPermissions::Private,
+            false,
+            None,
+            vec!["secret,ro".to_string()],
+        );
 
         let err = validate_volume_mounts(std::slice::from_mut(&mut mount)).unwrap_err();
         assert!(err.to_string().contains("must not contain"));
@@ -2005,16 +2053,16 @@ mod tests {
 
     #[test]
     fn test_validate_volume_mounts_rejects_direct_bind_empty_deny_pattern() {
-        let mut mount = VolumeMount::Bind {
-            host: PathBuf::from("/host/data"),
-            guest: "/data".to_string(),
-            options: MountOptions::default(),
-            stat_virtualization: StatVirtualization::Strict,
-            host_permissions: HostPermissions::Private,
-            follow_root_symlinks: false,
-            quota_mib: None,
-            deny: vec![String::new()],
-        };
+        let mut mount = bind_mount(
+            "/host/data",
+            "/data",
+            MountOptions::default(),
+            StatVirtualization::Strict,
+            HostPermissions::Private,
+            false,
+            None,
+            vec![String::new()],
+        );
 
         let err = validate_volume_mounts(std::slice::from_mut(&mut mount)).unwrap_err();
         assert!(err.to_string().contains("must not be empty"));
@@ -2022,32 +2070,32 @@ mod tests {
 
     #[test]
     fn test_validate_volume_mounts_accepts_direct_bind_valid_deny() {
-        let mut mount = VolumeMount::Bind {
-            host: PathBuf::from("/host/data"),
-            guest: "/data".to_string(),
-            options: MountOptions::default(),
-            stat_virtualization: StatVirtualization::Strict,
-            host_permissions: HostPermissions::Private,
-            follow_root_symlinks: false,
-            quota_mib: None,
-            deny: vec![".env".to_string(), "node_modules/".to_string()],
-        };
+        let mut mount = bind_mount(
+            "/host/data",
+            "/data",
+            MountOptions::default(),
+            StatVirtualization::Strict,
+            HostPermissions::Private,
+            false,
+            None,
+            vec![".env".to_string(), "node_modules/".to_string()],
+        );
 
         validate_volume_mounts(std::slice::from_mut(&mut mount)).unwrap();
     }
 
     #[test]
     fn test_validate_volume_mounts_rejects_path_deny_on_writable_bind() {
-        let mut mount = VolumeMount::Bind {
-            host: PathBuf::from("/host/data"),
-            guest: "/data".to_string(),
-            options: MountOptions::default(),
-            stat_virtualization: StatVirtualization::Strict,
-            host_permissions: HostPermissions::Private,
-            follow_root_symlinks: false,
-            quota_mib: None,
-            deny: vec!["sub/.env".to_string()],
-        };
+        let mut mount = bind_mount(
+            "/host/data",
+            "/data",
+            MountOptions::default(),
+            StatVirtualization::Strict,
+            HostPermissions::Private,
+            false,
+            None,
+            vec!["sub/.env".to_string()],
+        );
 
         let err = validate_volume_mounts(std::slice::from_mut(&mut mount)).unwrap_err();
         assert!(err.to_string().contains("path pattern"), "{err}");
@@ -2055,19 +2103,19 @@ mod tests {
 
     #[test]
     fn test_validate_volume_mounts_accepts_path_deny_on_readonly_bind() {
-        let mut mount = VolumeMount::Bind {
-            host: PathBuf::from("/host/data"),
-            guest: "/data".to_string(),
-            options: MountOptions {
+        let mut mount = bind_mount(
+            "/host/data",
+            "/data",
+            MountOptions {
                 readonly: true,
                 ..MountOptions::default()
             },
-            stat_virtualization: StatVirtualization::Strict,
-            host_permissions: HostPermissions::Private,
-            follow_root_symlinks: false,
-            quota_mib: None,
-            deny: vec!["sub/.env".to_string()],
-        };
+            StatVirtualization::Strict,
+            HostPermissions::Private,
+            false,
+            None,
+            vec!["sub/.env".to_string()],
+        );
 
         validate_volume_mounts(std::slice::from_mut(&mut mount)).unwrap();
     }
@@ -2135,16 +2183,16 @@ mod tests {
     #[cfg(windows)]
     fn test_validate_volume_mounts_accepts_windows_drive_host_paths() {
         let mut mounts = vec![
-            VolumeMount::Bind {
-                host: PathBuf::from(r"C:\Users\Stephen\data"),
-                guest: "/data".to_string(),
-                options: MountOptions::default(),
-                stat_virtualization: StatVirtualization::Strict,
-                host_permissions: HostPermissions::Private,
-                follow_root_symlinks: false,
-                quota_mib: None,
-                deny: Vec::new(),
-            },
+            bind_mount(
+                r"C:\Users\Stephen\data",
+                "/data",
+                MountOptions::default(),
+                StatVirtualization::Strict,
+                HostPermissions::Private,
+                false,
+                None,
+                Vec::new(),
+            ),
             VolumeMount::DiskImage {
                 host: PathBuf::from(r"C:\Users\Stephen\data.raw"),
                 guest: "/disk".to_string(),
@@ -2173,16 +2221,16 @@ mod tests {
 
     #[test]
     fn test_validate_volume_mounts_rejects_direct_off_mirror() {
-        let mut mount = VolumeMount::Bind {
-            host: PathBuf::from("/host/data"),
-            guest: "/data".to_string(),
-            options: MountOptions::default(),
-            stat_virtualization: StatVirtualization::Off,
-            host_permissions: HostPermissions::Mirror,
-            follow_root_symlinks: false,
-            quota_mib: None,
-            deny: Vec::new(),
-        };
+        let mut mount = bind_mount(
+            "/host/data",
+            "/data",
+            MountOptions::default(),
+            StatVirtualization::Off,
+            HostPermissions::Mirror,
+            false,
+            None,
+            Vec::new(),
+        );
 
         let err = validate_volume_mounts(std::slice::from_mut(&mut mount)).unwrap_err();
         assert!(err.to_string().contains("stat_virtualization=Off"));
@@ -2190,59 +2238,59 @@ mod tests {
 
     #[test]
     fn test_validate_volume_mounts_rejects_direct_invalid_ownership() {
-        let mut partial = VolumeMount::Bind {
-            host: PathBuf::from("/host/data"),
-            guest: "/data".to_string(),
-            options: MountOptions {
+        let mut partial = bind_mount(
+            "/host/data",
+            "/data",
+            MountOptions {
                 override_uid: Some(1000),
                 ..MountOptions::default()
             },
-            stat_virtualization: StatVirtualization::Strict,
-            host_permissions: HostPermissions::Private,
-            follow_root_symlinks: false,
-            quota_mib: None,
-            deny: Vec::new(),
-        };
+            StatVirtualization::Strict,
+            HostPermissions::Private,
+            false,
+            None,
+            Vec::new(),
+        );
         let err = validate_volume_mounts(std::slice::from_mut(&mut partial)).unwrap_err();
         assert!(
             err.to_string().contains("must be specified together"),
             "{err}"
         );
 
-        let mut off = VolumeMount::Bind {
-            host: PathBuf::from("/host/data"),
-            guest: "/data".to_string(),
-            options: MountOptions {
+        let mut off = bind_mount(
+            "/host/data",
+            "/data",
+            MountOptions {
                 override_uid: Some(1000),
                 override_gid: Some(1000),
                 ..MountOptions::default()
             },
-            stat_virtualization: StatVirtualization::Off,
-            host_permissions: HostPermissions::Private,
-            follow_root_symlinks: false,
-            quota_mib: None,
-            deny: Vec::new(),
-        };
+            StatVirtualization::Off,
+            HostPermissions::Private,
+            false,
+            None,
+            Vec::new(),
+        );
         let err = validate_volume_mounts(std::slice::from_mut(&mut off)).unwrap_err();
         assert!(err.to_string().contains("literal host metadata"), "{err}");
     }
 
     #[test]
     fn test_volume_mount_json_uses_options_object() {
-        let mount = VolumeMount::Bind {
-            host: PathBuf::from("/host/data"),
-            guest: "/data".to_string(),
-            options: MountOptions {
+        let mount = bind_mount(
+            "/host/data",
+            "/data",
+            MountOptions {
                 readonly: true,
                 noexec: true,
                 ..MountOptions::default()
             },
-            stat_virtualization: StatVirtualization::Strict,
-            host_permissions: HostPermissions::Private,
-            follow_root_symlinks: false,
-            quota_mib: None,
-            deny: Vec::new(),
-        };
+            StatVirtualization::Strict,
+            HostPermissions::Private,
+            false,
+            None,
+            Vec::new(),
+        );
 
         let value = serde_json::to_value(&mount).unwrap();
         assert!(value.get("readonly").is_none());

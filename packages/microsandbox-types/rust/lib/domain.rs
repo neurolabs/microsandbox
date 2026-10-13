@@ -407,6 +407,7 @@ pub enum VolumeMount {
         host_permissions: HostPermissions,
     },
     /// Bind mount a host directory into the guest.
+    #[non_exhaustive]
     Bind {
         /// Host path to bind mount.
         #[cfg_attr(feature = "ts", ts(type = "string"))]

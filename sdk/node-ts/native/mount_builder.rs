@@ -438,6 +438,7 @@ fn to_built_mount(mount: RustVolumeMount) -> JsBuiltVolumeMount {
             // TODO: surface follow_root_symlinks in the Node opt-out API.
             follow_root_symlinks: _,
             deny,
+            ..
         } => JsBuiltVolumeMount {
             kind: "bind".into(),
             guest,

@@ -1595,16 +1595,13 @@ mod tests {
     #[test]
     fn cloud_create_request_rejects_bind_mount_deny_list() {
         let mut config = base_cloud_config();
-        config.spec.mounts.push(VolumeMount::Bind {
-            host: std::path::PathBuf::from("/data"),
-            guest: "/data".into(),
-            options: MountOptions::default(),
-            stat_virtualization: StatVirtualization::Strict,
-            host_permissions: HostPermissions::Private,
-            follow_root_symlinks: false,
-            quota_mib: None,
-            deny: vec![".env".into()],
-        });
+        config.spec.mounts.push(
+            crate::sandbox::MountBuilder::new("/data")
+                .bind("/data")
+                .deny([".env"])
+                .build()
+                .unwrap(),
+        );
 
         assert_unsupported_config_field(config, "bind mount deny list");
     }
@@ -1637,20 +1634,13 @@ mod tests {
     #[test]
     fn cloud_create_request_rejects_mount_owner_without_capability() {
         let mut config = base_cloud_config();
-        config.spec.mounts.push(VolumeMount::Bind {
-            host: "/host/data".into(),
-            guest: "/data".into(),
-            options: MountOptions {
-                override_uid: Some(1000),
-                override_gid: Some(1000),
-                ..MountOptions::default()
-            },
-            stat_virtualization: StatVirtualization::Strict,
-            host_permissions: HostPermissions::Private,
-            follow_root_symlinks: false,
-            quota_mib: None,
-            deny: Vec::new(),
-        });
+        config.spec.mounts.push(
+            crate::sandbox::MountBuilder::new("/data")
+                .bind("/host/data")
+                .owner(1000, 1000)
+                .build()
+                .unwrap(),
+        );
 
         assert_unsupported_config_field(config, "mount owner");
     }

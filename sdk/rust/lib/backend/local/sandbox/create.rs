@@ -2278,8 +2278,8 @@ mod tests {
     use crate::backend::{Backend, LocalBackend};
     use crate::runtime::SpawnMode;
     use crate::sandbox::{
-        HostPermissions, MAX_HOSTNAME_BYTES, MountOptions, OciRootfsSource, PullPolicy,
-        RootfsSource, SandboxConfig, SandboxStatus, StatVirtualization, VolumeMount,
+        MAX_HOSTNAME_BYTES, MountOptions, OciRootfsSource, PullPolicy, RootfsSource, SandboxConfig,
+        SandboxStatus, VolumeMount,
     };
     use crate::snapshot::SnapshotReference;
 
@@ -3394,20 +3394,13 @@ mod tests {
         let temp = tempdir().unwrap();
         let pools = open_test_pools(&temp.path().join("test.db")).await;
         let mut config = test_config("owned-mount");
-        config.spec.mounts.push(VolumeMount::Bind {
-            host: "/host/data".into(),
-            guest: "/data".into(),
-            options: MountOptions {
-                override_uid: Some(1000),
-                override_gid: Some(1001),
-                ..MountOptions::default()
-            },
-            stat_virtualization: StatVirtualization::Strict,
-            host_permissions: HostPermissions::Private,
-            follow_root_symlinks: false,
-            quota_mib: None,
-            deny: Vec::new(),
-        });
+        config.spec.mounts.push(
+            crate::sandbox::MountBuilder::new("/data")
+                .bind("/host/data")
+                .owner(1000, 1001)
+                .build()
+                .unwrap(),
+        );
 
         let sandbox_id = LocalBackend::insert_sandbox_record(pools.write(), &config)
             .await

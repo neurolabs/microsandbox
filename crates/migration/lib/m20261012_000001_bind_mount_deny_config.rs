@@ -117,9 +117,7 @@ fn mount_carries_deny(mount: &serde_json::Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use microsandbox_types::{
-        HostPermissions, MountOptions, SandboxSpec, StatVirtualization, VolumeMount,
-    };
+    use microsandbox_types::{SandboxSpec, VolumeMount};
     use sea_orm_migration::sea_orm::{
         ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, Statement,
     };
@@ -169,16 +167,14 @@ mod tests {
     /// `mounts` at the top level.
     fn config(deny: Vec<String>) -> String {
         let mut spec = SandboxSpec::default();
-        spec.mounts.push(VolumeMount::Bind {
-            host: "/host/data".into(),
-            guest: "/data".into(),
-            options: MountOptions::default(),
-            stat_virtualization: StatVirtualization::Strict,
-            host_permissions: HostPermissions::Private,
-            follow_root_symlinks: false,
-            quota_mib: None,
-            deny,
-        });
+        let mut mount = VolumeMount::bind("/host/data", "/data");
+        if let VolumeMount::Bind {
+            deny: mount_deny, ..
+        } = &mut mount
+        {
+            *mount_deny = deny;
+        }
+        spec.mounts.push(mount);
         serde_json::to_string(&spec).unwrap()
     }
 

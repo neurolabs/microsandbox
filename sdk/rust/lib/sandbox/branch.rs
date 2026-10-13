@@ -764,18 +764,17 @@ mod tests {
 
     #[test]
     fn branch_of_deny_bearing_source_requires_redeclaration() {
-        use crate::sandbox::{HostPermissions, MountOptions, StatVirtualization, VolumeMount};
-        use std::path::PathBuf;
+        use crate::sandbox::VolumeMount;
 
-        let bind = |guest: &str, deny: &[&str]| VolumeMount::Bind {
-            host: PathBuf::from("/host/data"),
-            guest: guest.into(),
-            options: MountOptions::default(),
-            stat_virtualization: StatVirtualization::Strict,
-            host_permissions: HostPermissions::Private,
-            follow_root_symlinks: false,
-            quota_mib: None,
-            deny: deny.iter().map(|pattern| (*pattern).to_string()).collect(),
+        let bind = |guest: &str, deny: &[&str]| {
+            let mut mount = VolumeMount::bind("/host/data", guest);
+            if let VolumeMount::Bind {
+                deny: mount_deny, ..
+            } = &mut mount
+            {
+                *mount_deny = deny.iter().map(|pattern| (*pattern).to_string()).collect();
+            }
+            mount
         };
 
         let source = vec![bind("/data", &[".env"])];
