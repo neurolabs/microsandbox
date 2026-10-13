@@ -8307,6 +8307,74 @@ mod tests {
     }
 
     #[test]
+    fn apply_volume_rejects_deny_with_leading_hash() {
+        let builder = microsandbox::sandbox::SandboxBuilder::new("test").image("alpine");
+        let spec = MountSpec {
+            bind: Some("/host/data".to_string()),
+            deny: vec!["#secret".to_string()],
+            ..Default::default()
+        };
+
+        let err = match apply_volume(builder, "/data", &spec) {
+            Ok(_) => panic!("leading-# deny should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.message.contains("must not start with '#'"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn deny_pattern_fixture_dispositions_match_go_native_validator() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            pattern: String,
+            readonly: bool,
+            expect: String,
+        }
+
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest
+            .ancestors()
+            .map(|dir| dir.join("sdk/rust/tests/fixtures/deny/patterns.json"))
+            .find(|candidate| candidate.is_file())
+            .expect("shared deny fixture not found in any ancestor");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        let cases: Vec<Case> = serde_json::from_str(&raw).expect("parse deny fixture");
+        assert!(!cases.is_empty(), "fixture must not be empty");
+
+        for case in cases {
+            let builder = microsandbox::sandbox::SandboxBuilder::new("test").image("alpine");
+            let spec = MountSpec {
+                bind: Some("/host/data".to_string()),
+                readonly: case.readonly,
+                deny: vec![case.pattern.clone()],
+                ..Default::default()
+            };
+            let result = apply_volume(builder, "/data", &spec);
+            match case.expect.as_str() {
+                "accept" => assert!(
+                    result.is_ok(),
+                    "expected accept for pattern {:?} readonly={}: {:?}",
+                    case.pattern,
+                    case.readonly,
+                    result.err().map(|err| err.message)
+                ),
+                "reject" => assert!(
+                    result.is_err(),
+                    "expected reject for pattern {:?} readonly={}",
+                    case.pattern,
+                    case.readonly
+                ),
+                other => panic!("unknown fixture expectation {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn apply_volume_allows_readonly_path_deny_and_writable_name_only_deny() {
         let readonly = MountSpec {
             bind: Some("/host/data".to_string()),

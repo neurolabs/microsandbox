@@ -1053,6 +1053,16 @@ func TestMountBindPropagatesDeny(t *testing.T) {
 	}
 }
 
+func TestMountBindCarriesReservedDenyPatternsForBoundaryRejection(t *testing.T) {
+	// Go does not duplicate the shared validator; reserved patterns must reach
+	// the native boundary verbatim so it can reject them (leading '#', empty,
+	// wire separators).
+	m := Mount.Bind("/host/data", MountOptions{Deny: []string{"#secret", "", "a,b"}})
+	if len(m.Deny) != 3 || m.Deny[0] != "#secret" || m.Deny[1] != "" || m.Deny[2] != "a,b" {
+		t.Errorf("Deny: got %v, want [#secret  a,b]", m.Deny)
+	}
+}
+
 func TestMountNonBindFactoriesCarryDenyForRejection(t *testing.T) {
 	// Named must carry Deny through to the native layer so it is rejected
 	// loudly at apply time instead of silently dropped.

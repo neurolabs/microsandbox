@@ -702,6 +702,25 @@ func TestFFIWireShape_Volumes(t *testing.T) {
 	}
 }
 
+func TestFFIWireShape_BindDenyCarriedForNativeValidation(t *testing.T) {
+	// Go never inspects host paths, so a deny list on a bind is carried
+	// verbatim. The native validator rejects leading '#', wire separators, and
+	// path-on-writable patterns; a host file bind is rejected by the runtime
+	// file-mount resolver. Either way the pattern must reach the boundary
+	// unchanged rather than being dropped in Go.
+	got := marshalCreateOptions(t,
+		WithImage("alpine"),
+		WithMounts(map[string]MountConfig{
+			"/data": Mount.Bind("/host/data", MountOptions{Deny: []string{"#secret", "sub/secret", "."}}),
+		}),
+	)
+	volumes := mustField(t, got, "volumes").(map[string]any)
+	deny := volumes["/data"].(map[string]any)["deny"].([]any)
+	if len(deny) != 3 || deny[0] != "#secret" || deny[1] != "sub/secret" || deny[2] != "." {
+		t.Fatalf("deny = %v", deny)
+	}
+}
+
 func TestFFIWireShape_MountOwner(t *testing.T) {
 	got := marshalCreateOptions(t,
 		WithImage("alpine"),

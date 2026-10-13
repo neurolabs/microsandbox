@@ -1,3 +1,7 @@
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, it, vi } from "vitest";
 import {
   GiB,
@@ -396,7 +400,57 @@ describe("MountBuilder", () => {
     const builder = new MountBuilder("/data").bind("/host").deny(["a,b"]);
     expect(() => builder.build()).toThrow(InvalidConfigError);
   });
+
+  it("rejects empty, whitespace, and leading-# deny patterns", () => {
+    for (const bad of ["", " .env", ".env ", "#secret"]) {
+      const builder = new MountBuilder("/data").bind("/host").deny([bad]);
+      expect(() => builder.build(), JSON.stringify(bad)).toThrow(InvalidConfigError);
+    }
+  });
+
+  it("rejects a path deny pattern on a writable mount", () => {
+    const builder = new MountBuilder("/data").bind("/host").deny(["sub/secret"]);
+    expect(() => builder.build()).toThrow(InvalidConfigError);
+  });
+
+  it("matches the shared deny fixture dispositions", () => {
+    const cases = denyFixtureCases();
+    expect(cases.length).toBeGreaterThan(0);
+
+    for (const c of cases) {
+      const builder = new MountBuilder("/data").bind("/host");
+      if (c.readonly) {
+        builder.readonly();
+      }
+      builder.deny([c.pattern]);
+
+      const label = JSON.stringify(c);
+      if (c.expect === "accept") {
+        expect(() => builder.build(), label).not.toThrow();
+      } else if (c.expect === "reject") {
+        expect(() => builder.build(), label).toThrow();
+      } else {
+        throw new Error(`unknown fixture expectation ${c.expect}`);
+      }
+    }
+  });
 });
+
+function denyFixtureCases(): Array<{ pattern: string; readonly: boolean; expect: string }> {
+  let dir = dirname(fileURLToPath(import.meta.url));
+  for (;;) {
+    const candidate = resolve(dir, "sdk/rust/tests/fixtures/deny/patterns.json");
+    try {
+      return JSON.parse(readFileSync(candidate, "utf8"));
+    } catch {
+      const parent = dirname(dir);
+      if (parent === dir) {
+        throw new Error("shared deny fixture not found in any ancestor");
+      }
+      dir = parent;
+    }
+  }
+}
 
 describe("PatchBuilder", () => {
   it("collects patches in declaration order", () => {
