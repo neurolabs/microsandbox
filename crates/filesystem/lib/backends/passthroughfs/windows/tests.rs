@@ -2106,6 +2106,76 @@ fn deny_normal_ops_unchanged() {
     );
 }
 
+//--------------------------------------------------------------------------------------------------
+// Tests: deny unlink error parity (existence/type oracle)
+//--------------------------------------------------------------------------------------------------
+
+/// A denied name that exists returns EACCES, never deleting the file.
+#[test]
+fn unlink_denied_name_returns_eacces_when_present() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join(".env"), b"secret").unwrap();
+    let fs = fs_for_deny(&temp.path, vec![".env".to_string()]);
+
+    expect_errno(fs.unlink(context(), ROOT_INODE, c".env"), LINUX_EACCES);
+    assert!(temp.path.join(".env").exists(), "denied file must survive");
+}
+
+/// A denied name that does *not* exist returns EACCES, not ENOENT: the deny
+/// decision is made before any host stat, so unlink cannot reveal whether the
+/// hidden name exists.
+#[test]
+fn unlink_denied_name_returns_eacces_when_absent() {
+    let temp = TempDir::new();
+    let fs = fs_for_deny(&temp.path, vec![".env".to_string()]);
+
+    expect_errno(fs.unlink(context(), ROOT_INODE, c".env"), LINUX_EACCES);
+}
+
+/// A denied reparse point (symlink/junction) returns the same EACCES as a
+/// denied file: neither ELOOP nor a successful unlink may reveal that the
+/// hidden name exists and is a reparse point.
+#[test]
+fn unlink_denied_reparse_point_returns_eacces() {
+    let temp = TempDir::new();
+    let target = temp.path.join("target_dir");
+    std::fs::create_dir(&target).unwrap();
+    // Creating a symlink needs developer mode or SeCreateSymbolicLinkPrivilege;
+    // skip on runners without it.
+    if std::os::windows::fs::symlink_dir(&target, temp.path.join(".env")).is_err() {
+        return;
+    }
+    let fs = fs_for_deny(&temp.path, vec![".env".to_string()]);
+
+    expect_errno(fs.unlink(context(), ROOT_INODE, c".env"), LINUX_EACCES);
+}
+
+/// A directory-only rule (`node_modules/`) hides the directory from unlink with
+/// EACCES rather than leaking it through a raw EISDIR.
+#[test]
+fn unlink_dir_only_deny_still_hides_directory() {
+    let temp = TempDir::new();
+    std::fs::create_dir(temp.path.join("node_modules")).unwrap();
+    let fs = fs_for_deny(&temp.path, vec!["node_modules/".to_string()]);
+
+    expect_errno(
+        fs.unlink(context(), ROOT_INODE, c"node_modules"),
+        LINUX_EACCES,
+    );
+    assert!(temp.path.join("node_modules").is_dir());
+}
+
+/// A non-denied file still unlinks normally.
+#[test]
+fn unlink_allowed_file_succeeds() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join("plain.txt"), b"ok").unwrap();
+    let fs = fs_for_deny(&temp.path, vec![".env".to_string()]);
+
+    fs.unlink(context(), ROOT_INODE, c"plain.txt").unwrap();
+    assert!(!temp.path.join("plain.txt").exists());
+}
+
 #[test]
 fn no_override_falls_back_to_configured_default_owner() {
     let temp = TempDir::new();

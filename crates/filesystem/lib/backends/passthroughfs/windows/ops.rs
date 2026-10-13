@@ -153,13 +153,27 @@ impl DynFileSystem for PassthroughFs {
         // Validate the name before the deny check so a non-UTF-8 (invalid)
         // name fails with EINVAL rather than EACCES, matching lookup.
         let path = self.child_path(parent, name)?;
-        // Stat before the deny check so a dir-only pattern can match a directory;
-        // otherwise the check (is_dir=false) misses it and the EISDIR below
-        // reveals that a hidden name exists and is a directory.
-        let metadata = self.safe_metadata(&path)?;
-        if self.deny_matches_name(parent, name, metadata.file_type().is_dir()) {
+        // Name-only and path-only rules do not depend on the target's type, so
+        // decide them before touching the host filesystem. A denied name then
+        // returns EACCES whether it exists or not, never ENOENT, and a denied
+        // reparse point returns EACCES rather than ELOOP: no error reveals the
+        // hidden entry's existence or type.
+        if self.deny_matches_name(parent, name, false) {
             return Err(linux_error(LINUX_EACCES));
         }
+        // Only a directory-only pattern (`node_modules/`) needs the entry's
+        // type. Read metadata only when one is present; an unresolved type is
+        // treated as a directory so the rule still hides the name.
+        if self.deny.has_dir_only_patterns() {
+            let is_dir = self
+                .safe_metadata(&path)
+                .map(|metadata| metadata.file_type().is_dir())
+                .unwrap_or(true);
+            if self.deny_matches_name(parent, name, is_dir) {
+                return Err(linux_error(LINUX_EACCES));
+            }
+        }
+        let metadata = self.safe_metadata(&path)?;
         if metadata.file_type().is_dir() {
             return Err(linux_error(LINUX_EISDIR));
         }
