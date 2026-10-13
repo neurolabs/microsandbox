@@ -2253,6 +2253,46 @@ fn create_denied_name_via_trailing_dot_is_rejected() {
     }
 }
 
+//--------------------------------------------------------------------------------------------------
+// Tests: deny re-application on restore
+//--------------------------------------------------------------------------------------------------
+
+/// A checkpoint captured with an empty deny list must not re-intern a path the
+/// destination deny list hides.
+#[test]
+fn windows_restore_refuses_path_hidden_by_destination_deny() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join(".env"), b"secret").unwrap();
+    let source = fs_for(&temp.path);
+    source.lookup(context(), ROOT_INODE, c".env").unwrap();
+    let bytes = source.capture_state().unwrap();
+
+    let destination = fs_for_deny(&temp.path, vec![".env".to_string()]);
+    assert!(
+        destination.restore_state(&bytes).is_err(),
+        "restore must refuse a canonical path hidden by the destination deny list"
+    );
+}
+
+/// A saved hardlink alias whose name the destination deny list now hides must
+/// not be re-interned either.
+#[test]
+fn windows_restore_reapplies_deny_to_aliases() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join("first"), b"contents").unwrap();
+    std::fs::hard_link(temp.path.join("first"), temp.path.join(".env")).unwrap();
+    let source = fs_for(&temp.path);
+    source.lookup(context(), ROOT_INODE, c"first").unwrap();
+    source.lookup(context(), ROOT_INODE, c".env").unwrap();
+    let bytes = source.capture_state().unwrap();
+
+    let destination = fs_for_deny(&temp.path, vec![".env".to_string()]);
+    assert!(
+        destination.restore_state(&bytes).is_err(),
+        "restore must not re-intern an alias the destination deny list hides"
+    );
+}
+
 #[test]
 fn no_override_falls_back_to_configured_default_owner() {
     let temp = TempDir::new();

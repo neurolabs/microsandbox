@@ -10,7 +10,7 @@ use std::{
         fs::{MetadataExt, OpenOptionsExt},
         io::AsRawHandle,
     },
-    path::{Component, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{Arc, Mutex, RwLock, atomic::Ordering},
 };
 
@@ -614,6 +614,7 @@ fn restore_aliases(
         if fs.path_identity(&path)? != data.identity {
             return Err(invalid_state("alias no longer names its captured inode"));
         }
+        reject_denied_restore_path(fs, &alias.components, &path)?;
         prepared.inodes.by_path.insert(path, data);
     }
     Ok(())
@@ -865,6 +866,31 @@ fn validate_shape(
     Ok(())
 }
 
+/// Refuse to restore a stored path the destination deny list hides.
+///
+/// Denied names are never interned during normal operation, so a stored path
+/// can only match when the deny list grew after capture (or comes from a mount
+/// with different patterns). Re-interning it would re-expose a path the caller
+/// asked to hide, so fail closed with an explicit error. Mirrors the Unix
+/// `reject_denied_restore_path`; the empty component list is the mount root,
+/// which is never denied.
+fn reject_denied_restore_path(
+    fs: &PassthroughFs,
+    components: &[Vec<u16>],
+    path: &Path,
+) -> io::Result<()> {
+    if fs.deny.is_empty() || components.is_empty() {
+        return Ok(());
+    }
+    let is_dir = fs.safe_metadata(path)?.file_type().is_dir();
+    if fs.deny_matches_path(path, is_dir) {
+        return Err(invalid_state(
+            "restored passthrough inode is hidden by the mount deny list",
+        ));
+    }
+    Ok(())
+}
+
 fn rebuild(
     fs: &PassthroughFs,
     state: PassthroughState,
@@ -875,6 +901,7 @@ fn rebuild(
     for saved in &state.inodes {
         let path = path_from_components(fs, &saved.components)?;
         fs.safe_metadata(&path)?;
+        reject_denied_restore_path(fs, &saved.components, &path)?;
         if let Some(expected) = expected {
             validate_reopened_file(&open_identity_file(&path)?, &expected[&saved.inode])?;
         }
