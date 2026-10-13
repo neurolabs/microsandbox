@@ -482,6 +482,7 @@ impl Manifest {
         self.guest_clock()?;
         self.owned_volumes()?;
         self.external_mounts()?;
+        self.external_mount_policies()?;
         Ok(())
     }
 
@@ -963,6 +964,43 @@ mod tests {
         assert!(manifest.requires.is_empty());
         assert!(manifest.unsupported_requires().is_empty());
         assert_eq!(restored.external_mounts().unwrap(), ["/data", "/logs"]);
+    }
+
+    #[test]
+    fn external_mount_policies_are_additive_and_legacy_reads_as_unknown() {
+        use super::super::{EXTERNAL_MOUNTS_EXTENSION, ExternalMountPolicy};
+
+        let mut manifest = descriptor();
+        manifest.set_external_mounts(vec!["/data".into()]).unwrap();
+
+        // A deny-less capture adds no policy field and keeps the same bytes.
+        let without_policy = manifest.to_canonical_bytes().unwrap();
+        assert_eq!(manifest.external_mount_policies().unwrap(), None);
+        manifest.set_external_mount_policies(Vec::new()).unwrap();
+        assert_eq!(manifest.to_canonical_bytes().unwrap(), without_policy);
+
+        // A deny-bearing capture records the policy and round-trips.
+        manifest
+            .set_external_mount_policies(vec![ExternalMountPolicy {
+                guest_path: "/data".into(),
+                deny: vec![".env".into()],
+            }])
+            .unwrap();
+        let restored = Manifest::from_bytes(&manifest.to_canonical_bytes().unwrap()).unwrap();
+        assert_eq!(
+            restored.external_mount_policies().unwrap(),
+            Some(vec![ExternalMountPolicy {
+                guest_path: "/data".into(),
+                deny: vec![".env".into()],
+            }])
+        );
+
+        // A legacy extension without the field reads as unknown, never empty.
+        manifest.extensions.insert(
+            EXTERNAL_MOUNTS_EXTENSION.into(),
+            serde_json::json!({ "guest_paths": ["/data"] }),
+        );
+        assert_eq!(manifest.external_mount_policies().unwrap(), None);
     }
 
     #[test]
