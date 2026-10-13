@@ -140,19 +140,18 @@ impl DenyList {
         let mut needs_path_reconstruction = false;
         let mut has_dir_only_patterns = false;
         for pattern in patterns {
-            // Fail closed on a leading `#`: gitignore treats it as a comment and
-            // would silently drop the rule, so the mount would be weaker than the
-            // caller asked for. A literal leading `#` must be escaped (`\#`).
-            if pattern.starts_with('#') {
-                return Err(io::Error::new(
+            // Fail closed on any pattern the shared validator rejects. An empty,
+            // whitespace-only, wire-hazard, leading-`#`, or non-canonical pattern
+            // all compile to an empty matcher, which would make the deny list
+            // silently weaker than the caller asked for. The shared validator is
+            // the single source of truth for that contract, so the runtime cannot
+            // drift from the SDK/CLI.
+            microsandbox_types::validate_deny_pattern(pattern).map_err(|err| {
+                io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!(
-                        "invalid deny pattern {pattern:?}: a leading '#' is a gitignore comment; \
-                         escape a literal '#' as '\\#'"
-                    ),
-                ));
-            }
-            reject_non_canonical(pattern)?;
+                    format!("invalid deny pattern {pattern:?}: {err}"),
+                )
+            })?;
             // The `ignore` crate folds globs with ASCII-only case-folding, so a
             // non-ASCII pattern cannot be matched case-insensitively: a pattern
             // like `café` would silently fail to hide `CAFÉ`. Reject it on a
@@ -294,44 +293,6 @@ impl Drop for ProbeFile {
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
-
-/// Reject deny patterns that gitignore compiles to an empty matcher, so a
-/// direct constructor cannot produce a silently inert deny list.
-///
-/// Mirrors the shared `validate_deny_pattern` rules as defence in depth: the
-/// SDK/runtime validate patterns first, but `DenyList` must not rely on that. A
-/// pattern is rejected when it is `.`/`..`, starts with `//` or `./`, is a bare
-/// `!`, contains a repeated `/`, or contains a `.`/`..` path component.
-fn reject_non_canonical(pattern: &str) -> io::Result<()> {
-    let reason = if pattern == "." || pattern == ".." {
-        "'.' and '..' name the current and parent directory and cannot be denied; \
-         deny a named entry instead (e.g. 'secret' or 'secret/')"
-    } else if pattern.starts_with("//") {
-        "a leading '//' is not a rooted path; write a mount-relative path with a single \
-         separator (e.g. 'a/b') or a name pattern (e.g. 'secret')"
-    } else if pattern.starts_with("./") {
-        "a leading './' is a no-op prefix; write the mount-relative path directly \
-         (e.g. 'secret' or 'sub/secret')"
-    } else if pattern == "!" {
-        "a bare '!' is a negation with no rule to negate (e.g. '!keep.txt')"
-    } else if pattern.contains("//") {
-        "a repeated '/' creates an empty path component; use a single separator \
-         (e.g. 'a/b', 'foo/')"
-    } else if pattern
-        .split('/')
-        .any(|component| component == "." || component == "..")
-    {
-        "a '.' or '..' path component is never present in a mount-relative path, so the \
-         rule would be a no-op; use a real path or name pattern (e.g. 'a/b', 'secret')"
-    } else {
-        return Ok(());
-    };
-
-    Err(io::Error::new(
-        io::ErrorKind::InvalidInput,
-        format!("invalid deny pattern {pattern:?}: {reason}"),
-    ))
-}
 
 /// Whether the mount should match deny patterns case-insensitively.
 ///
@@ -770,6 +731,20 @@ mod tests {
             assert!(
                 DenyList::build(&owned, false).is_ok(),
                 "expected {ok:?} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_empty_and_whitespace_only_patterns() {
+        // An empty or whitespace-only pattern is accepted by gitignore and
+        // compiles to an empty matcher, so the deny list would silently enforce
+        // nothing. `DenyList::build` must refuse it instead.
+        for bad in ["", " ", "\t", "  .env  "] {
+            let owned = vec![bad.to_string()];
+            assert!(
+                DenyList::build(&owned, false).is_err(),
+                "expected {bad:?} to be rejected"
             );
         }
     }

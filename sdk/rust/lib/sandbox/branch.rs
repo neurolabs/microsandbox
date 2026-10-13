@@ -404,7 +404,15 @@ pub(super) async fn prepare_branch(
     // Owned declarations contain no source host path. Retain them as the required inventory
     // until capture proves that every one has independent child backing; clear external mounts.
     let source_mounts = config.spec.mounts.clone();
-    if !options.restore_resources.inherit {
+    if options.restore_resources.inherit {
+        // Inheritance reconnects the source's deny-bearing binds, so an omitted child
+        // mount is safe. An explicit child mount at the same guest path overrides the
+        // inherited source mount, though, so it must not drop or weaken the deny list.
+        crate::sandbox::require_preserved_inherited_bind_deny(
+            &source_mounts,
+            &options.spec.mounts,
+        )?;
+    } else {
         // A local branch clears the source's external binds, so a child that does not inherit
         // resources must re-declare any deny-bearing bind rather than silently dropping its policy.
         crate::sandbox::require_preserved_bind_deny(&source_mounts, &options.spec.mounts)?;
@@ -804,5 +812,53 @@ mod tests {
         // A source without deny imposes no requirement on the child.
         let plain_source = vec![bind("/data", &[])];
         crate::sandbox::require_preserved_bind_deny(&plain_source, &plain).unwrap();
+    }
+
+    #[test]
+    fn inherited_branch_guards_explicit_override_of_deny_bearing_bind() {
+        use crate::sandbox::VolumeMount;
+
+        let bind = |guest: &str, deny: &[&str]| {
+            let mut mount = VolumeMount::bind("/host/data", guest);
+            if let VolumeMount::Bind {
+                deny: mount_deny, ..
+            } = &mut mount
+            {
+                *mount_deny = deny.iter().map(|pattern| (*pattern).to_string()).collect();
+            }
+            mount
+        };
+
+        let source = vec![bind("/data", &[".env"])];
+
+        // Inherit + no explicit mount for the deny-bearing guest path is safe: the
+        // source bind (including its deny list) is reconnected.
+        let none = Vec::new();
+        crate::sandbox::require_preserved_inherited_bind_deny(&source, &none).unwrap();
+
+        // An explicit overlapping bind with no deny would override the inherited
+        // source mount and silently drop its policy, so it must be refused.
+        let weakened = vec![bind("/data", &[])];
+        assert!(
+            crate::sandbox::require_preserved_inherited_bind_deny(&source, &weakened).is_err(),
+            "an explicit inherit-mode bind that drops the source deny must be refused"
+        );
+
+        // An explicit overlapping bind that preserves or strengthens the deny is accepted.
+        let equal = vec![bind("/data", &[".env"])];
+        crate::sandbox::require_preserved_inherited_bind_deny(&source, &equal).unwrap();
+        let stronger = vec![bind("/data", &[".env", "*.log"])];
+        crate::sandbox::require_preserved_inherited_bind_deny(&source, &stronger).unwrap();
+
+        // A non-bind child mount at the same guest path also drops the deny policy.
+        let remapped = vec![VolumeMount::Tmpfs {
+            guest: "/data".into(),
+            size_mib: None,
+            options: Default::default(),
+        }];
+        assert!(
+            crate::sandbox::require_preserved_inherited_bind_deny(&source, &remapped).is_err(),
+            "remapping a deny-bearing guest path to a non-bind must be refused"
+        );
     }
 }

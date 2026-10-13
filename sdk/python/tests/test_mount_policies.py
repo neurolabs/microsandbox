@@ -383,8 +383,8 @@ def test_mountconfig_accepts_non_canonical_lookalikes() -> None:
 def test_mountconfig_rejects_deny_on_non_bind() -> None:
     # _to_dict is the boundary that produces the dict apply_mount consumes; any
     # deny on a non-bind arm must be rejected here, never silently dropped.
-    # (The native apply_mount guard for hand-built dicts is covered by the
-    # crate's Rust test `apply_mount_rejects_deny_on_non_bind_arms`.)
+    # (The native apply_mount guard for hand-built dicts is covered by
+    # sdk/python/tests/test_mount_deny_native.py.)
     for kind, kw in (
         (MountKind.NAMED, {"named": "vol"}),
         (MountKind.OWNED, {"owned_kind": VolumeKind.DIRECTORY}),

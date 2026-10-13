@@ -175,27 +175,13 @@ fn reject_weakened_deny(
 /// inherit resources must re-declare each deny-bearing bind with a deny list at
 /// least as strict as the source's. Omitting the mount entirely is refused too:
 /// the source bind is gone, so silently proceeding would drop its policy. Callers
-/// skip this when the child inherits resources, because the source mount
-/// (including its deny list) is reconnected.
+/// use [`require_preserved_inherited_bind_deny`] instead when the child inherits
+/// resources, because the source mount (including its deny list) is reconnected.
 pub(crate) fn require_preserved_bind_deny(
     source_mounts: &[VolumeMount],
     destination_mounts: &[VolumeMount],
 ) -> MicrosandboxResult<()> {
-    let mut source = source_mounts.to_vec();
-    canonicalize_volume_mounts(&mut source)?;
-
-    let policies: Vec<ExternalMountPolicy> = source
-        .iter()
-        .filter_map(|mount| match mount {
-            VolumeMount::Bind { guest, deny, .. } if !deny.is_empty() => {
-                Some(ExternalMountPolicy {
-                    guest_path: guest.clone(),
-                    deny: deny.clone(),
-                })
-            }
-            _ => None,
-        })
-        .collect();
+    let policies = deny_policies(source_mounts)?;
     if policies.is_empty() {
         return Ok(());
     }
@@ -217,6 +203,47 @@ pub(crate) fn require_preserved_bind_deny(
     }
 
     reject_weakened_deny(&destination, Some(&policies))
+}
+
+/// Refuse a branch child whose explicit mount weakens an inherited deny-bearing bind.
+///
+/// With resource inheritance the source's deny-bearing bind is reconnected, so an
+/// omitted explicit mount is safe. But an explicit child mount at the same guest path
+/// overrides that inherited source mount, so it must not drop or weaken the source's
+/// deny list. This applies the same weakening check as a restore, without requiring
+/// the mount to be present merely because it is inherited.
+pub(crate) fn require_preserved_inherited_bind_deny(
+    source_mounts: &[VolumeMount],
+    destination_mounts: &[VolumeMount],
+) -> MicrosandboxResult<()> {
+    let policies = deny_policies(source_mounts)?;
+    if policies.is_empty() {
+        return Ok(());
+    }
+
+    let mut destination = destination_mounts.to_vec();
+    canonicalize_volume_mounts(&mut destination)?;
+
+    reject_weakened_deny(&destination, Some(&policies))
+}
+
+/// Capture the deny policies of the source bind mounts, canonicalizing guest paths.
+fn deny_policies(source_mounts: &[VolumeMount]) -> MicrosandboxResult<Vec<ExternalMountPolicy>> {
+    let mut source = source_mounts.to_vec();
+    canonicalize_volume_mounts(&mut source)?;
+
+    Ok(source
+        .iter()
+        .filter_map(|mount| match mount {
+            VolumeMount::Bind { guest, deny, .. } if !deny.is_empty() => {
+                Some(ExternalMountPolicy {
+                    guest_path: guest.clone(),
+                    deny: deny.clone(),
+                })
+            }
+            _ => None,
+        })
+        .collect())
 }
 
 /// Reconnect only user-selected bindings or an exact locally recorded source binding.
