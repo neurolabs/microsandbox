@@ -61,7 +61,7 @@ pub(super) struct RenameEndpoint<'a> {
 /// rename never needs this because it always replaces the destination with the
 /// source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExchangeDest {
+pub(super) enum ExchangeDest {
     /// The destination did not resolve when its type was assessed.
     Absent,
     /// The destination resolved with this host `(ino, dev)` identity.
@@ -75,7 +75,7 @@ enum ExchangeDest {
 impl ExchangeDest {
     /// Capture the expectation from the destination's pre-move identity, if it
     /// was present.
-    fn capture(identity: Option<(u64, u64)>) -> Self {
+    pub(super) fn capture(identity: Option<(u64, u64)>) -> Self {
         match identity {
             Some((ino, dev)) => Self::Present { ino, dev },
             None => Self::Absent,
@@ -84,7 +84,7 @@ impl ExchangeDest {
 
     /// Whether a freshly read destination identity (absent when `None`) still
     /// satisfies this expectation.
-    fn still_matches(self, current: Option<(u64, u64)>) -> bool {
+    pub(super) fn still_matches(self, current: Option<(u64, u64)>) -> bool {
         match self {
             Self::Absent => current.is_none(),
             Self::Present { ino, dev } => current == Some((ino, dev)),

@@ -16,6 +16,7 @@ crossbeam-channel = "0.5"
 hex.workspace = true
 ignore.workspace = true
 libc.workspace = true
+microsandbox-types.workspace = true
 microsandbox-utils.workspace = true
 msb_krun.workspace = true
 msb_krun_utils.workspace = true

@@ -4025,6 +4025,7 @@ dependencies = [
  "hex",
  "ignore",
  "libc",
+ "microsandbox-types",
  "microsandbox-utils",
  "msb_krun",
  "msb_krun_utils",

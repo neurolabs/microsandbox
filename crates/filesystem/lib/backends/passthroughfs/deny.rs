@@ -333,33 +333,6 @@ fn reject_non_canonical(pattern: &str) -> io::Result<()> {
     ))
 }
 
-/// Reject path deny patterns (`sub/.env`, `**/env.secret`) on a writable mount.
-///
-/// Mirrors the shared `microsandbox_types::reject_writable_path_patterns` rule
-/// as defence in depth: the SDK/runtime validate patterns first, but the Unix
-/// backend constructor must not rely on that. A path pattern is matched against
-/// the entry's reconstructed mount-relative path, so a guest with a writable
-/// mount can rename an ancestor directory and make the denied path stop
-/// matching. Name-only (`.env`) and directory-only (`node_modules/`) patterns
-/// match anywhere and stay valid, and a read-only mount cannot rename, so path
-/// patterns remain valid there.
-pub(crate) fn reject_writable_path_patterns(patterns: &[String]) -> io::Result<()> {
-    if let Some(pattern) = patterns
-        .iter()
-        .find(|pattern| pattern.trim_end_matches('/').contains('/'))
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "deny pattern {pattern:?} is a path pattern, which a writable mount can bypass by \
-                 renaming an ancestor directory; use a name-only pattern, or mark the mount read-only"
-            ),
-        ));
-    }
-
-    Ok(())
-}
-
 /// Whether the mount should match deny patterns case-insensitively.
 ///
 /// On Windows this is always `true`. NTFS supports per-directory case

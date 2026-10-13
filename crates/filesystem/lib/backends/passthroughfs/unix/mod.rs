@@ -343,10 +343,12 @@ impl PassthroughFs {
     ) -> io::Result<Self> {
         // Defence in depth: a path pattern on a writable mount can be laundered
         // by renaming an ancestor directory, so the SDK/runtime reject it at
-        // configuration time. Re-check here too, so a caller that reaches the
-        // backend constructor directly cannot bypass the rule.
+        // configuration time. Re-check here too, via the shared validator (the
+        // single source of truth), so a caller that reaches the backend
+        // constructor directly cannot bypass the rule.
         if !cfg.readonly() {
-            deny::reject_writable_path_patterns(&cfg.deny)?;
+            microsandbox_types::reject_writable_path_patterns(&cfg.deny)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
         }
 
         if cfg.owned_checkpoint.is_some() && (cfg.external_checkpoint.is_some() || cfg.inject_init)

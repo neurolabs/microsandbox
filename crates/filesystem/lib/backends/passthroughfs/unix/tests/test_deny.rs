@@ -912,14 +912,17 @@ fn builder_rejects_path_pattern_on_writable_mount() {
 /// stale one retries, and a denied endpoint is denied. Covers the extraction's
 /// Proceed/Retry/Deny branches without needing a concurrent writer (or macOS).
 ///
-/// The exchange-destination `Retry` re-check inside the same call cannot be
-/// triggered without a concurrent writer mutating the destination between the
-/// capture and the re-check; its `ExchangeDest::still_matches` logic is covered
-/// by the unit tests in `remove_ops`.
+/// The exchange-destination `Retry` re-check inside one call cannot be exercised
+/// end-to-end without a concurrent writer mutating the destination between the
+/// capture and the re-check (the two reads happen back-to-back in the same
+/// call). Its predicate — `ExchangeDest::still_matches` — is asserted directly
+/// below and also covered by the unit tests in `remove_ops`.
 #[test]
 fn test_decide_rename_deny_proceeds_and_retries_on_stale_source() {
     use super::super::inode;
-    use super::super::remove_ops::{RenameDecision, RenameEndpoint, decide_rename_deny};
+    use super::super::remove_ops::{
+        ExchangeDest, RenameDecision, RenameEndpoint, decide_rename_deny,
+    };
     use crate::backends::shared::platform;
 
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
@@ -982,6 +985,18 @@ fn test_decide_rename_deny_proceeds_and_retries_on_stale_source() {
         decide_rename_deny(&sb.fs, old, denied, 0, &current).unwrap(),
         RenameDecision::Deny
     ));
+
+    // Exchange-destination Retry predicate: a present destination that changed
+    // identity, or disappeared, no longer matches; an unchanged one does, and an
+    // initially-absent destination is stale once anything appears.
+    let expected = ExchangeDest::capture(Some((10, 20)));
+    assert!(expected.still_matches(Some((10, 20))));
+    assert!(!expected.still_matches(Some((10, 21))));
+    assert!(!expected.still_matches(None));
+
+    let absent = ExchangeDest::capture(None);
+    assert!(absent.still_matches(None));
+    assert!(!absent.still_matches(Some((10, 20))));
 }
 
 //--------------------------------------------------------------------------------------------------
