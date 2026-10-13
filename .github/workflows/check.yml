@@ -659,6 +659,14 @@ jobs:
           Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
           cargo +stable test -p microsandbox-network --lib --target ${{ matrix.rust_target }} dns::windows_resolver::
 
+      - name: Check Windows filesystem library
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
+          Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
+          cargo +stable check --no-default-features -p microsandbox-filesystem --target ${{ matrix.rust_target }}
+
       - name: Test Windows filesystem DAX mappings
         shell: pwsh
         run: |
@@ -694,6 +702,9 @@ jobs:
           cache-targets: true
           shared-key: filesystem-backend-crosscheck
 
+      # `--no-default-features` avoids the `embed-binaries` OUT_DIR payload, which
+      # is not available in this cross-check; the deny code is not feature-gated,
+      # so this still compiles and covers the C1 windows-backend break.
       - name: Check Windows filesystem backend
         run: cargo +stable check --no-default-features -p microsandbox-filesystem --target x86_64-pc-windows-msvc
 

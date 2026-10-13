@@ -230,10 +230,14 @@ impl PassthroughFs {
     /// filesystem. A host writer could replace an allowed file at a
     /// directory-only-denied name with a directory after lookup vouched for it;
     /// an inode-scoped mutation must not then act on the hidden replacement.
-    /// The mount root and pinned (`retained`) objects are exempt. Fails closed:
-    /// an unreadable live path is treated as a directory.
+    /// The synthetic mount root and init inode, and pinned (`retained`) objects,
+    /// are exempt. Fails closed: an unreadable live path is treated as a
+    /// directory.
     pub(super) fn reject_dir_only_denied_live_path(&self, inode: u64) -> io::Result<()> {
-        if inode == ROOT_INODE || !self.deny.has_dir_only_patterns() {
+        // The synthetic inodes (`ROOT_INODE`, `INIT_INODE`) are never path-backed
+        // namespace entries. Exempting them keeps an unknown-inode `EBADF` from
+        // shadowing `do_setattr`'s own handling (e.g. `EACCES` for `INIT_INODE`).
+        if inode <= INIT_INODE || !self.deny.has_dir_only_patterns() {
             return Ok(());
         }
         let data = self.inode(inode)?;

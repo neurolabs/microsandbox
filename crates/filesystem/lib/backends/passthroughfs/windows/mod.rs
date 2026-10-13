@@ -309,6 +309,14 @@ impl PassthroughFs {
     /// re-apply the deny rule to avoid exposing a directory that replaced an
     /// allowed file at a directory-only-denied name. Fails closed when the path
     /// cannot be matched.
+    ///
+    /// Unlike [`Self::deny_matches_name`], this does not apply the fail-closed
+    /// 8.3 short-name over-match: it only ever receives canonical long names —
+    /// host paths interned by lookup (which the over-match already denied while
+    /// a deny list is active) or stored canonical paths from a checkpoint. A
+    /// legitimate long name may itself contain a `~`+digit shape, so
+    /// over-matching here would over-deny real entries; callers must not pass a
+    /// guest-supplied short alias to this function.
     pub(super) fn deny_matches_path(&self, path: &Path, is_dir: bool) -> bool {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             return true;
