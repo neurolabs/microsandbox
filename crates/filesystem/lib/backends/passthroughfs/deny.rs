@@ -144,6 +144,20 @@ impl DenyList {
                 ));
             }
             reject_non_canonical(pattern)?;
+            // The `ignore` crate folds globs with ASCII-only case-folding, so a
+            // non-ASCII pattern cannot be matched case-insensitively: a pattern
+            // like `café` would silently fail to hide `CAFÉ`. Reject it on a
+            // case-insensitive mount rather than under-match.
+            if case_insensitive && !pattern.is_ascii() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "deny pattern {pattern:?} contains non-ASCII characters, which cannot be \
+                         matched case-insensitively on this filesystem; use an ASCII pattern or a \
+                         case-sensitive mount"
+                    ),
+                ));
+            }
             needs_path_reconstruction |= pattern.trim_end_matches('/').contains('/');
             has_dir_only_patterns |= pattern.ends_with('/');
             builder.add_line(None, pattern).map_err(|err| {
@@ -365,11 +379,12 @@ fn ro_fs_is_case_sensitive(root: &Path) -> bool {
         return false;
     }
     // Known case-sensitive filesystem magic numbers (ext2/3/4, xfs, btrfs,
-    // tmpfs, reiserfs, jfs, f2fs, bcachefs, nilfs2, ocfs2, overlayfs). Everything
-    // else (vfat/exfat/ntfs, remote/fuseblk/cifs/nfs, unknown, future types) is
-    // treated as case-insensitive, because those filesystems' case behavior is
-    // server- or configuration-dependent and cannot be positively established
-    // without a write probe. Over-matching is the safe direction.
+    // tmpfs, reiserfs, jfs, bcachefs, nilfs2, ocfs2). Everything else
+    // (vfat/exfat/ntfs, remote/fuseblk/cifs/nfs, f2fs, overlayfs, unknown,
+    // future types) is treated as case-insensitive, because those filesystems'
+    // case behavior is server-, configuration-, or per-directory-dependent and
+    // cannot be positively established without a write probe. Over-matching is
+    // the safe direction.
     matches!(
         st.f_type as u32,
         0x0000_EF53 // ext2/3/4
@@ -378,11 +393,9 @@ fn ro_fs_is_case_sensitive(root: &Path) -> bool {
             | 0x0102_1994 // tmpfs
             | 0x5265_4973 // reiserfs
             | 0x3153_464A // jfs
-            | 0xF2F5_2010 // f2fs
             | 0xCA45_1A4E // bcachefs
             | 0x0000_3434 // nilfs2
             | 0x7461_636F // ocfs2
-            | 0x794C_7630 // overlayfs
     )
 }
 
@@ -506,6 +519,35 @@ mod tests {
         let path_patterns = vec!["sub/.env".to_string()];
         let insensitive = DenyList::build(&path_patterns, true).unwrap();
         assert!(insensitive.matches_path(b"sub/.ENV", false));
+    }
+
+    #[test]
+    fn non_ascii_pattern_on_case_insensitive_mount_is_rejected_or_folds() {
+        // A case-insensitive mount folds with `ignore`'s ASCII-only fold, so a
+        // non-ASCII pattern can never match a differently-cased name. The build
+        // must therefore either reject it or truly fold it; silently accepting
+        // and then under-matching is the bug this pins.
+        let owned = vec!["café".to_string()];
+        match DenyList::build(&owned, true) {
+            Ok(list) => assert!(
+                list.matches_basename("CAFE\u{301}".as_bytes(), false),
+                "a case-insensitive build must fold café to CAFÉ or reject it"
+            ),
+            Err(_) => {}
+        }
+
+        // On a case-sensitive mount the pattern is byte-exact and stays valid.
+        assert!(DenyList::build(&owned, false).is_ok());
+    }
+
+    #[test]
+    fn ascii_folding_still_works() {
+        let sensitive = DenyList::build(&[".ENV".to_string()], false).unwrap();
+        assert!(!sensitive.matches_basename(b".env", false));
+
+        let insensitive = DenyList::build(&[".ENV".to_string()], true).unwrap();
+        assert!(insensitive.matches_basename(b".env", false));
+        assert!(insensitive.matches_basename(b".Env", false));
     }
 
     #[test]
