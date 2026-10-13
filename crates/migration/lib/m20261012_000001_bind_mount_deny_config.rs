@@ -76,18 +76,14 @@ fn reject_persisted_deny(name: &str, column: &str, raw: &str) -> Result<(), DbEr
     // Read raw JSON so a later policy cannot be dropped by deserialization. Only
     // an absent, null, or empty deny list is safe to discard. `SandboxConfig`
     // flattens `SandboxSpec`, so mounts live at the top level (`/mounts`), not
-    // under `/spec`; see the guest-clock migration for the same shape.
+    // under `/spec`; see the guest-clock migration for the same shape. The scan
+    // is shape-tolerant because `msb self downgrade` runs the v0.6.5 mount rewrap
+    // (`config::prepare`) before the schema rollback reaches this guard, moving
+    // the deny list from the mount object into its nested `bind` object.
     let has_deny = value
         .pointer("/mounts")
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|mounts| {
-            mounts.iter().any(|mount| {
-                mount
-                    .get("deny")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|deny| !deny.is_empty())
-            })
-        });
+        .is_some_and(|mounts| mounts.iter().any(mount_carries_deny));
 
     if has_deny {
         return Err(DbErr::Migration(format!(
@@ -95,6 +91,24 @@ fn reject_persisted_deny(name: &str, column: &str, raw: &str) -> Result<(), DbEr
         )));
     }
     Ok(())
+}
+
+/// Whether a serialized mount object carries a non-empty `deny` list.
+///
+/// The current shape stores the list directly on the mount
+/// (`{"type":"Bind","deny":[...]}`). A previous-version rewrap stores the same
+/// fields one level down (`{"bind":{"deny":[...]}}`). Recursing through nested
+/// objects finds the list at either nesting, so a future mount rewrite cannot
+/// hide the policy from the guard. Only an absent, null, or empty list is safe.
+fn mount_carries_deny(mount: &serde_json::Value) -> bool {
+    match mount {
+        serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
+            (key == "deny" && value.as_array().is_some_and(|deny| !deny.is_empty()))
+                || mount_carries_deny(value)
+        }),
+        serde_json::Value::Array(items) => items.iter().any(mount_carries_deny),
+        _ => false,
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -245,6 +259,35 @@ mod tests {
                 (deny.as_str(), empty.as_str())
             } else {
                 (empty.as_str(), deny.as_str())
+            };
+            let db = database(desired, Some(active)).await;
+            let before = saved_state(&db).await;
+
+            let error = Migration.down(&SchemaManager::new(&db)).await.unwrap_err();
+
+            let message = error.to_string();
+            assert!(
+                message.contains("bind_mount_deny_downgrade_unrepresentable"),
+                "{message}"
+            );
+            assert!(message.contains("deny-fixture"), "{message}");
+            assert!(message.contains(column), "{message}");
+            assert_eq!(saved_state(&db).await, before);
+        }
+    }
+
+    /// The v0.6.5 saved-config rewrap nests a bind mount's fields under a `bind`
+    /// object (`{"bind":{"deny":[...]}}`). The downgrade path runs `config::prepare`
+    /// before `Migrator::down`, so the guard must still find the deny list at the
+    /// rewritten nesting instead of dropping the policy.
+    #[tokio::test]
+    async fn v0_6_5_downgrade_refuses_when_deny_wrapped_in_bind() {
+        let raw = r#"{"mounts":[{"bind":{"host":"/host/data","guest":"/data","deny":[".env"]}}]}"#;
+        for column in ["config", "active_config"] {
+            let (desired, active) = if column == "config" {
+                (raw, "{}")
+            } else {
+                ("{}", raw)
             };
             let db = database(desired, Some(active)).await;
             let before = saved_state(&db).await;
