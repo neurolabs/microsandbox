@@ -133,6 +133,52 @@ pub fn validate_deny_pattern(pattern: &str) -> TypesResult<()> {
         )));
     }
 
+    // `.` and `..` name the current and parent directory. gitignore cannot
+    // express either as a rule, so the pattern would compile to an empty
+    // matcher and enforce nothing.
+    if pattern == "." || pattern == ".." {
+        return Err(TypesError::invalid_config(format!(
+            "deny pattern must not be '.' or '..'; deny a named entry instead \
+             (e.g. 'secret' or 'secret/'), not the current or parent directory: {pattern:?}"
+        )));
+    }
+
+    // A leading `//` (including a leading `/` immediately followed by another
+    // `/`) is not a rooted path in gitignore and would compile to nothing.
+    if pattern.starts_with("//") {
+        return Err(TypesError::invalid_config(format!(
+            "deny pattern must not start with '//'; write a mount-relative path \
+             with a single separator (e.g. 'a/b') or a name pattern (e.g. 'secret'): {pattern:?}"
+        )));
+    }
+
+    // A leading `./` is a no-op path prefix in gitignore, so the rule would be
+    // silently dropped.
+    if pattern.starts_with("./") {
+        return Err(TypesError::invalid_config(format!(
+            "deny pattern must not start with './'; write the mount-relative path \
+             directly (e.g. 'secret' or 'sub/secret'): {pattern:?}"
+        )));
+    }
+
+    // A bare `!` is a negation with nothing to negate, so it compiles to an
+    // empty matcher. `!name` (an allow rule) stays valid.
+    if pattern == "!" {
+        return Err(TypesError::invalid_config(format!(
+            "deny pattern must not be a bare '!'; a negation needs a rule to negate \
+             (e.g. '!keep.txt'): {pattern:?}"
+        )));
+    }
+
+    // Repeated `/` creates an empty path component (e.g. `a//b`, `foo//`), which
+    // gitignore does not match, so the rule would enforce nothing.
+    if pattern.contains("//") {
+        return Err(TypesError::invalid_config(format!(
+            "deny pattern must not contain repeated '/'; use a single separator \
+             between path components (e.g. 'a/b', 'foo/'): {pattern:?}"
+        )));
+    }
+
     Ok(())
 }
 
@@ -364,6 +410,43 @@ mod tests {
 
         // `!` is still valid: it drives allowlist negation alongside a `*` rule.
         validate_deny_pattern("!keep.txt").unwrap();
+    }
+
+    #[test]
+    fn rejects_non_canonical_patterns() {
+        for bad in ["./secret", "//secret", "a//b", "!", ".", "..", "foo//"] {
+            assert!(validate_deny_pattern(bad).is_err(), "{bad:?}");
+        }
+        for ok in [
+            ".env",
+            "sub/.env",
+            "**/env.secret",
+            "node_modules/",
+            "\\#x",
+            "!keep.txt",
+        ] {
+            validate_deny_pattern(ok).unwrap();
+        }
+    }
+
+    #[test]
+    fn non_canonical_patterns_have_distinct_actionable_messages() {
+        let message = |bad: &str| validate_deny_pattern(bad).unwrap_err().to_string();
+
+        // Each rejected form names the exact mistake; `.`/`..` share the
+        // directory rule but every form points at the fix.
+        assert!(message("./secret").contains("must not start with './'"));
+        assert!(message("//secret").contains("must not start with '//'"));
+        assert!(message("a//b").contains("must not contain repeated '/'"));
+        assert!(message("foo//").contains("must not contain repeated '/'"));
+        assert!(message("!").contains("must not be a bare '!'"));
+        assert!(message(".").contains("must not be '.' or '..'"));
+        assert!(message("..").contains("must not be '.' or '..'"));
+
+        // The four independent forms carry four distinct reasons.
+        let reasons = ["./secret", "//secret", "a//b", "!"].map(message);
+        let unique: std::collections::BTreeSet<&String> = reasons.iter().collect();
+        assert_eq!(unique.len(), 4, "expected distinct messages: {reasons:?}");
     }
 
     #[test]

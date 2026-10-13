@@ -143,6 +143,7 @@ impl DenyList {
                     ),
                 ));
             }
+            reject_non_canonical(pattern)?;
             needs_path_reconstruction |= pattern.trim_end_matches('/').contains('/');
             has_dir_only_patterns |= pattern.ends_with('/');
             builder.add_line(None, pattern).map_err(|err| {
@@ -244,6 +245,38 @@ impl DenyList {
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+/// Reject deny patterns that gitignore compiles to an empty matcher, so a
+/// direct constructor cannot produce a silently inert deny list.
+///
+/// Mirrors the shared `validate_deny_pattern` rules as defence in depth: the
+/// SDK/runtime validate patterns first, but `DenyList` must not rely on that. A
+/// pattern is rejected when it is `.`/`..`, starts with `//` or `./`, is a bare
+/// `!`, or contains a repeated `/`.
+fn reject_non_canonical(pattern: &str) -> io::Result<()> {
+    let reason = if pattern == "." || pattern == ".." {
+        "'.' and '..' name the current and parent directory and cannot be denied; \
+         deny a named entry instead (e.g. 'secret' or 'secret/')"
+    } else if pattern.starts_with("//") {
+        "a leading '//' is not a rooted path; write a mount-relative path with a single \
+         separator (e.g. 'a/b') or a name pattern (e.g. 'secret')"
+    } else if pattern.starts_with("./") {
+        "a leading './' is a no-op prefix; write the mount-relative path directly \
+         (e.g. 'secret' or 'sub/secret')"
+    } else if pattern == "!" {
+        "a bare '!' is a negation with no rule to negate (e.g. '!keep.txt')"
+    } else if pattern.contains("//") {
+        "a repeated '/' creates an empty path component; use a single separator \
+         (e.g. 'a/b', 'foo/')"
+    } else {
+        return Ok(());
+    };
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("invalid deny pattern {pattern:?}: {reason}"),
+    ))
+}
 
 /// Whether the mount should match deny patterns case-insensitively.
 ///
@@ -524,6 +557,34 @@ mod tests {
         // An escaped literal '#' is still a valid pattern.
         let escaped = vec!["\\#secret".to_string()];
         assert!(DenyList::build(&escaped, false).is_ok());
+    }
+
+    #[test]
+    fn rejects_non_canonical_patterns() {
+        // A pattern the matcher cannot enforce must fail construction rather
+        // than compile to an empty matcher that silently denies nothing.
+        for bad in ["./secret", "//secret", "a//b", "!", ".", "..", "foo//"] {
+            let owned = vec![(*bad).to_string()];
+            assert!(
+                DenyList::build(&owned, false).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+
+        for ok in [
+            ".env",
+            "sub/.env",
+            "**/env.secret",
+            "node_modules/",
+            "\\#x",
+            "!keep.txt",
+        ] {
+            let owned = vec![(*ok).to_string()];
+            assert!(
+                DenyList::build(&owned, false).is_ok(),
+                "expected {ok:?} to be accepted"
+            );
+        }
     }
 
     #[test]
