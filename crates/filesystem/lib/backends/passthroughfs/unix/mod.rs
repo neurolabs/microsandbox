@@ -341,6 +341,14 @@ impl PassthroughFs {
         cfg: PassthroughConfig,
         probe_name: Option<&CStr>,
     ) -> io::Result<Self> {
+        // Defence in depth: a path pattern on a writable mount can be laundered
+        // by renaming an ancestor directory, so the SDK/runtime reject it at
+        // configuration time. Re-check here too, so a caller that reaches the
+        // backend constructor directly cannot bypass the rule.
+        if !cfg.readonly() {
+            deny::reject_writable_path_patterns(&cfg.deny)?;
+        }
+
         if cfg.owned_checkpoint.is_some() && (cfg.external_checkpoint.is_some() || cfg.inject_init)
         {
             return Err(io::Error::new(

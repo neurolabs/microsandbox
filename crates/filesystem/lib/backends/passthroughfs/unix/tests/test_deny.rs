@@ -362,6 +362,7 @@ fn test_deny_normal_ops_unchanged() {
 fn test_deny_path_pattern_lookup() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
         deny: vec!["sub/.env".to_string()],
+        readonly: true,
         ..cfg
     });
     sb.host_create_dir("sub");
@@ -385,6 +386,7 @@ fn test_deny_path_pattern_lookup() {
 fn test_deny_recursive_path_pattern() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
         deny: vec!["**/env.secret".to_string()],
+        readonly: true,
         ..cfg
     });
     sb.host_create_dir("a");
@@ -398,41 +400,59 @@ fn test_deny_recursive_path_pattern() {
     TestSandbox::assert_errno(sb.lookup(b.inode, "env.secret"), LINUX_ENOENT);
 }
 
-/// Path patterns also gate create within a hidden subtree.
+/// A path pattern on a writable mount is refused by the backend constructor.
+///
+/// The per-operation create check for path patterns is therefore unreachable
+/// with a writable mount; the deny matcher itself is covered by the readonly
+/// lookup and readdir tests. Here we pin that `PassthroughFs::new` (not just
+/// the builder) enforces the rule.
 #[test]
 fn test_deny_path_pattern_create() {
-    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let writable = PassthroughFs::new(PassthroughConfig {
+        root_dir: tmp.path().to_path_buf(),
         deny: vec![".sub/.secret".to_string()],
-        ..cfg
+        ..Default::default()
     });
-    sb.host_create_dir(".sub");
-    let dir = sb.lookup_root(".sub").unwrap();
+    assert!(
+        writable.is_err(),
+        "a writable mount must refuse a path pattern"
+    );
 
-    TestSandbox::assert_errno(sb.fuse_create(dir.inode, ".secret", 0o644), LINUX_EACCES);
-
-    // Sibling create is unaffected.
-    sb.fuse_create(dir.inode, "normal.txt", 0o644).unwrap();
+    let readonly = PassthroughFs::new(PassthroughConfig {
+        root_dir: tmp.path().to_path_buf(),
+        deny: vec![".sub/.secret".to_string()],
+        readonly: true,
+        ..Default::default()
+    });
+    assert!(
+        readonly.is_ok(),
+        "a read-only mount must accept a path pattern"
+    );
 }
 
-/// A path pattern fires on a rename whose destination is the denied path.
+/// A path pattern is only valid on a read-only mount, where the guest cannot
+/// rename an ancestor directory to launder the denied path. The rename itself
+/// is refused outright (`EROFS`), so the writable laundering path is closed.
 ///
-/// This pins the location-based semantics of path patterns: `sub/.env` hides a
-/// file *at* `sub/.env`, so renaming a visible file onto that path is rejected
-/// with `EACCES`. (The converse — renaming a denied file *off* the path makes
-/// it served — is pinned separately as the known ancestor-rename laundering
-/// limitation.)
+/// This replaces the previous writable-mount expectation: a path pattern is now
+/// rejected at construction on a writable mount (see
+/// `builder_rejects_path_pattern_on_writable_mount`).
 #[test]
 fn test_deny_path_pattern_rename_onto_denied_path_is_rejected() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
         deny: vec!["sub/.env".to_string()],
+        readonly: true,
         ..cfg
     });
     sb.host_create_dir("sub");
-    sb.fuse_create_root("src").unwrap();
+    sb.host_create_file("src", b"x");
 
-    // The destination `sub/.env` matches the denied path, so the rename is
-    // rejected before any host move happens.
     let sub = sb.lookup_root("sub").unwrap();
+
+    // A rename would let a writable guest launder the location, so a read-only
+    // mount refuses the rename entirely.
     TestSandbox::assert_errno(
         sb.fs.rename(
             sb.ctx(),
@@ -442,12 +462,8 @@ fn test_deny_path_pattern_rename_onto_denied_path_is_rejected() {
             &TestSandbox::cstr(".env"),
             0,
         ),
-        LINUX_EACCES,
+        LINUX_EROFS,
     );
-
-    // The source is untouched and the denied destination is still absent.
-    sb.lookup_root("src").unwrap();
-    TestSandbox::assert_errno(sb.lookup(sub.inode, ".env"), LINUX_ENOENT);
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -490,6 +506,7 @@ fn test_deny_dir_only_lookup_serves_same_named_file() {
 fn test_deny_dir_only_path_pattern_lookup() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
         deny: vec!["sub/node_modules/".to_string()],
+        readonly: true,
         ..cfg
     });
     sb.host_create_dir("sub");
@@ -790,6 +807,7 @@ fn test_deny_dir_only_unlink_same_named_file_allowed() {
 fn test_deny_path_pattern_fails_closed_on_unresolvable_parent() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
         deny: vec!["sub/.env".to_string()],
+        readonly: true,
         ..cfg
     });
 
@@ -799,6 +817,44 @@ fn test_deny_path_pattern_fails_closed_on_unresolvable_parent() {
         sb.fs.deny_matches_name(1_000_000, b"secret", false),
         "unresolvable parent under path patterns must fail closed"
     );
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests: backend boundary rejects writable-mount path patterns
+//--------------------------------------------------------------------------------------------------
+
+/// The backend boundary refuses a path pattern on a writable mount, matching
+/// the SDK/runtime rule, so a caller reaching the builder directly cannot
+/// bypass it. A read-only mount accepts the same pattern.
+#[test]
+fn builder_rejects_path_pattern_on_writable_mount() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let writable = PassthroughFs::builder()
+        .root_dir(tmp.path())
+        .deny(["sub/.env".to_string()])
+        .build();
+    assert!(
+        writable.is_err(),
+        "a writable mount must reject a path pattern"
+    );
+
+    let readonly = PassthroughFs::builder()
+        .root_dir(tmp.path())
+        .readonly(true)
+        .deny(["sub/.env".to_string()])
+        .build();
+    assert!(
+        readonly.is_ok(),
+        "a read-only mount must accept a path pattern"
+    );
+
+    // Name-only patterns stay valid on a writable mount.
+    let name_only = PassthroughFs::builder()
+        .root_dir(tmp.path())
+        .deny([".env".to_string(), "node_modules/".to_string()])
+        .build();
+    assert!(name_only.is_ok(), "name-only patterns are always writable");
 }
 
 //--------------------------------------------------------------------------------------------------

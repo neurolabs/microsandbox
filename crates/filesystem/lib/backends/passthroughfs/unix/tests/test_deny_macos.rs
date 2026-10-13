@@ -13,6 +13,7 @@ use super::*;
 fn test_macos_deny_path_pattern_lookup() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
         deny: vec!["sub/.env".to_string()],
+        readonly: true,
         ..cfg
     });
     sb.host_create_dir("sub");
@@ -30,6 +31,7 @@ fn test_macos_deny_path_pattern_lookup() {
 fn test_macos_deny_recursive_path_pattern() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
         deny: vec!["**/env.secret".to_string()],
+        readonly: true,
         ..cfg
     });
     sb.host_create_dir("a");
@@ -41,16 +43,33 @@ fn test_macos_deny_recursive_path_pattern() {
     TestSandbox::assert_errno(sb.lookup(b.inode, "env.secret"), LINUX_ENOENT);
 }
 
-/// Path-pattern create is rejected within a hidden subtree on macOS.
+/// A writable mount refuses a path pattern at construction; a read-only mount
+/// accepts it. Path patterns are location-based and a writable mount can
+/// launder them by renaming an ancestor directory.
 #[test]
 fn test_macos_deny_path_pattern_create() {
-    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let writable = PassthroughFs::new(PassthroughConfig {
+        root_dir: tmp.path().to_path_buf(),
         deny: vec!["sub/.secret".to_string()],
-        ..cfg
+        ..Default::default()
     });
-    sb.host_create_dir("sub");
-    let dir = sb.lookup_root("sub").unwrap();
-    TestSandbox::assert_errno(sb.fuse_create(dir.inode, ".secret", 0o644), LINUX_EACCES);
+    assert!(
+        writable.is_err(),
+        "a writable mount must refuse a path pattern"
+    );
+
+    let readonly = PassthroughFs::new(PassthroughConfig {
+        root_dir: tmp.path().to_path_buf(),
+        deny: vec!["sub/.secret".to_string()],
+        readonly: true,
+        ..Default::default()
+    });
+    assert!(
+        readonly.is_ok(),
+        "a read-only mount must accept a path pattern"
+    );
 }
 
 /// `/.vol` resolution returns a real host path for a tracked inode.

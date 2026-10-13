@@ -142,6 +142,11 @@ impl PassthroughFsBuilder {
     }
 
     /// Deny-list of gitignore-style patterns to hide from the guest.
+    ///
+    /// Path patterns (any interior `/`, e.g. `sub/.env`) are only valid on a
+    /// read-only mount; [`Self::build`] refuses them when the mount is
+    /// writable, because a writable mount can rename an ancestor directory to
+    /// launder the denied location.
     pub fn deny(mut self, patterns: impl IntoIterator<Item = String>) -> Self {
         self.deny.extend(patterns);
         self
