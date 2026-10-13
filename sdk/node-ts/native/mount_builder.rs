@@ -307,7 +307,8 @@ impl JsMountBuilder {
     /// Hide host paths matching gitignore-style patterns from the guest.
     ///
     /// Matching entries are invisible (ENOENT) and writes to them are forbidden
-    /// (EACCES). Patterns are relative to the mount root. Valid only for bind mounts.
+    /// (EACCES). Patterns are relative to the mount root. Valid only for directory
+    /// bind mounts; a host file bind has no namespace to filter and rejects them.
     /// A path pattern (`sub/secret`) requires a read-only mount, since a writable
     /// guest could rename an ancestor directory to bypass it.
     #[napi]

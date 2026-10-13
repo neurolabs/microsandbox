@@ -293,6 +293,10 @@ Mount a host directory into the sandbox. Changes in the guest are reflected on t
     <div className="msb-param-key"><code>gid</code><span className="msb-type">int | None</span></div>
     <div className="msb-param-desc">Guest gid fallback for host files without a per-file stat override; set together with <code>uid</code>.</div>
   </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>deny</code><span className="msb-type">list[str] | None</span></div>
+    <div className="msb-param-desc">Host-side deny-list of gitignore-style patterns. Directory bind mounts only; path patterns require a read-only mount. See <a href="#mountconfig">MountConfig.deny</a>.</div>
+  </div>
 </div>
 
 <p className="msb-label">Returns</p>
@@ -832,7 +836,6 @@ Frozen dataclass representing a mount configuration. Build one with a [mount fac
 | noexec | `bool` | `False` | Whether direct execution from the mount is disabled |
 | nosuid | `bool` | `False` | Whether setuid/setgid privilege elevation is ignored |
 | nodev | `bool` | `False` | Whether device files on the mount are ignored |
-| deny | `list[str] \| None` | `None` | Host-side deny-list of gitignore-style patterns. Matching entries are hidden from the guest and writes to them are forbidden. Directory bind mounts only. Path patterns (`sub/secret`) require a read-only mount. |
 | disk | `str \| None` | `None` | Host path to a disk image for disk mounts |
 | format | [`DiskImageFormat`](#diskimageformat)` \| None` | `None` | Disk image format for disk mounts |
 | fstype | `str \| None` | `None` | Inner filesystem type for disk mounts |
@@ -840,6 +843,12 @@ Frozen dataclass representing a mount configuration. Build one with a [mount fac
 | host_permissions | [`HostPermissions`](#hostpermissions)` \| None` | `None` | Per-mount host-permission policy (virtiofs-backed only) |
 | override_uid | `int \| None` | `None` | Guest uid fallback for host files without a per-file override; set through factory `uid=` with `gid=` |
 | override_gid | `int \| None` | `None` | Guest gid fallback for host files without a per-file override; set through factory `gid=` with `uid=` |
+
+#### <span className="msb-recv">config.</span><span className="msb-hn">deny</span>
+
+`list[str] | None`
+
+Host-side deny-list of gitignore-style patterns (e.g. `.env`, `sub/secret`). Matching entries are invisible to the guest (ENOENT) and writes to them are forbidden (EACCES). Set through [`Volume.bind(deny=...)`](#volume-bind). Directory bind mounts only; a host file bind has no namespace to filter and rejects them. A path pattern (`sub/secret`) requires a read-only mount, since a writable guest could rename an ancestor directory to bypass it; name-only and directory-only (`node_modules/`) patterns are valid on any mount. Empty patterns, wire separators (`,`, `:`, newline, NUL), a leading `#` (escape it as `\#`), surrounding whitespace, `.`/`..` components, and repeated or leading `./`/`//` separators are rejected at serialization time with `ValueError`.
 
 ### MountKind
 
