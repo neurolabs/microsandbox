@@ -813,6 +813,45 @@ Direct forking keeps its existing behavior for unavailable resources. Disk-only 
 
 </Accordion>
 
+### Deny policy durability
+
+A bind mount's host-side [`deny`](/sandboxes/volumes#deny-pattern) list is captured in the snapshot. On restore the destination deny list is compared with the captured one and must be at least as strict: a restore that drops or weakens any captured pattern is refused with an explicit error. Re-declare the same (or a stricter) list on the destination mount:
+
+<CodeGroup>
+```typescript TypeScript
+const child = await Sandbox.restore("worker:snap")
+    .name("child")
+    .volume("/work", v => v.bind("/host/project").deny([".env"]))
+    .restore();
+```
+
+```rust Rust
+let child = Sandbox::restore("worker:snap")
+    .name("child")
+    .volume("/work", |v| v.bind("/host/project").deny([".env"]))
+    .restore()
+    .await?;
+```
+
+```python Python
+from microsandbox import Sandbox, Volume
+
+child = await Sandbox.restore(
+    "worker:snap",
+    name="child",
+    volumes={"/work": Volume.bind("/host/project", deny=[".env"])},
+)
+```
+
+```bash CLI
+msb snap restore worker:snap --name child -v /host/project:/work:deny=.env
+```
+</CodeGroup>
+
+Snapshots written before deny capture, and snapshots whose mounts carry no deny list, record no captured policy. Restore treats that as unknown and continues, so older snapshots keep restoring as before. A disk-only restore that boots fresh still enforces the destination deny list on the new mount.
+
+Direct forking children do not inherit host binds by default: when a child does not inherit resources it must re-declare a deny-bearing bind with a deny list at least as strict as the source's. Restoring on the same host with inherited resources reconnects the source mount and keeps its deny list.
+
 ### Validate mounts
 
 Full restore and forking validate captured filesystem identities. Strict is the default; relaxed mode accepts supported differences and reports warnings:
