@@ -1080,3 +1080,67 @@ fn test_deny_symlink_to_denied_target_does_not_expose_target() {
     // rejects, so the target's contents stay unreachable.
     TestSandbox::assert_errno(sb.lookup_root(".env"), LINUX_ENOENT);
 }
+
+//--------------------------------------------------------------------------------------------------
+// Tests: restored directory snapshots re-apply the destination deny list
+//--------------------------------------------------------------------------------------------------
+
+/// A name visible when a directory listing was captured must not reappear through
+/// the restored snapshot once the destination deny list hides it.
+///
+/// Restore re-interning a saved directory snapshot bypasses live lookup and
+/// readdir filtering, so the deny list must be re-applied while rebuilding the
+/// snapshot. The denied file is never looked up, so it has no restored inode:
+/// only the directory-snapshot re-filter can hide it.
+#[test]
+fn restored_directory_snapshot_drops_names_hidden_by_destination_deny() {
+    use super::super::mobility::{capture, restore};
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("sub")).unwrap();
+    std::fs::write(tmp.path().join("sub/.env"), b"secret").unwrap();
+    std::fs::write(tmp.path().join("sub/visible"), b"ok").unwrap();
+
+    let source = PassthroughFs::new(PassthroughConfig {
+        root_dir: tmp.path().to_path_buf(),
+        ..Default::default()
+    })
+    .unwrap();
+    source.init(FsOptions::empty()).unwrap();
+
+    let ctx = Context {
+        uid: 0,
+        gid: 0,
+        pid: 0,
+    };
+    let sub = source.lookup(ctx, ROOT_INODE, c"sub").unwrap().inode;
+    let (handle, _) = source.opendir(ctx, sub, 0).unwrap();
+    let handle = handle.unwrap();
+    let captured = source.readdir(ctx, sub, handle, 4096, 0).unwrap();
+    assert!(
+        captured.iter().any(|entry| entry.name == b".env"),
+        "the denied name must be visible at capture time"
+    );
+    let encoded = capture(&source).unwrap();
+
+    let destination = PassthroughFs::new(PassthroughConfig {
+        root_dir: tmp.path().to_path_buf(),
+        deny: vec![".env".to_string()],
+        ..Default::default()
+    })
+    .unwrap();
+    destination.init(FsOptions::empty()).unwrap();
+    restore(&destination, &encoded).unwrap();
+
+    let restored = destination.readdir(ctx, sub, handle, 4096, 0).unwrap();
+    let names: Vec<&[u8]> = restored.iter().map(|entry| &entry.name[..]).collect();
+
+    assert!(
+        !names.contains(&b".env".as_slice()),
+        "a denied name must not be served from a restored snapshot: {names:?}"
+    );
+    assert!(
+        names.contains(&b"visible".as_slice()),
+        "allowed names must remain visible: {names:?}"
+    );
+}

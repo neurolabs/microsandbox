@@ -789,6 +789,17 @@ fn rebuild(
         let snapshot = saved.entries.as_ref().map(|entries| DirSnapshot {
             entries: entries
                 .iter()
+                // A restored snapshot bypasses live lookup and readdir filtering,
+                // so the destination deny list must be re-applied here. Otherwise
+                // a name that was visible at capture but is hidden at the
+                // destination would be served from the cached listing.
+                .filter(|entry| {
+                    !fs.deny_matches_name_in_dir(
+                        Some(components.as_slice()),
+                        &entry.name,
+                        entry.file_type == platform::DIRENT_DIR,
+                    )
+                })
                 .map(|entry| PassthroughDirEntry {
                     inode: entry.inode,
                     name: entry.name.clone(),
