@@ -1090,6 +1090,119 @@ async fn scoped_header_downgrade_refuses_without_changing_the_catalog() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// A real serialized `SandboxSpec` carrying a bind mount with a deny list.
+///
+/// Deserialized from the current persisted shape and re-serialized, so it is the
+/// exact production JSON an active catalog row holds, not a hand-built literal.
+fn bind_deny_config() -> String {
+    let source = serde_json::json!({
+        "name": "bind-deny-fixture",
+        "mounts": [{
+            "type": "Bind",
+            "host": "/host/data",
+            "guest": "/data",
+            "deny": [".env"]
+        }]
+    });
+    let spec: microsandbox_types::SandboxSpec = serde_json::from_value(source).unwrap();
+    serde_json::to_string(&spec).unwrap()
+}
+
+/// Number of applied migrations from the newest down to (and including) the
+/// bind-mount deny marker, so the rollback reaches the guard regardless of
+/// later markers.
+fn steps_to_bind_deny_marker() -> usize {
+    use microsandbox_migration::{Migrator, MigratorTrait};
+
+    let migrations = Migrator::migrations();
+    let index = migrations
+        .iter()
+        .position(|migration| {
+            migration.name()
+                == microsandbox_migration::schema_metadata::BIND_MOUNT_DENY_CONFIG_MIGRATION_ID
+        })
+        .expect("bind-deny marker migration is listed");
+    migrations.len() - index
+}
+
+/// The full `self downgrade` ordering (`config::prepare` then `Migrator::down`)
+/// must refuse a persisted bind deny list at every target, including v0.6.5,
+/// whose mount rewrap nests the list under `bind` before schema rollback.
+#[tokio::test]
+async fn downgrade_refuses_bind_deny() {
+    use microsandbox_migration::{Migrator, MigratorTrait};
+
+    let raw = bind_deny_config();
+    let steps = steps_to_bind_deny_marker();
+    let mut failures = Vec::new();
+
+    for version in ["0.6.5", "0.6.18", "0.7.3"] {
+        for column in ["config", "active_config"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = open_downgrade_db(&dir.path().join("source.db"))
+                .await
+                .unwrap();
+            Migrator::up(db.inner(), None).await.unwrap();
+            let (config, active) = if column == "config" {
+                (raw.clone(), "{}".to_string())
+            } else {
+                ("{}".to_string(), raw.clone())
+            };
+            db.inner()
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "INSERT INTO sandbox (name, config, active_config, status, ephemeral) VALUES ('bind-deny-fixture', ?, ?, 'Stopped', 0)",
+                    [config.into(), active.into()],
+                ))
+                .await
+                .unwrap();
+
+            let target = Version::parse(version).unwrap();
+            let result = rollback_schema_for_target(db.inner(), steps, Some(&target)).await;
+
+            match result {
+                Err(error) => {
+                    let error = error.to_string();
+                    if !(error.contains("bind_mount_deny_downgrade_unrepresentable")
+                        && error.contains("bind-deny-fixture")
+                        && error.contains(column))
+                    {
+                        failures.push(format!("{version} {column}: unexpected error: {error}"));
+                    }
+                }
+                Ok(()) => failures.push(format!("{version} {column}: unsafe downgrade accepted")),
+            }
+
+            let row = db
+                .inner()
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Sqlite,
+                    "SELECT config, active_config FROM sandbox WHERE name = 'bind-deny-fixture'",
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            let expected = if column == "config" {
+                (raw.as_str(), "{}")
+            } else {
+                ("{}", raw.as_str())
+            };
+            assert_eq!(
+                row.try_get::<String>("", "config").unwrap(),
+                expected.0,
+                "{version} {column}"
+            );
+            assert_eq!(
+                row.try_get::<String>("", "active_config").unwrap(),
+                expected.1,
+                "{version} {column}"
+            );
+        }
+    }
+
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// Uses catalogs created and upgraded by real release/candidate binaries.
 #[tokio::test]
 #[ignore = "requires MSB_TEST_CATALOG_MATRIX containing isolated release fixture homes"]
