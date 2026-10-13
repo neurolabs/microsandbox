@@ -179,6 +179,21 @@ pub fn validate_deny_pattern(pattern: &str) -> TypesResult<()> {
         )));
     }
 
+    // A `.` or `..` path component is never present in a reconstructed
+    // mount-relative path, so a pattern like `a/./b` or `../secret` would match
+    // only its literal spelling and be a silent no-op. Only exact components are
+    // rejected; dot-prefixed names (`.env`, `..foo`, `...`) stay valid.
+    if pattern
+        .split('/')
+        .any(|component| component == "." || component == "..")
+    {
+        return Err(TypesError::invalid_config(format!(
+            "deny pattern must not contain a '.' or '..' path component; path components \
+             are matched literally and never contain '.' or '..', so the rule would be a \
+             no-op; use a real path or name pattern (e.g. 'a/b', 'secret'): {pattern:?}"
+        )));
+    }
+
     Ok(())
 }
 
@@ -414,7 +429,19 @@ mod tests {
 
     #[test]
     fn rejects_non_canonical_patterns() {
-        for bad in ["./secret", "//secret", "a//b", "!", ".", "..", "foo//"] {
+        for bad in [
+            "./secret",
+            "//secret",
+            "a//b",
+            "!",
+            ".",
+            "..",
+            "foo//",
+            "a/./b",
+            "a/../b",
+            "../secret",
+            "./a",
+        ] {
             assert!(validate_deny_pattern(bad).is_err(), "{bad:?}");
         }
         for ok in [
@@ -424,6 +451,9 @@ mod tests {
             "node_modules/",
             "\\#x",
             "!keep.txt",
+            "..foo",
+            "...",
+            "a/..foo/b",
         ] {
             validate_deny_pattern(ok).unwrap();
         }
@@ -442,11 +472,14 @@ mod tests {
         assert!(message("!").contains("must not be a bare '!'"));
         assert!(message(".").contains("must not be '.' or '..'"));
         assert!(message("..").contains("must not be '.' or '..'"));
+        assert!(message("a/./b").contains("must not contain a '.' or '..' path component"));
+        assert!(message("a/../b").contains("must not contain a '.' or '..' path component"));
+        assert!(message("../secret").contains("must not contain a '.' or '..' path component"));
 
-        // The four independent forms carry four distinct reasons.
-        let reasons = ["./secret", "//secret", "a//b", "!"].map(message);
+        // The five independent forms carry five distinct reasons.
+        let reasons = ["./secret", "//secret", "a//b", "!", "a/./b"].map(message);
         let unique: std::collections::BTreeSet<&String> = reasons.iter().collect();
-        assert_eq!(unique.len(), 4, "expected distinct messages: {reasons:?}");
+        assert_eq!(unique.len(), 5, "expected distinct messages: {reasons:?}");
     }
 
     #[test]

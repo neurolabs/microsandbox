@@ -252,7 +252,7 @@ impl DenyList {
 /// Mirrors the shared `validate_deny_pattern` rules as defence in depth: the
 /// SDK/runtime validate patterns first, but `DenyList` must not rely on that. A
 /// pattern is rejected when it is `.`/`..`, starts with `//` or `./`, is a bare
-/// `!`, or contains a repeated `/`.
+/// `!`, contains a repeated `/`, or contains a `.`/`..` path component.
 fn reject_non_canonical(pattern: &str) -> io::Result<()> {
     let reason = if pattern == "." || pattern == ".." {
         "'.' and '..' name the current and parent directory and cannot be denied; \
@@ -268,6 +268,12 @@ fn reject_non_canonical(pattern: &str) -> io::Result<()> {
     } else if pattern.contains("//") {
         "a repeated '/' creates an empty path component; use a single separator \
          (e.g. 'a/b', 'foo/')"
+    } else if pattern
+        .split('/')
+        .any(|component| component == "." || component == "..")
+    {
+        "a '.' or '..' path component is never present in a mount-relative path, so the \
+         rule would be a no-op; use a real path or name pattern (e.g. 'a/b', 'secret')"
     } else {
         return Ok(());
     };
@@ -563,7 +569,19 @@ mod tests {
     fn rejects_non_canonical_patterns() {
         // A pattern the matcher cannot enforce must fail construction rather
         // than compile to an empty matcher that silently denies nothing.
-        for bad in ["./secret", "//secret", "a//b", "!", ".", "..", "foo//"] {
+        for bad in [
+            "./secret",
+            "//secret",
+            "a//b",
+            "!",
+            ".",
+            "..",
+            "foo//",
+            "a/./b",
+            "a/../b",
+            "../secret",
+            "./a",
+        ] {
             let owned = vec![(*bad).to_string()];
             assert!(
                 DenyList::build(&owned, false).is_err(),
@@ -578,6 +596,9 @@ mod tests {
             "node_modules/",
             "\\#x",
             "!keep.txt",
+            "..foo",
+            "...",
+            "a/..foo/b",
         ] {
             let owned = vec![(*ok).to_string()];
             assert!(
