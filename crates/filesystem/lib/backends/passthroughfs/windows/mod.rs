@@ -279,7 +279,7 @@ impl PassthroughFs {
 
         // Fail closed: a parent path outside the mount root, or a name that
         // cannot be decoded to UTF-8, cannot be matched against a path pattern.
-        let Some(rel_parent) = relative_path_string(&parent_data.path, &self.root) else {
+        let Some(rel_parent) = relative_path_string(&parent_data.path(), &self.root) else {
             return true;
         };
         let Ok(name_str) = std::str::from_utf8(name_bytes) else {
