@@ -24,7 +24,9 @@
 //! inode identity on reopen instead.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ignore::{Match, gitignore::Gitignore, gitignore::GitignoreBuilder};
@@ -42,10 +44,15 @@ use ignore::{Match, gitignore::Gitignore, gitignore::GitignoreBuilder};
 /// formed. A process-unique numeric suffix keeps concurrent builders from
 /// colliding.
 const CASE_PROBE_PREFIX: &str = "MsBCaSePrObE";
-/// Probe file prefix lowercased, used to validate case-insensitivity.
-fn case_validation_prefix() -> String {
-    CASE_PROBE_PREFIX.to_ascii_lowercase()
-}
+
+/// Lowercase of [`CASE_PROBE_PREFIX`], used to validate case-insensitivity by
+/// resolving a differently-cased variant of the probe file. Must stay the
+/// lowercase form of `CASE_PROBE_PREFIX`.
+const CASE_VALIDATION_PREFIX: &str = "msbcaseprobe";
+
+/// Monotonic counter used to make the case-sensitivity probe name unique within
+/// the process, so concurrent builders on the same mount root do not collide.
+static CASE_PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -76,6 +83,8 @@ pub(crate) struct DenyList {
     /// Only dir-only patterns depend on the entry's type, so callers must learn
     /// `is_dir` when this is `true`.
     has_dir_only_patterns: bool,
+    /// Whether the list has no patterns (matches nothing).
+    empty: bool,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -99,10 +108,41 @@ impl DenyList {
     /// case-sensitivity is instead inferred from the filesystem type; see
     /// [`mount_is_case_insensitive`].
     pub(crate) fn new(root: &Path, patterns: &[String], readonly: bool) -> io::Result<Self> {
+        // Skip the host-side case-insensitivity probe for the common empty-list
+        // case, so deny-less mounts avoid creating a probe file in the root.
+        let case_insensitive = !patterns.is_empty() && mount_is_case_insensitive(root, readonly);
+        Self::build(patterns, case_insensitive)
+    }
+
+    /// Build a matcher with an explicit case-sensitivity setting.
+    ///
+    /// Case-insensitivity must be configured *before* the globs are added: the
+    /// `ignore` crate compiles each glob with the builder's current setting, and
+    /// a later change only affects globs added afterward. Setting it after the
+    /// loop would silently leave matching case-sensitive on NTFS/APFS.
+    fn build(patterns: &[String], case_insensitive: bool) -> io::Result<Self> {
         let mut builder = GitignoreBuilder::new(Path::new("/"));
+        builder.case_insensitive(case_insensitive).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("failed to configure deny matcher: {err}"),
+            )
+        })?;
         let mut needs_path_reconstruction = false;
         let mut has_dir_only_patterns = false;
         for pattern in patterns {
+            // Fail closed on a leading `#`: gitignore treats it as a comment and
+            // would silently drop the rule, so the mount would be weaker than the
+            // caller asked for. A literal leading `#` must be escaped (`\#`).
+            if pattern.starts_with('#') {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "invalid deny pattern {pattern:?}: a leading '#' is a gitignore comment; \
+                         escape a literal '#' as '\\#'"
+                    ),
+                ));
+            }
             needs_path_reconstruction |= pattern.trim_end_matches('/').contains('/');
             has_dir_only_patterns |= pattern.ends_with('/');
             builder.add_line(None, pattern).map_err(|err| {
@@ -111,11 +151,6 @@ impl DenyList {
                     format!("invalid deny pattern {pattern:?}: {err}"),
                 )
             })?;
-        }
-        // Skip the host-side case-insensitivity probe for the common empty-list
-        // case, so deny-less mounts avoid creating a probe file in the root.
-        if !patterns.is_empty() {
-            let _ = builder.case_insensitive(mount_is_case_insensitive(root, readonly));
         }
         let matcher = builder.build().map_err(|err| {
             io::Error::new(
@@ -127,12 +162,18 @@ impl DenyList {
             matcher,
             needs_path_reconstruction,
             has_dir_only_patterns,
+            empty: patterns.is_empty(),
         })
     }
 
     /// Whether any pattern needs the full mount-relative path (interior `/`).
     pub(crate) fn needs_path_reconstruction(&self) -> bool {
         self.needs_path_reconstruction
+    }
+
+    /// Whether the list has no patterns and therefore matches nothing.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.empty
     }
 
     /// Whether any pattern is directory-only (trailing `/`).
@@ -204,10 +245,6 @@ impl DenyList {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
-/// Monotonic counter used to make the case-sensitivity probe name unique within
-/// the process, so concurrent builders on the same mount root do not collide.
-static CASE_PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
-
 /// Whether the mount should match deny patterns case-insensitively.
 ///
 /// On Windows this is always `true`. NTFS supports per-directory case
@@ -249,7 +286,7 @@ fn mount_is_case_insensitive(root: &Path, readonly: bool) -> bool {
 
     let seq = CASE_PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
     let probe_name = format!("{CASE_PROBE_PREFIX}-{}-{seq}", std::process::id());
-    let validation_name = format!("{}-{}-{seq}", case_validation_prefix(), std::process::id());
+    let validation_name = format!("{}-{}-{seq}", CASE_VALIDATION_PREFIX, std::process::id());
     let probe = root.join(&probe_name);
     let validation = root.join(&validation_name);
 
@@ -320,25 +357,17 @@ fn ro_fs_is_case_sensitive(_root: &Path) -> bool {
 
 /// Join entry-name components into a relative `PathBuf`.
 ///
-/// Used to reconstruct a mount-relative path from the inode anchor chain.
+/// Used by the Unix backend to reconstruct a mount-relative path from the inode
+/// anchor chain; the Windows backend matches on `str` paths instead.
+#[cfg(unix)]
 pub(crate) fn join_path(components: &[Vec<u8>]) -> PathBuf {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        let mut path = PathBuf::new();
-        for component in components {
-            path.push(std::ffi::OsStr::from_bytes(component));
-        }
-        path
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut path = PathBuf::new();
+    for component in components {
+        path.push(std::ffi::OsStr::from_bytes(component));
     }
-    #[cfg(not(unix))]
-    {
-        let mut path = PathBuf::new();
-        for component in components {
-            path.push(String::from_utf8_lossy(component).into_owned());
-        }
-        path
-    }
+    path
 }
 
 /// Build a `Path` from raw entry-name bytes.
@@ -407,6 +436,40 @@ mod tests {
     }
 
     #[test]
+    fn case_validation_prefix_matches_probe_prefix() {
+        // The probe creates `CASE_PROBE_PREFIX...` and validates by resolving
+        // `CASE_VALIDATION_PREFIX...`; if the two ever drift, the case probe
+        // silently mis-detects and a differently-cased name could bypass a
+        // deny pattern. `CASE_VALIDATION_PREFIX` is a literal for const-ness,
+        // so pin the relationship here.
+        assert_eq!(
+            CASE_VALIDATION_PREFIX,
+            CASE_PROBE_PREFIX.to_ascii_lowercase()
+        );
+    }
+
+    #[test]
+    fn case_insensitive_matcher_folds_names() {
+        // Regression: case-insensitivity must be applied when the globs are
+        // added, so a pattern hides a differently-cased sibling. `build` takes
+        // the setting explicitly so this holds on a case-sensitive test host.
+        let patterns = vec![".env".to_string(), "node_modules/".to_string()];
+        let sensitive = DenyList::build(&patterns, false).unwrap();
+        let insensitive = DenyList::build(&patterns, true).unwrap();
+
+        assert!(!sensitive.matches_basename(b".ENV", false));
+        assert!(insensitive.matches_basename(b".ENV", false));
+        assert!(insensitive.matches_basename(b".Env", false));
+
+        assert!(!sensitive.matches_basename(b"NODE_MODULES", true));
+        assert!(insensitive.matches_basename(b"NODE_MODULES", true));
+
+        let path_patterns = vec!["sub/.env".to_string()];
+        let insensitive = DenyList::build(&path_patterns, true).unwrap();
+        assert!(insensitive.matches_path(b"sub/.ENV", false));
+    }
+
+    #[test]
     fn empty_list_denies_nothing() {
         let list = deny(&[]);
         assert!(!list.matches_basename(b"anything", false));
@@ -449,6 +512,18 @@ mod tests {
         assert!(list.matches_basename(b"a", false));
         assert!(list.matches_basename(b"z", false));
         assert!(!list.matches_basename(b"0", false));
+    }
+
+    #[test]
+    fn hash_leading_pattern_is_rejected_not_silently_dropped() {
+        // gitignore would treat `#secret` as a comment and enforce nothing; the
+        // matcher must reject it so the deny list is never weaker than asked.
+        let hash = vec!["#secret".to_string()];
+        assert!(DenyList::build(&hash, false).is_err());
+
+        // An escaped literal '#' is still a valid pattern.
+        let escaped = vec!["\\#secret".to_string()];
+        assert!(DenyList::build(&escaped, false).is_ok());
     }
 
     #[test]

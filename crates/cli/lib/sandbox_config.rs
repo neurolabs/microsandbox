@@ -252,6 +252,7 @@ struct MountObject {
     host_permissions: Option<HostPermissionsInput>,
     uid: Option<u32>,
     gid: Option<u32>,
+    deny: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1424,6 +1425,9 @@ fn materialize_mount_object(object: &MountObject) -> anyhow::Result<VolumeMount>
     if object.uid.is_some() && object.bind.is_none() && object.named.is_none() {
         anyhow::bail!("mount.uid and mount.gid are only valid for bind or named mounts");
     }
+    if !object.deny.is_empty() && object.bind.is_none() {
+        anyhow::bail!("mount.deny is only valid for a bind mount");
+    }
 
     let tmpfs_size = object
         .tmpfs
@@ -1476,6 +1480,9 @@ fn materialize_mount_object(object: &MountObject) -> anyhow::Result<VolumeMount>
     }
     if let (Some(uid), Some(gid)) = (object.uid, object.gid) {
         mount = mount.owner(uid, gid);
+    }
+    if !object.deny.is_empty() {
+        mount = mount.deny(object.deny.clone());
     }
     mount.build().map_err(Into::into)
 }
@@ -2544,7 +2551,7 @@ patches:
     #[test]
     fn yaml_string_mounts_share_the_full_bind_option_grammar() {
         let bind = materialize_mount(&MountInput::String(
-            "/host:/workspace:ro,noexec,nosuid,nodev,stat-virt=relaxed,host-perms=mirror,quota=64M,uid=1000,gid=1001"
+            "/host:/workspace:ro,noexec,nosuid,nodev,stat-virt=relaxed,host-perms=mirror,quota=64M,uid=1000,gid=1001,deny=.env"
                 .to_string(),
         ))
         .unwrap();
@@ -2557,6 +2564,7 @@ patches:
                 stat_virtualization,
                 host_permissions,
                 quota_mib,
+                deny,
                 ..
             } => {
                 assert_eq!(host, PathBuf::from("/host"));
@@ -2570,9 +2578,62 @@ patches:
                 assert_eq!(stat_virtualization, StatVirtualization::Relaxed);
                 assert_eq!(host_permissions, HostPermissions::Mirror);
                 assert_eq!(quota_mib, Some(64));
+                assert_eq!(deny, vec![".env".to_string()]);
             }
             other => panic!("expected bind mount, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn yaml_object_mounts_support_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            "deny.yaml",
+            r#"
+image: alpine
+mounts:
+  - bind: "./workspace"
+    target: "/workspace"
+    readonly: true
+    deny:
+      - .env
+      - sub/secret
+"#,
+        );
+        let patch = load_root(&path).unwrap();
+        let mounts = patch.mounts.unwrap();
+        let mount = materialize_mount(&mounts[0]).unwrap();
+        match mount {
+            VolumeMount::Bind { deny, .. } => {
+                assert_eq!(deny, vec![".env".to_string(), "sub/secret".to_string()]);
+            }
+            other => panic!("expected bind mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn yaml_object_mounts_reject_deny_on_non_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            "deny-named.yaml",
+            r#"
+image: alpine
+mounts:
+  - named: cache
+    target: "/cache"
+    deny:
+      - .env
+"#,
+        );
+        let patch = load_root(&path).unwrap();
+        let mounts = patch.mounts.unwrap();
+        let err = materialize_mount(&mounts[0]).unwrap_err().to_string();
+        assert!(
+            err.contains("only valid for a bind mount"),
+            "expected non-bind deny rejection, got: {err}"
+        );
     }
 
     #[test]

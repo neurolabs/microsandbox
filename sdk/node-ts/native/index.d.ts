@@ -481,6 +481,8 @@ export declare class MountBuilder {
    *
    * Matching entries are invisible (ENOENT) and writes to them are forbidden
    * (EACCES). Patterns are relative to the mount root. Valid only for bind mounts.
+   * A path pattern (`sub/secret`) requires a read-only mount, since a writable
+   * guest could rename an ancestor directory to bypass it.
    */
   deny(patterns: Array<string>): this
   /**

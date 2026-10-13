@@ -217,21 +217,21 @@ fn warm_tree(root: &Path) {
 /// Per-scenario benchmark result: median scenario latencies plus per-round
 /// ratios/deltas against a baseline measured on the same fs in the same round.
 struct Measured {
-    /// Scenario pass lookup latency per op.
+    /// Scenario pass lookup time for one `REPETITIONS`-op burst (not per op).
     pass_lookup: Duration,
     /// Median per-round ratio of scenario pass lookup to baseline pass lookup.
     pass_lookup_x: f64,
-    /// Scenario denied lookup latency per op (ZERO if the scenario has none).
+    /// Scenario denied lookup time for one burst (ZERO if the scenario has none).
     deny_lookup: Duration,
     /// Median per-round ratio of denied lookup to baseline pass lookup.
     deny_lookup_x: f64,
-    /// Scenario pass-heavy readdir latency per op.
+    /// Scenario pass-heavy readdir time for one burst.
     readdir: Duration,
     /// Median per-round ratio of scenario readdir to baseline readdir.
     readdir_x: f64,
     /// Median per-round extra ns per entry vs baseline readdir.
     readdir_ns_per_entry: f64,
-    /// Scenario deny-heavy readdir latency per op (ZERO if none).
+    /// Scenario deny-heavy readdir time for one burst (ZERO if none).
     deny_readdir: Duration,
     /// Median per-round ratio of deny-heavy readdir to baseline readdir.
     deny_readdir_x: f64,
@@ -444,11 +444,11 @@ fn measure(root: &Path, scenario: &Scenario) -> Measured {
     deny_readdir_deltas.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let mid = ROUNDS / 2;
 
-    let deny_lookup = deny_lookups.first().copied().unwrap_or(Duration::ZERO);
-    let deny_lookup_x = deny_lookup_xs.first().copied().unwrap_or(0.0);
-    let deny_readdir = deny_readdirs.first().copied().unwrap_or(Duration::ZERO);
-    let deny_readdir_x = deny_readdir_xs.first().copied().unwrap_or(0.0);
-    let deny_ns_per_entry = deny_readdir_deltas.first().copied().unwrap_or(0.0) * 1e9;
+    let deny_lookup = deny_lookups.get(mid).copied().unwrap_or(Duration::ZERO);
+    let deny_lookup_x = deny_lookup_xs.get(mid).copied().unwrap_or(0.0);
+    let deny_readdir = deny_readdirs.get(mid).copied().unwrap_or(Duration::ZERO);
+    let deny_readdir_x = deny_readdir_xs.get(mid).copied().unwrap_or(0.0);
+    let deny_ns_per_entry = deny_readdir_deltas.get(mid).copied().unwrap_or(0.0) * 1e9;
 
     Measured {
         pass_lookup: pass_lookups[mid],
@@ -508,9 +508,6 @@ fn print_table(scenarios: &[Scenario], rows: &[Measured]) {
     println!();
 }
 
-/// Print one compact line summarizing a single run of every scenario, so `N`
-/// runs read as `N` scannable rows. Reports the `x` ratios and `ns/entry`
-/// deltas (the machine-state-independent figures) per scenario.
 /// Print the reviewer-facing headline matrix: one row per deny-pattern kind,
 /// one column per operation, showing the median `x` ratio (relative to the
 /// deny-free baseline) across runs with the run-to-run spread as a percentage

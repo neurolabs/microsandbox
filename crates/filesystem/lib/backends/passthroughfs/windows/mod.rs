@@ -855,7 +855,7 @@ fn linux_error(errno: i32) -> io::Error {
 /// Combines the volume serial number and the volume-unique file index. Returns
 /// `None` when the filesystem does not report a file index (so callers can skip
 /// identity-based race checks rather than fail).
-fn file_identity(metadata: &std::fs::Metadata) -> Option<(u32, u64)> {
+fn metadata_identity(metadata: &std::fs::Metadata) -> Option<(u32, u64)> {
     match (metadata.volume_serial_number(), metadata.file_index()) {
         (Some(volume), Some(index)) => Some((volume, index)),
         _ => None,

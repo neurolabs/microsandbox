@@ -156,14 +156,17 @@ pub struct SandboxOpts {
     pub guest_clock: Option<GuestClockPolicy>,
 
     /// Mount a host path or named volume into the sandbox (`SOURCE:DEST[:OPTIONS]`).
-    /// OPTIONS may include paired `uid=<N>,gid=<N>` for directory-backed mounts.
+    /// OPTIONS may include `quota=<size>`, paired `uid=<N>,gid=<N>`, and repeatable
+    /// `deny=<pattern>` for directory bind mounts.
     #[arg(short, long)]
     pub volume: Vec<String>,
 
     /// Explicitly mount a host directory into the sandbox (`SOURCE:DEST[:OPTIONS]`).
     ///
-    /// OPTIONS may include `quota=<size>` and `uid=<N>,gid=<N>` to present
-    /// host-created files as that guest owner; both IDs are required together.
+    /// OPTIONS may include `quota=<size>`, `uid=<N>,gid=<N>` to present
+    /// host-created files as that guest owner (both `uid` and `gid` are required
+    /// together), and repeatable `deny=<pattern>` gitignore-style patterns to hide
+    /// matching host entries from the guest.
     #[arg(long = "mount-dir", value_name = "SOURCE:DEST[:OPTIONS]")]
     pub mount_dir: Vec<String>,
 
@@ -1942,6 +1945,7 @@ fn parse_volume_mount_spec(spec: &str) -> anyhow::Result<ParsedCliMountSpec<'_>>
             policies: true,
             quota: true,
             owner: true,
+            deny: true,
             ..CliMountOptionSupport::default()
         },
     )
@@ -4681,7 +4685,7 @@ mod tests {
     async fn test_apply_explicit_dir_mount_deny_repeatable_preserves_inner_equals() {
         let dir = make_temp_dir("msb-mount-dir-deny-rep");
         let spec = format!(
-            "{}:/work:deny=.env,deny=*.log,deny=sub/secret=file",
+            "{}:/work:ro,deny=.env,deny=*.log,deny=sub/secret=file",
             dir.display()
         );
         let mount = build_explicit(&spec, apply_explicit_dir_mount).await;
@@ -4707,6 +4711,19 @@ mod tests {
         let mount = build_explicit(&spec, apply_explicit_dir_mount).await;
         match mount {
             VolumeMount::Bind { deny, .. } => assert!(deny.is_empty()),
+            other => panic!("expected Bind, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_volume_deny_bind_supported() {
+        let dir = make_temp_dir("msb-volume-deny");
+        let spec = format!("{}:/work:deny=.env,deny=*.log", dir.display());
+        let mount = build_explicit(&spec, apply_volume).await;
+        match mount {
+            VolumeMount::Bind { deny, .. } => {
+                assert_eq!(deny, vec![".env".to_string(), "*.log".to_string()]);
+            }
             other => panic!("expected Bind, got {other:?}"),
         }
     }

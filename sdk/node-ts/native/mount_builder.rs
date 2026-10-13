@@ -308,6 +308,8 @@ impl JsMountBuilder {
     ///
     /// Matching entries are invisible (ENOENT) and writes to them are forbidden
     /// (EACCES). Patterns are relative to the mount root. Valid only for bind mounts.
+    /// A path pattern (`sub/secret`) requires a read-only mount, since a writable
+    /// guest could rename an ancestor directory to bypass it.
     #[napi]
     pub fn deny(&mut self, patterns: Vec<String>) -> &Self {
         let prev = self.take_inner();

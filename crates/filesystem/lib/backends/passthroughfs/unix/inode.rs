@@ -206,7 +206,7 @@ fn open_macos_inode_reopen(path: *const libc::c_char, flags: i32) -> io::Result<
 
 /// Build a `/.vol/<dev>/<ino>` identity path as a `CString` (macOS only).
 #[cfg(target_os = "macos")]
-pub(crate) use crate::backends::shared::platform::vol_path;
+use crate::backends::shared::platform::vol_path;
 
 /// Look up a child name in a parent directory and return an [`Entry`].
 ///

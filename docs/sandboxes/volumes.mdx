@@ -469,8 +469,6 @@ Mounts use normal Linux behavior by default: writable, executable, suid-enabled,
 - `nodev` when device files should be ignored.
 - `deny=<pattern>` when some host paths should be hidden.
 
-For stronger in-guest hardening, create the sandbox with the restricted security profile. Restricted sandboxes set `no_new_privs`, drop mount-admin capability from user commands, and force `nosuid,nodev` on user mounts. This profile is incompatible with workloads such as `sudo` and Docker-in-Docker.
-
 ### `noexec`
 
 `noexec` does not stop interpreters from reading scripts from the mount, for example `sh /app/src/script.sh`.
@@ -483,9 +481,9 @@ Matching follows the host filesystem's case behavior. Windows/NTFS is always mat
 
 **Path patterns require a read-only mount.** A path pattern like `sub/.env` is matched against each entry's mount-relative path at lookup time, so a guest with a writable mount could `rename` an ancestor directory (for example `mv sub x`) and make the denied path stop matching. To keep the guarantee, `deny` rejects path patterns on a writable mount: use a **name-only pattern** (`.env`, `*.log`) to hide a name anywhere, or make the mount read-only to use path patterns.
 
-On the CLI, patterns are transported as part of the `SOURCE:DEST[:OPTIONS]` mount string, so a pattern must not contain the mount-spec delimiter characters `,` or `:` (nor newline or NUL). Patterns must also not begin or end with whitespace: option tokens are trimmed, so a value like `" !secret"` would otherwise be silently reinterpreted as the allow rule `!secret`. This means a file whose name contains `,` or `:` cannot be hidden by a `deny` pattern. `deny` applies to directory binds only: a single-file bind (for example `--mount-file`) exposes exactly one file and has no namespace to filter, so a deny list on it is rejected rather than silently ignored.
+On the CLI, patterns are transported as part of the `SOURCE:DEST[:OPTIONS]` mount string, where commas separate options and `: ` splits the option block from the host path. A pattern therefore cannot contain `,` or `:` (nor a newline or NUL), and must not begin with `#` (gitignore treats a leading `#` as a comment, which would silently hide nothing; escape a literal leading `#` as `\#`) or begin or end with whitespace (option tokens are trimmed, so a value like `" !secret"` would otherwise be silently reinterpreted as the allow rule `!secret`). Because a comma is the option separator, a file whose name contains `,` or `:` cannot be hidden by a `deny` pattern. The SDK builders reject these patterns up front; at the CLI a `,` is consumed as an option separator. `deny` applies to directory binds only: a single-file bind (for example `--mount-file`) exposes exactly one file and has no namespace to filter, so a deny list on it is rejected rather than silently ignored.
 
-Matching is by **path, not by inode**. A host-created hard link to a denied file under a non-denied name is served, because only the name being looked up is checked. Likewise a symlink's **target is not re-checked**: a symlink named `link` pointing at a denied relative path (for example `.env`) resolves and is served, because the deny list sees the symlink's own name, not its target. These are inherent to name-based deny lists; use name-only patterns and `ro` mounts when you need defense against host-created hard links or guest-created symlinks.
+Matching is by **path, not by inode**. A host-created hard link to a denied file under a non-denied name is served, because only the name being looked up is checked. Symlinks behave differently from hard links: the link entry itself is served when its own name is not denied, but following it issues a fresh lookup of the target name, which deny rejects, so a symlink cannot expose a denied target's contents. The hard-link case is inherent to name-based deny lists; use name-only patterns and `ro` mounts when you need defense against host-created hard links.
 
 A **concurrent host writer** (another process, or a second mount on the same host directory) can also race a rename: replacing the source or, for an atomic exchange, the destination between the deny check and the move could let a directory land at a directory-only-denied name. Directory-only checks re-read the source's type and, for an exchange, pin both endpoints (including a destination that was absent when it was assessed) and retry on mismatch, but no kernel offers a rename-conditional-on-inode operation, so a sub-millisecond window remains. On Windows, directory inodes are path-backed and `opendir` and every child operation re-apply the directory-only rule to the live path, so a host writer replacing an allowed file with a directory at a directory-only-denied name cannot expose or modify its contents after lookup (only the name's type remains observable through metadata). Both are the same name-based limitation as the cases above; a read-only mount is the robust answer.
 
@@ -499,6 +497,8 @@ A **concurrent host writer** (another process, or a second mount on the same hos
 
 In practice the overhead matters most for `readdir`-heavy and lookup-heavy workloads on very large directories with a long path-pattern list. Name-only patterns keep the deny fast path.
 
+For stronger in-guest hardening, create the sandbox with the restricted security profile. Restricted sandboxes set `no_new_privs`, drop mount-admin capability from user commands, and force `nosuid,nodev` on user mounts. This profile is incompatible with workloads such as `sudo` and Docker-in-Docker.
+
 ### Fallback guest ownership
 
 Bind mounts and directory-backed named volumes normally present host files without a per-file metadata override using the sandbox user's fallback identity. Set a mount owner when those files should consistently appear as another guest `(uid, gid)` pair. This changes only the guest view: it does not `chown` the host files or create per-file metadata overrides, and an existing per-file override still takes precedence.
@@ -511,6 +511,7 @@ Most CLI mount flags use `SOURCE:DEST[:OPTIONS]`; `--mount-owned` only needs `DE
 
 | Flag | Source | Options |
 |------|--------|---------|
+| `-v`, `--volume` | Host directory, host file, or named volume | `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `stat-virt=strict\|relaxed\|off`, `host-perms=private\|mirror`, `quota=<size>`, paired `uid=<N>,gid=<N>`, `deny=<pattern>` (repeatable, directory binds only) |
 | `--mount-dir` | Host directory | `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `stat-virt=strict\|relaxed\|off`, `host-perms=private\|mirror`, `quota=<size>`, paired `uid=<N>,gid=<N>`, `deny=<pattern>` (repeatable) |
 | `--mount-file` | Host file | `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `stat-virt=strict\|relaxed\|off`, `host-perms=private\|mirror`, `quota=<size>`, paired `uid=<N>,gid=<N>` |
 | `--mount-named` | Named volume | `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `kind=dir\|disk`, `size=<size>` for `kind=disk`, `quota=<size>` for directory volumes; directory-backed named volumes also support `stat-virt=strict\|relaxed\|off`, `host-perms=private\|mirror`, paired `uid=<N>,gid=<N>` |

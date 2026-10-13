@@ -93,6 +93,86 @@ pub fn hostname_from_sandbox_name(name: &str) -> String {
     format!("{}-{}", &name[..end], suffix)
 }
 
+/// Validate a single bind-mount `deny` pattern for the mount wire format.
+///
+/// Patterns are rendered as `deny=<pattern>` inside a comma-joined option block
+/// that is colon-split from the host path, so a `,`, `:`, newline, or NUL would
+/// fail the parse or silently attenuate other mount options. Leading or
+/// trailing whitespace is rejected because option tokens are trimmed, which
+/// would reinterpret a value like `" !secret"` as the allow rule `!secret`.
+///
+/// Shared by the Rust SDK, the Go native binding, and the runtime so a pattern
+/// accepted by one layer is accepted by all of them.
+pub fn validate_deny_pattern(pattern: &str) -> TypesResult<()> {
+    if pattern.is_empty() {
+        return Err(TypesError::invalid_config("deny pattern must not be empty"));
+    }
+
+    // gitignore treats a leading `#` as a comment, so the rule would be silently
+    // dropped and enforce nothing. A literal leading `#` must be escaped (`\#`).
+    if pattern.starts_with('#') {
+        return Err(TypesError::invalid_config(format!(
+            "deny pattern must not start with '#' (gitignore treats it as a comment; \
+             escape a literal '#' as '\\#'): {pattern:?}"
+        )));
+    }
+
+    if pattern.contains(',')
+        || pattern.contains(':')
+        || pattern.contains('\n')
+        || pattern.contains('\0')
+    {
+        return Err(TypesError::invalid_config(format!(
+            "deny pattern must not contain ',', ':', newline, or NUL: {pattern:?}"
+        )));
+    }
+
+    if pattern.trim() != pattern {
+        return Err(TypesError::invalid_config(format!(
+            "deny pattern must not have leading or trailing whitespace: {pattern:?}"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Reject path deny patterns (`sub/.env`, `**/env.secret`) on a writable mount.
+///
+/// A path pattern is matched against the entry's reconstructed mount-relative
+/// path, so a guest with a writable mount can rename an ancestor directory and
+/// make the denied path stop matching. Name-only (`.env`) and directory-only
+/// (`node_modules/`) patterns match anywhere and stay valid, and a read-only
+/// mount cannot rename, so path patterns remain valid there.
+pub fn reject_writable_path_patterns(patterns: &[String]) -> TypesResult<()> {
+    if let Some(pattern) = patterns
+        .iter()
+        .find(|pattern| pattern.trim_end_matches('/').contains('/'))
+    {
+        return Err(TypesError::invalid_config(format!(
+            "deny pattern {pattern:?} is a path pattern, which a writable mount can bypass by \
+             renaming an ancestor directory; use a name-only pattern, or mark the mount read-only"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Validate a bind-mount `deny` list.
+///
+/// Every pattern must be wire-safe, and a writable mount (`readonly` false) must
+/// not carry a path pattern. An empty list is always valid.
+pub fn validate_deny_list(patterns: &[String], readonly: bool) -> TypesResult<()> {
+    for pattern in patterns {
+        validate_deny_pattern(pattern)?;
+    }
+
+    if !readonly {
+        reject_writable_path_patterns(patterns)?;
+    }
+
+    Ok(())
+}
+
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
@@ -242,5 +322,58 @@ mod tests {
                 .to_string(),
             "invalid config: hostname is too long: 65 bytes (max 64)"
         );
+    }
+
+    #[test]
+    fn deny_pattern_rejects_wire_and_whitespace_hazards() {
+        assert_eq!(
+            validate_deny_pattern("").unwrap_err().to_string(),
+            "invalid config: deny pattern must not be empty"
+        );
+        for bad in ["a,b", "a:b", "a\nb", "a\0b"] {
+            assert!(
+                validate_deny_pattern(bad)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("must not contain"),
+                "{bad:?}"
+            );
+        }
+        for bad in [" .env", ".env ", "\tsecret"] {
+            assert!(
+                validate_deny_pattern(bad)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("leading or trailing whitespace"),
+                "{bad:?}"
+            );
+        }
+        validate_deny_pattern(".env").unwrap();
+        validate_deny_pattern("sub/secret").unwrap();
+    }
+
+    #[test]
+    fn deny_pattern_rejects_gitignore_comment_prefix() {
+        // A leading `#` is a gitignore comment, so such a rule would be accepted
+        // and then enforce nothing — a silent security no-op.
+        let err = validate_deny_pattern("#secret").unwrap_err().to_string();
+        assert!(err.contains("must not start with '#'"), "{err}");
+
+        // Escaping stays available for a literal leading `#`.
+        validate_deny_pattern("\\#secret").unwrap();
+
+        // `!` is still valid: it drives allowlist negation alongside a `*` rule.
+        validate_deny_pattern("!keep.txt").unwrap();
+    }
+
+    #[test]
+    fn deny_list_rejects_path_pattern_on_writable_mount_only() {
+        let path_pattern = vec!["sub/.env".to_string()];
+        assert!(validate_deny_list(&path_pattern, false).is_err());
+        validate_deny_list(&path_pattern, true).unwrap();
+
+        let name_only = vec![".env".to_string(), "node_modules/".to_string()];
+        validate_deny_list(&name_only, false).unwrap();
+        validate_deny_list(&[], false).unwrap();
     }
 }

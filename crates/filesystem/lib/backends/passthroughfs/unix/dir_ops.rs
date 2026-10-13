@@ -57,7 +57,14 @@ pub(crate) fn do_readdir(
     offset: u64,
 ) -> io::Result<Vec<DirEntry<'static>>> {
     let handles = fs.dir_handles.read().unwrap();
-    let data = handles.get(&handle).ok_or_else(platform::ebadf)?;
+    // The handle must belong to the requested directory: a mismatched nodeid
+    // would otherwise reconstruct deny paths (and `init.krun` injection) from the
+    // wrong inode while still reading this handle's fd. Mirrors the Windows
+    // backend, which rejects the same mismatch with EBADF.
+    let data = handles
+        .get(&handle)
+        .filter(|data| data.inode == inode)
+        .ok_or_else(platform::ebadf)?;
 
     let mut snapshot_lock = data.snapshot.lock().unwrap();
     if snapshot_lock.is_none() {
@@ -85,7 +92,14 @@ pub(crate) fn do_readdir_for_each(
     add_entry: &mut AddDirEntry<'_>,
 ) -> io::Result<()> {
     let handles = fs.dir_handles.read().unwrap();
-    let data = handles.get(&handle).ok_or_else(platform::ebadf)?;
+    // The handle must belong to the requested directory: a mismatched nodeid
+    // would otherwise reconstruct deny paths (and `init.krun` injection) from the
+    // wrong inode while still reading this handle's fd. Mirrors the Windows
+    // backend, which rejects the same mismatch with EBADF.
+    let data = handles
+        .get(&handle)
+        .filter(|data| data.inode == inode)
+        .ok_or_else(platform::ebadf)?;
 
     let mut snapshot_lock = data.snapshot.lock().unwrap();
     if snapshot_lock.is_none() {
@@ -153,7 +167,14 @@ pub(crate) fn do_readdirplus_for_each(
     add_entry: &mut AddDirEntryPlus<'_>,
 ) -> io::Result<()> {
     let handles = fs.dir_handles.read().unwrap();
-    let data = handles.get(&handle).ok_or_else(platform::ebadf)?;
+    // The handle must belong to the requested directory: a mismatched nodeid
+    // would otherwise reconstruct deny paths (and `init.krun` injection) from the
+    // wrong inode while still reading this handle's fd. Mirrors the Windows
+    // backend, which rejects the same mismatch with EBADF.
+    let data = handles
+        .get(&handle)
+        .filter(|data| data.inode == inode)
+        .ok_or_else(platform::ebadf)?;
 
     let mut snapshot_lock = data.snapshot.lock().unwrap();
     if snapshot_lock.is_none() {

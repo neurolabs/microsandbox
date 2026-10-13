@@ -2139,6 +2139,7 @@ fn build_vm(
         };
         let parsed = parse_mount_spec(&file_mount.mount)
             .map_err(|e| RuntimeError::Custom(format!("file mount {:?}: {e}", file_mount.mount)))?;
+        reject_file_mount_deny(&file_mount.mount, &parsed.deny)?;
         let tag = parsed.tag;
         let host_path = PathBuf::from(&parsed.host_path);
         let override_owner = match (parsed.override_uid, parsed.override_gid) {
@@ -3610,7 +3611,8 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
                             })?);
                         }
                         "deny" => {
-                            validate_deny_pattern(value)?;
+                            microsandbox_types::validate_deny_pattern(value)
+                                .map_err(|err| err.to_string())?;
                             deny.push(value.to_string())
                         }
                         other => return Err(format!("unknown mount option {other:?}")),
@@ -3636,15 +3638,8 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
     // mount-relative path, so a writable guest can rename an ancestor directory
     // to launder them. Reject them here; name-only and directory-only patterns
     // stay valid, and a read-only mount cannot rename.
-    if !readonly
-        && let Some(pattern) = deny
-            .iter()
-            .find(|pattern| pattern.trim_end_matches('/').contains('/'))
-    {
-        return Err(format!(
-            "deny pattern {pattern:?} is a path pattern, which a writable mount can bypass by \
-             renaming an ancestor directory; use a name-only pattern, or mark the mount `ro`"
-        ));
+    if !readonly {
+        microsandbox_types::reject_writable_path_patterns(&deny).map_err(|err| err.to_string())?;
     }
 
     Ok(ParsedMountSpec {
@@ -3661,33 +3656,19 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
     })
 }
 
-/// Reject deny patterns that would corrupt the mount wire format.
+/// Reject a deny list on a host file-mount spec.
 ///
-/// The option block is comma-joined and the spec is colon-split, so a `,` or
-/// `:` in a pattern would either fail the whole spawn or — worse — silently
-/// attenuate other mount protections. A newline/NUL would corrupt gitignore
-/// parsing. Leading or trailing whitespace is rejected too: option tokens are
-/// trimmed, so a value like `" !secret"` would otherwise be silently
-/// reinterpreted as the allow rule `!secret`. Validate here so the runtime
-/// never accepts an injectable pattern.
-///
-/// Keep this in sync with the identical validators in
-/// `sdk/rust/lib/sandbox/types.rs` and `sdk/go/native/src/lib.rs`.
-fn validate_deny_pattern(value: &str) -> Result<(), String> {
-    if value.is_empty() {
-        return Err("empty deny pattern".to_string());
+/// A file host-mount exposes exactly one entry through `SingleFileFs`, which has
+/// no namespace to filter, so a deny list can never be enforced. Refuse it
+/// rather than start the sandbox with weaker protection than the caller asked
+/// for.
+fn reject_file_mount_deny(mount_spec: &str, deny: &[String]) -> Result<(), RuntimeError> {
+    if deny.is_empty() {
+        return Ok(());
     }
-    if value.contains(',') || value.contains(':') || value.contains('\n') || value.contains('\0') {
-        return Err(format!(
-            "deny pattern must not contain ',', ':', newline, or NUL: {value:?}"
-        ));
-    }
-    if value.trim() != value {
-        return Err(format!(
-            "deny pattern must not have leading or trailing whitespace: {value:?}"
-        ));
-    }
-    Ok(())
+    Err(RuntimeError::Custom(format!(
+        "file mount {mount_spec:?}: deny patterns are not supported for a host file mount"
+    )))
 }
 
 /// Split `host_path[:opts]`, skipping the drive colon in Windows paths.
@@ -3801,8 +3782,8 @@ mod tests {
         HostPermissions, StatVirtualization, agent_kernel_cmdline, agent_primary_queue_size,
         append_block_root_env, bind_rootfs_backend, encode_bootstrap_frame,
         guest_shutdown_flush_timeout, guest_shutdown_flush_timeout_with_override, parse_mount_spec,
-        prepend_scripts_path, request_guest_shutdown, request_guest_shutdown_with_timeout,
-        thp_kernel_cmdline, validate_disk_format,
+        prepend_scripts_path, reject_file_mount_deny, request_guest_shutdown,
+        request_guest_shutdown_with_timeout, thp_kernel_cmdline, validate_disk_format,
     };
     #[cfg(unix)]
     use super::{
@@ -4301,6 +4282,22 @@ mod tests {
     }
 
     #[test]
+    fn test_file_mount_deny_is_rejected() {
+        // A file host-mount has no namespace to filter, so a requested deny list
+        // must be refused rather than silently dropped.
+        let parsed = parse_mount_spec("foo:/host/data:deny=.env").unwrap();
+        let err = reject_file_mount_deny("foo:/host/data:deny=.env", &parsed.deny).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("deny patterns are not supported for a host file mount"),
+            "got: {err}"
+        );
+
+        // No deny list is accepted.
+        reject_file_mount_deny("foo:/host/data", &[]).unwrap();
+    }
+
+    #[test]
     fn test_parse_mount_spec_deny_value_with_equals() {
         let p = parse_mount_spec("foo:/host/data:deny=a=b").unwrap();
         assert_eq!(p.deny, vec!["a=b".to_string()]);
@@ -4327,7 +4324,7 @@ mod tests {
     fn test_parse_mount_spec_rejects_empty_deny() {
         let err = parse_mount_spec("foo:/host/data:deny=").unwrap_err();
         assert!(
-            err.contains("empty deny pattern"),
+            err.contains("must not be empty"),
             "expected empty-pattern rejection, got: {err}"
         );
     }

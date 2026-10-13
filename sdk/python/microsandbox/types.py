@@ -701,6 +701,8 @@ class MountConfig:
     override_gid: int | None = None
     #: Host-side deny-list of gitignore-style patterns (directory binds only;
     #: a host file bind rejects them because it has no namespace to filter).
+    #: A path pattern (``sub/secret``) requires a read-only mount, since a
+    #: writable guest could rename an ancestor directory to bypass it.
     deny: list[str] | None = None
     #: Backing kind for storage allocated and removed with the sandbox.
     owned_kind: VolumeKind | None = None

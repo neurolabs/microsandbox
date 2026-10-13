@@ -153,10 +153,13 @@ impl DynFileSystem for PassthroughFs {
         // Validate the name before the deny check so a non-UTF-8 (invalid)
         // name fails with EINVAL rather than EACCES, matching lookup.
         let path = self.child_path(parent, name)?;
-        if self.deny_matches_name(parent, name, false) {
+        // Stat before the deny check so a dir-only pattern can match a directory;
+        // otherwise the check (is_dir=false) misses it and the EISDIR below
+        // reveals that a hidden name exists and is a directory.
+        let metadata = self.safe_metadata(&path)?;
+        if self.deny_matches_name(parent, name, metadata.file_type().is_dir()) {
             return Err(linux_error(LINUX_EACCES));
         }
-        let metadata = self.safe_metadata(&path)?;
         if metadata.file_type().is_dir() {
             return Err(linux_error(LINUX_EISDIR));
         }
@@ -278,12 +281,12 @@ impl DynFileSystem for PassthroughFs {
             // rename-conditional-on-inode operation exists and the same window
             // cannot be closed at all (upstream virtiofsd accepts the same race).
             let after_meta = self.safe_metadata(&old_path)?;
-            let after_identity = file_identity(&after_meta);
+            let after_identity = metadata_identity(&after_meta);
             let after_is_dir = after_meta.file_type().is_dir();
             let dir_denied = !source_is_dir
                 && self.deny.has_dir_only_patterns()
                 && self.deny_matches_name(newdir, newname, true);
-            match (file_identity(&source_meta), after_identity) {
+            match (metadata_identity(&source_meta), after_identity) {
                 (Some(before), Some(after)) if before != after => continue,
                 (None, _) | (_, None) if dir_denied && after_is_dir => {
                     return Err(linux_error(LINUX_EBUSY));

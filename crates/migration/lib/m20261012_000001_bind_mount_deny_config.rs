@@ -74,9 +74,11 @@ fn reject_persisted_deny(name: &str, column: &str, raw: &str) -> Result<(), DbEr
     })?;
 
     // Read raw JSON so a later policy cannot be dropped by deserialization. Only
-    // an absent, null, or empty deny list is safe to discard.
+    // an absent, null, or empty deny list is safe to discard. `SandboxConfig`
+    // flattens `SandboxSpec`, so mounts live at the top level (`/mounts`), not
+    // under `/spec`; see the guest-clock migration for the same shape.
     let has_deny = value
-        .pointer("/spec/mounts")
+        .pointer("/mounts")
         .and_then(serde_json::Value::as_array)
         .is_some_and(|mounts| {
             mounts.iter().any(|mount| {
@@ -101,6 +103,9 @@ fn reject_persisted_deny(name: &str, column: &str, raw: &str) -> Result<(), DbEr
 
 #[cfg(test)]
 mod tests {
+    use microsandbox_types::{
+        HostPermissions, MountOptions, SandboxSpec, StatVirtualization, VolumeMount,
+    };
     use sea_orm_migration::sea_orm::{
         ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, Statement,
     };
@@ -143,9 +148,81 @@ mod tests {
         )
     }
 
-    fn with_deny() -> String {
-        r#"{"spec":{"mounts":[{"type":"Bind","host":"/host/data","guest":"/data","deny":["sub/.env"]}]}}"#
-            .to_string()
+    /// A durable sandbox config carrying one bind mount with the given deny list.
+    ///
+    /// Built from the shared `SandboxSpec`, whose fields `SandboxConfig` flattens
+    /// into the persisted JSON — so this is the exact production shape, with
+    /// `mounts` at the top level.
+    fn config(deny: Vec<String>) -> String {
+        let mut spec = SandboxSpec::default();
+        spec.mounts.push(VolumeMount::Bind {
+            host: "/host/data".into(),
+            guest: "/data".into(),
+            options: MountOptions::default(),
+            stat_virtualization: StatVirtualization::Strict,
+            host_permissions: HostPermissions::Private,
+            follow_root_symlinks: false,
+            quota_mib: None,
+            deny,
+        });
+        serde_json::to_string(&spec).unwrap()
+    }
+
+    /// A durable sandbox config with no mounts at all.
+    fn config_without_mounts() -> String {
+        serde_json::to_string(&SandboxSpec::default()).unwrap()
+    }
+
+    /// Pin the assumption the guard depends on: persisted configs flatten the
+    /// spec, so `mounts` (and `deny` within them) live at the top level, not
+    /// under `spec`. A regression here would make the downgrade guard dead code.
+    #[test]
+    fn persisted_config_places_mounts_at_top_level() {
+        let value: serde_json::Value = serde_json::from_str(&config(vec![".env".into()])).unwrap();
+        assert!(
+            value.get("spec").is_none(),
+            "SandboxConfig flattens SandboxSpec"
+        );
+        assert_eq!(value["mounts"][0]["deny"][0], ".env");
+    }
+
+    /// Proof that the pre-fix pointer `/spec/mounts` never detected a real deny
+    /// list, while `/mounts` does. Runs the exact predicate from
+    /// [`reject_persisted_deny`] against the production-shaped JSON.
+    #[test]
+    fn old_spec_pointer_was_dead_for_production_shape() {
+        let raw = config(vec!["sub/.env".into()]);
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        let deny_under = |pointer: &str| {
+            value
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|mounts| {
+                    mounts.iter().any(|mount| {
+                        mount
+                            .get("deny")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|deny| !deny.is_empty())
+                    })
+                })
+        };
+
+        eprintln!(
+            "production config shape:\n{}",
+            serde_json::to_string_pretty(&value).unwrap()
+        );
+        eprintln!("/spec/mounts detects deny = {}", deny_under("/spec/mounts"));
+        eprintln!("/mounts detects deny      = {}", deny_under("/mounts"));
+
+        assert!(
+            !deny_under("/spec/mounts"),
+            "the old pointer must be proven dead on real data"
+        );
+        assert!(
+            deny_under("/mounts"),
+            "the new pointer must detect the deny list"
+        );
     }
 
     /// Number of applied migrations from the newest down to (and including) this
@@ -161,15 +238,15 @@ mod tests {
 
     #[tokio::test]
     async fn downgrade_refuses_deny_in_desired_or_active_config() {
-        let empty = r#"{"spec":{"mounts":[{"type":"Bind","host":"/host/data","guest":"/data","deny":[]}]}}"#;
+        let deny = config(vec!["sub/.env".to_string()]);
+        let empty = config(Vec::new());
         for column in ["config", "active_config"] {
-            let deny = with_deny();
-            let (config, active) = if column == "config" {
-                (deny.as_str(), empty)
+            let (desired, active) = if column == "config" {
+                (deny.as_str(), empty.as_str())
             } else {
-                (empty, deny.as_str())
+                (empty.as_str(), deny.as_str())
             };
-            let db = database(config, Some(active)).await;
+            let db = database(desired, Some(active)).await;
             let before = saved_state(&db).await;
 
             let error = Migration.down(&SchemaManager::new(&db)).await.unwrap_err();
@@ -188,11 +265,10 @@ mod tests {
     #[tokio::test]
     async fn downgrade_and_reupgrade_preserve_deny_free_configs() {
         for raw in [
-            r#"{"spec":{"mounts":[]}}"#.to_string(),
-            r#"{"spec":{"mounts":[{"type":"Bind","host":"/host/data","guest":"/data","deny":[]}]}}"#
-                .to_string(),
-            r#"{"spec":{"mounts":[{"type":"Bind","host":"/host/data","guest":"/data"}]}}"#
-                .to_string(),
+            config_without_mounts(),
+            config(Vec::new()),
+            // A config whose serialized form predates `mounts` entirely.
+            r#"{"name":"legacy"}"#.to_string(),
         ] {
             for active in [None, Some(raw.as_str())] {
                 let db = database(&raw, active).await;

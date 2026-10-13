@@ -503,6 +503,8 @@ impl MountBuilder {
     /// (EACCES). Patterns are relative to the mount root and may be component
     /// names (`.env`, `*.log`) or paths (`sub/secret`). Valid only for directory
     /// bind mounts; a host file bind has no namespace to filter and rejects them.
+    /// A path pattern requires a read-only mount, since a writable guest could
+    /// rename an ancestor directory to bypass it.
     pub fn deny(mut self, patterns: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.deny.extend(patterns.into_iter().map(Into::into));
         self
@@ -598,12 +600,8 @@ impl MountBuilder {
                 ".deny() is only valid for bind mounts".into(),
             ));
         }
-        for pattern in &self.deny {
-            validate_deny_pattern(pattern)?;
-        }
-        if !self.options.readonly {
-            reject_writable_path_patterns(&self.deny)?;
-        }
+        microsandbox_types::validate_deny_list(&self.deny, self.options.readonly)
+            .map_err(|err| crate::MicrosandboxError::InvalidConfig(err.to_string()))?;
         if self.disk_format.is_some() && !is_disk {
             return Err(crate::MicrosandboxError::InvalidConfig(
                 ".format() is only valid for disk image mounts".into(),
@@ -1349,12 +1347,8 @@ fn validate_volume_mount(mount: &VolumeMount) -> crate::MicrosandboxResult<()> {
         } => {
             validate_host_path_wire_safe(host, "bind host path")?;
             validate_virtiofs_policies(*stat_virtualization, *host_permissions, options)?;
-            for pattern in deny {
-                validate_deny_pattern(pattern)?;
-            }
-            if !options.readonly {
-                reject_writable_path_patterns(deny)?;
-            }
+            microsandbox_types::validate_deny_list(deny, options.readonly)
+                .map_err(|err| crate::MicrosandboxError::InvalidConfig(err.to_string()))?;
         }
         VolumeMount::Named {
             name,
@@ -1406,73 +1400,6 @@ fn validate_host_path_wire_safe(path: &Path, label: &str) -> crate::Microsandbox
     if path.contains(',') || path.contains(';') || has_forbidden_host_path_colon(path) {
         return Err(crate::MicrosandboxError::InvalidConfig(format!(
             "{label} must not contain ',', ':', or ';': {path}"
-        )));
-    }
-    Ok(())
-}
-
-/// Validate a single deny-list pattern for the mount wire format.
-///
-/// Patterns are rendered into the `--mount` option block as `deny=<pattern>`.
-/// The block is comma-joined and the spec is colon-split, so any of those
-/// separators (or a newline/NUL, which would corrupt gitignore parsing) must
-/// be rejected up front rather than silently attenuating other mount options.
-/// Leading or trailing whitespace is rejected too: the runtime trims option
-/// tokens, so a value like `" !secret"` would otherwise be silently
-/// reinterpreted as the allow rule `!secret`.
-///
-/// Keep this in sync with the identical validators in
-/// `crates/runtime/lib/vm.rs` (`validate_deny_pattern`) and
-/// `sdk/go/native/src/lib.rs`.
-fn validate_deny_pattern(pattern: &str) -> crate::MicrosandboxResult<()> {
-    if pattern.is_empty() {
-        return Err(crate::MicrosandboxError::InvalidConfig(
-            "deny patterns must not be empty".into(),
-        ));
-    }
-    if pattern.contains(',')
-        || pattern.contains(':')
-        || pattern.contains('\n')
-        || pattern.contains('\0')
-    {
-        return Err(crate::MicrosandboxError::InvalidConfig(format!(
-            "deny pattern must not contain ',', ':', newline, or NUL: {pattern:?}"
-        )));
-    }
-    if pattern.trim() != pattern {
-        return Err(crate::MicrosandboxError::InvalidConfig(format!(
-            "deny pattern must not have leading or trailing whitespace: {pattern:?}"
-        )));
-    }
-    Ok(())
-}
-
-/// Whether a deny pattern targets a mount-relative path (an interior `/`).
-///
-/// A trailing `/` only marks a directory-only pattern (`node_modules/`), which
-/// still matches by component name, so it does not make the pattern a path
-/// pattern.
-fn is_path_deny_pattern(pattern: &str) -> bool {
-    pattern.trim_end_matches('/').contains('/')
-}
-
-/// Reject path deny patterns on a writable mount.
-///
-/// Path patterns (`sub/.env`, `**/env.secret`) are matched against the entry's
-/// reconstructed mount-relative path, so a guest with a writable mount can
-/// rename an ancestor directory and make the denied path stop matching. Refuse
-/// them at configuration time rather than accept a rule a writable guest can
-/// launder. Name-only (`.env`) and directory-only (`node_modules/`) patterns
-/// match anywhere and stay valid, and read-only mounts cannot rename, so path
-/// patterns remain valid there.
-fn reject_writable_path_patterns(patterns: &[String]) -> crate::MicrosandboxResult<()> {
-    if let Some(pattern) = patterns
-        .iter()
-        .find(|pattern| is_path_deny_pattern(pattern))
-    {
-        return Err(crate::MicrosandboxError::InvalidConfig(format!(
-            "deny pattern {pattern:?} is a path pattern, which a writable mount can bypass by \
-             renaming an ancestor directory; use a name-only pattern, or mark the mount read-only"
         )));
     }
     Ok(())

@@ -12,11 +12,44 @@ use crate::backends::shared::inode_table::NamespaceAlias;
 use crate::{
     Context,
     backends::shared::{name_validation, platform},
+    stat64,
 };
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// `RENAME_EXCHANGE` flag: atomically swap source and destination.
+///
+/// This is the Linux value; the macOS branch maps it to `RENAME_SWAP` before
+/// calling `renameatx_np`, but the deny checks below reason about the flag in
+/// this shared numbering.
+const RENAME_EXCHANGE: u32 = 2;
 
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
+
+/// Platform-agnostic outcome of the deny decision for a rename.
+pub(super) enum RenameDecision {
+    /// No deny rule matched and the checked identities are fresh: perform the move.
+    Proceed,
+    /// A deny rule matched: the caller returns `EACCES`.
+    Deny,
+    /// A checked identity went stale: the caller retries from the top.
+    Retry,
+}
+
+/// One side of a rename: the pinned parent handle, its inode, and the entry name.
+#[derive(Clone, Copy)]
+pub(super) struct RenameEndpoint<'a> {
+    /// Open handle to the parent directory.
+    pub(super) fd: &'a inode::InodeFd,
+    /// Parent inode number, used to reconstruct the mount-relative path.
+    pub(super) dir: u64,
+    /// Entry name within the parent.
+    pub(super) name: &'a CStr,
+}
 
 /// Expected state of an atomic exchange (`RENAME_EXCHANGE`/`RENAME_SWAP`)
 /// destination, captured when its type drives a directory-only deny decision.
@@ -63,9 +96,112 @@ impl ExchangeDest {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
-/// Linux `RENAME_EXCHANGE` flag: atomically swap source and destination.
-#[cfg(target_os = "linux")]
-const RENAME_EXCHANGE: u32 = 2;
+/// Apply the deny rules for a rename, shared by the Linux and macOS branches.
+///
+/// `source_st` is the source's freshly captured `fstat`, whose type and identity
+/// the decision is pinned to. Returns [`RenameDecision::Deny`] when a pattern
+/// matches, [`RenameDecision::Retry`] when the source or an exchange destination
+/// changed under us, and [`RenameDecision::Proceed`] when the move may run. The
+/// platform-specific syscall and any post-rename inode bookkeeping stay in the
+/// caller.
+pub(super) fn decide_rename_deny(
+    fs: &PassthroughFs,
+    old: RenameEndpoint<'_>,
+    new: RenameEndpoint<'_>,
+    flags: u32,
+    source_st: &stat64,
+) -> io::Result<RenameDecision> {
+    // A rename replaces the destination with the source's type (and, for an
+    // exchange, moves the destination onto the source name), so the source's
+    // type drives every dir-only decision in both directions.
+    let source_is_dir = fs.deny.has_dir_only_patterns()
+        && platform::mode_file_type(source_st.st_mode) == platform::MODE_DIR;
+
+    // Resolve each parent's mount-relative path once per attempt and reuse it
+    // across the deny checks below: path patterns need it for every match, and
+    // one resolution dominates the cost of a deny check. Component-only patterns
+    // skip resolution entirely (basename fast path). An unresolvable parent fails
+    // closed, mirroring `deny_matches_name`.
+    let (old_comps, new_comps) = if fs.deny.needs_path_reconstruction() {
+        let old_comps = inode::parent_path_components(&fs.inodes, old.dir, fs.deny_root())
+            .ok_or_else(platform::eacces)?;
+        // Same-directory renames are the dominant case; resolve once.
+        let new_comps = if new.dir == old.dir {
+            old_comps.clone()
+        } else {
+            inode::parent_path_components(&fs.inodes, new.dir, fs.deny_root())
+                .ok_or_else(platform::eacces)?
+        };
+        (Some(old_comps), Some(new_comps))
+    } else {
+        (None, None)
+    };
+
+    // Authoritative deny decision against the pinned source type.
+    if fs.deny_matches_name_in_dir(old_comps.as_deref(), old.name.to_bytes(), source_is_dir)
+        || fs.deny_matches_name_in_dir(new_comps.as_deref(), new.name.to_bytes(), source_is_dir)
+    {
+        return Ok(RenameDecision::Deny);
+    }
+
+    let mut exchange_dest = None;
+    if fs.deny.has_dir_only_patterns() {
+        let dest_st = platform::fstatat_nofollow(new.fd.raw(), new.name).ok();
+        let dest_is_dir = dest_st
+            .as_ref()
+            .map(|st| platform::mode_file_type(st.st_mode) == platform::MODE_DIR)
+            .unwrap_or(false);
+        if dest_is_dir
+            && fs.deny_matches_name_in_dir(new_comps.as_deref(), new.name.to_bytes(), true)
+        {
+            return Ok(RenameDecision::Deny);
+        }
+        // RENAME_EXCHANGE also moves the destination onto the *source* name, so
+        // the reverse direction needs the destination's type: exchanging a file
+        // at a dir-only-denied name with a directory at an allowed name would
+        // otherwise land the directory at the denied name.
+        if flags & RENAME_EXCHANGE != 0 {
+            if dest_is_dir
+                && fs.deny_matches_name_in_dir(old_comps.as_deref(), old.name.to_bytes(), true)
+            {
+                return Ok(RenameDecision::Deny);
+            }
+            // Pin the destination as well, so an external writer swapping in a
+            // directory (or creating one at an absent name) is caught by the
+            // re-check below rather than landing at the denied source name.
+            exchange_dest = Some(ExchangeDest::capture(
+                dest_st
+                    .as_ref()
+                    .map(|st| (platform::stat_ino(st), platform::stat_dev(st))),
+            ));
+        }
+    }
+
+    // The source path must still refer to the pinned inode; otherwise the type
+    // we checked is stale, so retry the whole check+move.
+    match platform::fstatat_nofollow(old.fd.raw(), old.name) {
+        Ok(st)
+            if platform::stat_ino(&st) == platform::stat_ino(source_st)
+                && platform::stat_dev(&st) == platform::stat_dev(source_st) => {}
+        _ => return Ok(RenameDecision::Retry),
+    }
+
+    // An exchange destination must still match what we checked: a non-exchange
+    // rename replaces the destination with the source, so only the source
+    // identity matters there, but an exchange moves the destination onto the
+    // source name and must not let a directory appear at (or replace) a
+    // dir-only-denied destination.
+    if let Some(expected) = exchange_dest {
+        let current = platform::fstatat_nofollow(new.fd.raw(), new.name)
+            .ok()
+            .map(|st| (platform::stat_ino(&st), platform::stat_dev(&st)));
+        if !expected.still_matches(current) {
+            return Ok(RenameDecision::Retry);
+        }
+    }
+
+    Ok(RenameDecision::Proceed)
+}
 
 /// Remove a file.
 ///
@@ -88,11 +224,23 @@ pub(crate) fn do_unlink(
         return Err(platform::eacces());
     }
 
-    if fs.deny_matches_name(parent, name.to_bytes(), false) {
+    let parent_fd = inode::get_inode_fd(fs, parent)?;
+
+    // A dir-only pattern (`node_modules/`) must hide the directory from unlink
+    // too: otherwise the raw unlink returns EISDIR and reveals that a hidden
+    // name exists and is a directory. Only dir-only patterns depend on the
+    // entry's type, so stat only when one is present; an unresolved type fails
+    // closed by matching as a directory.
+    let is_dir = if fs.deny.has_dir_only_patterns() {
+        platform::fstatat_nofollow(parent_fd.raw(), name)
+            .map(|st| platform::mode_file_type(st.st_mode) == platform::MODE_DIR)
+            .unwrap_or(true)
+    } else {
+        false
+    };
+    if fs.deny_matches_name(parent, name.to_bytes(), is_dir) {
         return Err(platform::eacces());
     }
-
-    let parent_fd = inode::get_inode_fd(fs, parent)?;
 
     #[cfg(target_os = "linux")]
     let pre_unlink_fd = {
@@ -343,8 +491,6 @@ pub(crate) fn do_rename(
                     return Err(err);
                 }
             };
-            let source_is_dir = fs.deny.has_dir_only_patterns()
-                && platform::mode_file_type(source_st.st_mode) == platform::MODE_DIR;
             let source_key = match inode::linux_alt_key_from_fd(source_probe_fd) {
                 Ok(key) => key,
                 Err(err) => {
@@ -354,97 +500,24 @@ pub(crate) fn do_rename(
             };
             unsafe { libc::close(source_probe_fd) };
 
-            // Resolve each parent's mount-relative path once per attempt and
-            // reuse it across the deny checks below: path patterns need it for
-            // every match, and one resolution walks the inode anchor chain,
-            // which dominates the cost of a deny check. Component-only patterns
-            // skip resolution entirely (basename fast path). An unresolvable
-            // parent fails closed, mirroring `deny_matches_name`.
-            let (old_comps, new_comps) = if fs.deny.needs_path_reconstruction() {
-                let old_comps = inode::parent_path_components(&fs.inodes, olddir, fs.deny_root())
-                    .ok_or_else(platform::eacces)?;
-                // Same-directory renames are the dominant case; resolve once.
-                let new_comps = if newdir == olddir {
-                    old_comps.clone()
-                } else {
-                    inode::parent_path_components(&fs.inodes, newdir, fs.deny_root())
-                        .ok_or_else(platform::eacces)?
-                };
-                (Some(old_comps), Some(new_comps))
-            } else {
-                (None, None)
-            };
-
-            // Authoritative deny decision against the pinned source type.
-            if fs.deny_matches_name_in_dir(old_comps.as_deref(), oldname.to_bytes(), source_is_dir)
-                || fs.deny_matches_name_in_dir(
-                    new_comps.as_deref(),
-                    newname.to_bytes(),
-                    source_is_dir,
-                )
-            {
-                return Err(platform::eacces());
-            }
-            let mut exchange_dest = None;
-            if fs.deny.has_dir_only_patterns() {
-                let dest_st = platform::fstatat_nofollow(new_fd.raw(), newname).ok();
-                let dest_is_dir = dest_st
-                    .as_ref()
-                    .map(|st| platform::mode_file_type(st.st_mode) == platform::MODE_DIR)
-                    .unwrap_or(false);
-                if dest_is_dir
-                    && fs.deny_matches_name_in_dir(new_comps.as_deref(), newname.to_bytes(), true)
-                {
-                    return Err(platform::eacces());
-                }
-                // RENAME_EXCHANGE also moves the destination onto the *source*
-                // name, so the reverse direction needs the destination's type:
-                // exchanging a file at a dir-only-denied name with a directory at
-                // an allowed name would otherwise land the directory at the
-                // denied name.
-                if flags & RENAME_EXCHANGE != 0 {
-                    if dest_is_dir
-                        && fs.deny_matches_name_in_dir(
-                            old_comps.as_deref(),
-                            oldname.to_bytes(),
-                            true,
-                        )
-                    {
-                        return Err(platform::eacces());
-                    }
-                    // Pin the destination as well, so an external writer swapping
-                    // in a directory (or creating one at an absent name) is caught
-                    // by the re-check below rather than landing at the denied
-                    // source name.
-                    exchange_dest = Some(ExchangeDest::capture(
-                        dest_st
-                            .as_ref()
-                            .map(|st| (platform::stat_ino(st), platform::stat_dev(st))),
-                    ));
-                }
-            }
-
-            // The source path must still refer to the pinned inode; otherwise the
-            // type we checked is stale, so retry the whole check+move.
-            match platform::fstatat_nofollow(old_fd.raw(), oldname) {
-                Ok(st)
-                    if platform::stat_ino(&st) == platform::stat_ino(&source_st)
-                        && platform::stat_dev(&st) == platform::stat_dev(&source_st) => {}
-                _ => continue,
-            }
-
-            // An exchange destination must still match what we checked: a
-            // non-exchange rename replaces the destination with the source, so
-            // only the source identity matters there, but an exchange moves the
-            // destination onto the source name and must not let a directory
-            // appear at (or replace) a dir-only-denied destination.
-            if let Some(expected) = exchange_dest {
-                let current = platform::fstatat_nofollow(new_fd.raw(), newname)
-                    .ok()
-                    .map(|st| (platform::stat_ino(&st), platform::stat_dev(&st)));
-                if !expected.still_matches(current) {
-                    continue;
-                }
+            match decide_rename_deny(
+                fs,
+                RenameEndpoint {
+                    fd: &old_fd,
+                    dir: olddir,
+                    name: oldname,
+                },
+                RenameEndpoint {
+                    fd: &new_fd,
+                    dir: newdir,
+                    name: newname,
+                },
+                flags,
+                &source_st,
+            )? {
+                RenameDecision::Deny => return Err(platform::eacces()),
+                RenameDecision::Retry => continue,
+                RenameDecision::Proceed => {}
             }
 
             let target_probe_fd = unsafe {
@@ -561,101 +634,25 @@ pub(crate) fn do_rename(
             }
 
             let source_st = platform::fstatat_nofollow(old_fd.raw(), oldname)?;
-            let source_is_dir = fs.deny.has_dir_only_patterns()
-                && platform::mode_file_type(source_st.st_mode) == platform::MODE_DIR;
 
-            // Resolve each parent's mount-relative path once per attempt and
-            // reuse it across the deny checks below: path patterns need it for
-            // every match, and one resolution runs F_GETPATH through the
-            // `/.vol/<dev>/<ino>` path, which dominates the cost of a deny
-            // check. Component-only patterns skip resolution entirely (basename
-            // fast path). An unresolvable parent fails closed, mirroring
-            // `deny_matches_name`.
-            let (old_comps, new_comps) = if fs.deny.needs_path_reconstruction() {
-                let old_comps = inode::parent_path_components(&fs.inodes, olddir, fs.deny_root())
-                    .ok_or_else(platform::eacces)?;
-                // Same-directory renames are the dominant case; resolve once.
-                let new_comps = if newdir == olddir {
-                    old_comps.clone()
-                } else {
-                    inode::parent_path_components(&fs.inodes, newdir, fs.deny_root())
-                        .ok_or_else(platform::eacces)?
-                };
-                (Some(old_comps), Some(new_comps))
-            } else {
-                (None, None)
-            };
-
-            // Authoritative deny decision against the freshly-captured source type.
-            if fs.deny_matches_name_in_dir(old_comps.as_deref(), oldname.to_bytes(), source_is_dir)
-                || fs.deny_matches_name_in_dir(
-                    new_comps.as_deref(),
-                    newname.to_bytes(),
-                    source_is_dir,
-                )
-            {
-                return Err(platform::eacces());
-            }
-            let mut exchange_dest = None;
-            if fs.deny.has_dir_only_patterns() {
-                let dest_st = platform::fstatat_nofollow(new_fd.raw(), newname).ok();
-                let dest_is_dir = dest_st
-                    .as_ref()
-                    .map(|st| platform::mode_file_type(st.st_mode) == platform::MODE_DIR)
-                    .unwrap_or(false);
-                if dest_is_dir
-                    && fs.deny_matches_name_in_dir(new_comps.as_deref(), newname.to_bytes(), true)
-                {
-                    return Err(platform::eacces());
-                }
-                // RENAME_EXCHANGE also moves the destination onto the *source*
-                // name, so the reverse direction needs the destination's type:
-                // exchanging a file at a dir-only-denied name with a directory at
-                // an allowed name would otherwise land the directory at the
-                // denied name. Linux RENAME_EXCHANGE = 2; `flags` is translated
-                // to macOS renameatx_np flags below.
-                if flags & 2 != 0 {
-                    if dest_is_dir
-                        && fs.deny_matches_name_in_dir(
-                            old_comps.as_deref(),
-                            oldname.to_bytes(),
-                            true,
-                        )
-                    {
-                        return Err(platform::eacces());
-                    }
-                    // Pin the destination as well, so an external writer swapping
-                    // in a directory (or creating one at an absent name) is caught
-                    // by the re-check below rather than landing at the denied
-                    // source name.
-                    exchange_dest = Some(ExchangeDest::capture(
-                        dest_st
-                            .as_ref()
-                            .map(|st| (platform::stat_ino(st), platform::stat_dev(st))),
-                    ));
-                }
-            }
-
-            // The source path must still refer to the captured inode.
-            match platform::fstatat_nofollow(old_fd.raw(), oldname) {
-                Ok(st)
-                    if platform::stat_ino(&st) == platform::stat_ino(&source_st)
-                        && platform::stat_dev(&st) == platform::stat_dev(&source_st) => {}
-                _ => continue,
-            }
-
-            // An exchange destination must still match what we checked: a
-            // non-exchange rename replaces the destination with the source, so
-            // only the source identity matters there, but an exchange moves the
-            // destination onto the source name and must not let a directory
-            // appear at (or replace) a dir-only-denied destination.
-            if let Some(expected) = exchange_dest {
-                let current = platform::fstatat_nofollow(new_fd.raw(), newname)
-                    .ok()
-                    .map(|st| (platform::stat_ino(&st), platform::stat_dev(&st)));
-                if !expected.still_matches(current) {
-                    continue;
-                }
+            match decide_rename_deny(
+                fs,
+                RenameEndpoint {
+                    fd: &old_fd,
+                    dir: olddir,
+                    name: oldname,
+                },
+                RenameEndpoint {
+                    fd: &new_fd,
+                    dir: newdir,
+                    name: newname,
+                },
+                flags,
+                &source_st,
+            )? {
+                RenameDecision::Deny => return Err(platform::eacces()),
+                RenameDecision::Retry => continue,
+                RenameDecision::Proceed => {}
             }
 
             let ret = if flags == 0 {

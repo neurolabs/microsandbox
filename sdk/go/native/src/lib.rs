@@ -2037,38 +2037,6 @@ fn apply_patch(
     Ok(builder.add_patch(patch))
 }
 
-/// Reject deny patterns that would corrupt the mount wire format.
-///
-/// The mount option block is comma-joined and the spec is colon-split, so a
-/// `,` or `:` in a pattern would either fail the whole spawn or silently
-/// attenuate other mount protections; a newline/NUL would corrupt gitignore
-/// parsing. Reject here so the FFI boundary reports a clear error instead of
-/// the deeper `MountBuilder::build()` validation.
-///
-/// Keep this in sync with the identical validators in
-/// `crates/runtime/lib/vm.rs` (`validate_deny_pattern`) and
-/// `sdk/rust/lib/sandbox/types.rs`.
-fn validate_deny_pattern(pattern: &str) -> Result<(), FfiError> {
-    if pattern.is_empty() {
-        return Err(FfiError::invalid_argument("deny pattern must not be empty"));
-    }
-    if pattern.contains(',')
-        || pattern.contains(':')
-        || pattern.contains('\n')
-        || pattern.contains('\0')
-    {
-        return Err(FfiError::invalid_argument(format!(
-            "deny pattern must not contain ',', ':', newline, or NUL: {pattern:?}"
-        )));
-    }
-    if pattern.trim() != pattern {
-        return Err(FfiError::invalid_argument(format!(
-            "deny pattern must not have leading or trailing whitespace: {pattern:?}"
-        )));
-    }
-    Ok(())
-}
-
 fn apply_volume(
     builder: microsandbox::sandbox::SandboxBuilder,
     guest_path: &str,
@@ -2124,7 +2092,15 @@ fn volume_mount(
     let override_gid = m.override_gid;
     let deny = m.deny.clone();
     for pattern in &deny {
-        validate_deny_pattern(pattern)?;
+        microsandbox_types::validate_deny_pattern(pattern)
+            .map_err(|err| FfiError::invalid_argument(err.to_string()))?;
+    }
+    // Reject deny on anything that is not a bind mount before the owned-mount
+    // early return below, which would otherwise drop it silently.
+    if !deny.is_empty() && bind.is_none() {
+        return Err(FfiError::invalid_argument(
+            "deny is only valid for bind mounts",
+        ));
     }
     let raw_named_mode = m.named_mode.clone();
     let raw_named_kind = m.named_kind.clone();
@@ -2242,24 +2218,12 @@ fn volume_mount(
             "override_uid/override_gid are only valid for bind or named mounts",
         ));
     }
-    if !deny.is_empty() && bind.is_none() {
-        return Err(FfiError::invalid_argument(
-            "deny is only valid for bind mounts",
-        ));
-    }
     // A path pattern (`sub/.env`) is matched against the entry's mount-relative
     // path, so a writable guest can rename an ancestor directory to launder it.
-    // Reject it here, in step with the identical checks in the Rust SDK and the
-    // runtime, rather than relying on the later Rust `MountBuilder::build`.
-    if !readonly
-        && let Some(pattern) = deny
-            .iter()
-            .find(|pattern| pattern.trim_end_matches('/').contains('/'))
-    {
-        return Err(FfiError::invalid_argument(format!(
-            "deny pattern {pattern:?} is a path pattern, which a writable mount can bypass by \
-             renaming an ancestor directory; use a name-only pattern, or mark the mount read-only"
-        )));
+    // The shared validator rejects it in step with the Rust SDK and the runtime.
+    if !readonly {
+        microsandbox_types::reject_writable_path_patterns(&deny)
+            .map_err(|err| FfiError::invalid_argument(err.to_string()))?;
     }
 
     let mb = microsandbox::sandbox::MountBuilder::new(guest_path);
@@ -8302,6 +8266,21 @@ mod tests {
 
         let err = match apply_volume(builder, "/data", &spec) {
             Ok(_) => panic!("deny on a named mount should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.message.contains("deny is only valid for bind mounts"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn apply_volume_rejects_deny_on_owned_mount() {
+        let spec: MountSpec = serde_json::from_str(r#"{"owned":"dir","deny":[".env"]}"#).unwrap();
+
+        let err = match volume_mount("/data", &spec) {
+            Ok(_) => panic!("deny on an owned mount should be rejected"),
             Err(err) => err,
         };
         assert!(

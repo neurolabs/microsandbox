@@ -13,6 +13,7 @@ crate-type = ["staticlib", "cdylib"]
 
 [dependencies]
 microsandbox = { workspace = true, default-features = true, features = ["net", "ssh"] }
+microsandbox-types.workspace = true
 microsandbox-network.workspace = true
 ipnetwork.workspace = true
 tokio.workspace = true

@@ -214,6 +214,48 @@ fn test_deny_rename_to_denied_target() {
 // Tests: readdir filtering
 //--------------------------------------------------------------------------------------------------
 
+/// PROOF (H1): a readdir request whose `nodeid` disagrees with the handle's
+/// inode must not leak path-pattern-denied entries; the deny path must come from
+/// the handle's inode, not the request. Fails on the unpatched backend.
+#[test]
+fn test_deny_readdir_ignores_mismatched_request_inode() {
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec!["a/.env".to_string()],
+        readonly: true,
+        ..cfg
+    });
+    sb.host_create_dir("a");
+    sb.host_create_file("a/.env", b"hidden");
+    sb.host_create_file("a/ok.txt", b"ok");
+
+    let a = sb.lookup_root("a").unwrap().inode;
+
+    // Correct nodeid: the path pattern hides `.env`.
+    let correct = sb.fuse_opendir(a).unwrap();
+    let correct_entries = sb.fs.readdir(sb.ctx(), a, correct, 4096, 0).unwrap();
+    assert!(
+        !correct_entries.iter().any(|e| e.name == b".env"),
+        "deny path pattern must hide `.env` under the real directory"
+    );
+
+    // Same directory handle, mismatched request nodeid: rejected (not leaked).
+    let mismatched = sb.fuse_opendir(a).unwrap();
+    match sb.fs.readdir(sb.ctx(), ROOT_INODE, mismatched, 4096, 0) {
+        Err(err) => assert_eq!(
+            err.raw_os_error(),
+            Some(LINUX_EBADF),
+            "mismatched nodeid must be rejected as EBADF"
+        ),
+        Ok(leaked) => {
+            let leaked_names: Vec<String> = leaked
+                .iter()
+                .map(|e| String::from_utf8_lossy(&e.name).into_owned())
+                .collect();
+            panic!("readdir leaked entries via a mismatched nodeid: {leaked_names:?}");
+        }
+    }
+}
+
 /// Denied entries are omitted from readdir.
 #[test]
 fn test_deny_readdir_omits_entries() {
@@ -707,6 +749,26 @@ fn test_deny_dir_only_rmdir_rejected() {
     );
 }
 
+/// A dir-only pattern must hide the directory from `unlink` too: otherwise the
+/// raw unlink returns EISDIR, revealing that a hidden name exists and is a
+/// directory (an existence/type oracle).
+#[test]
+fn test_deny_dir_only_unlink_dir_rejected_not_eisdir() {
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec!["node_modules/".to_string()],
+        ..cfg
+    });
+
+    sb.host_create_dir("node_modules");
+    TestSandbox::assert_errno(
+        sb.fs
+            .unlink(sb.ctx(), ROOT_INODE, &TestSandbox::cstr("node_modules")),
+        LINUX_EACCES,
+    );
+    // The name stays fully hidden.
+    TestSandbox::assert_errno(sb.lookup_root("node_modules"), LINUX_ENOENT);
+}
+
 /// A dir-only pattern allows unlink of a same-named file (gitignore 'foo/'
 /// does not match files).
 #[test]
@@ -740,7 +802,62 @@ fn test_deny_path_pattern_fails_closed_on_unresolvable_parent() {
 }
 
 //--------------------------------------------------------------------------------------------------
-// Tests: known limitations pinned as #[ignore] (behavior documented, not yet enforced)
+// Tests: rename deny decision helper (both Retry branches)
+//--------------------------------------------------------------------------------------------------
+
+/// Directly exercises `decide_rename_deny`: a fresh source identity proceeds, a
+/// stale one retries. Covers the extraction's Retry branch without needing a
+/// concurrent writer (or macOS).
+#[test]
+fn test_decide_rename_deny_proceeds_and_retries_on_stale_source() {
+    use super::super::inode;
+    use super::super::remove_ops::{RenameDecision, RenameEndpoint, decide_rename_deny};
+    use crate::backends::shared::platform;
+
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec!["sub/.env".to_string()],
+        readonly: true,
+        ..cfg
+    });
+    sb.host_create_dir("sub");
+    sb.host_create_file("sub/keep", b"x");
+
+    let sub_inode = sb.lookup_root("sub").unwrap().inode;
+    let keep_inode = sb.lookup(sub_inode, "keep").unwrap().inode;
+
+    let sub_fd = inode::get_inode_fd(&sb.fs, sub_inode).unwrap();
+    let keep_fd = inode::get_inode_fd(&sb.fs, keep_inode).unwrap();
+
+    let keep_name = TestSandbox::cstr("keep");
+    let dest_name = TestSandbox::cstr("keep2");
+    let old = RenameEndpoint {
+        fd: &sub_fd,
+        dir: sub_inode,
+        name: keep_name.as_c_str(),
+    };
+    let new = RenameEndpoint {
+        fd: &sub_fd,
+        dir: sub_inode,
+        name: dest_name.as_c_str(),
+    };
+
+    // Fresh source identity -> proceed (`sub/.env` does not match `sub/keep`).
+    let current = platform::fstat(keep_fd.raw()).unwrap();
+    assert!(matches!(
+        decide_rename_deny(&sb.fs, old, new, 0, &current).unwrap(),
+        RenameDecision::Proceed
+    ));
+
+    // A stale captured identity (the parent directory's) -> retry.
+    let stale = platform::fstat(sub_fd.raw()).unwrap();
+    assert!(matches!(
+        decide_rename_deny(&sb.fs, old, new, 0, &stale).unwrap(),
+        RenameDecision::Retry
+    ));
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests: name-based semantics
 //--------------------------------------------------------------------------------------------------
 
 // The ancestor-rename laundering gap is closed at configuration time: a path
@@ -748,17 +865,15 @@ fn test_deny_path_pattern_fails_closed_on_unresolvable_parent() {
 // validators), so it can only be configured on a read-only mount, where the
 // guest cannot rename. Only name-based gaps remain below.
 
-/// Pins the symlink-target gap: deny matching checks the entry name, not the
-/// resolved symlink target.
+/// A symlink whose target is denied does not expose the target.
 ///
-/// A symlink named `link` pointing at a denied relative path (`.env`) is
-/// served, because the deny list sees `link` and never re-checks the target.
-/// This is inherent to name-based deny lists and is documented in
-/// docs/sandboxes/volumes.mdx; it is `#[ignore]`d because the bypass is
-/// current behavior.
+/// The link entry itself is served (deny matches the entry name, and `link` is
+/// allowed), but following the link is a fresh lookup of the target name, which
+/// deny rejects. So the target's contents stay unreachable; only the link
+/// entry's existence is observable, which is the same name-based limitation as
+/// any allowed name.
 #[test]
-#[ignore = "known limitation: deny matches the entry name, not the symlink target"]
-fn test_deny_symlink_to_denied_target_is_served() {
+fn test_deny_symlink_to_denied_target_does_not_expose_target() {
     use std::os::unix::fs::symlink;
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
         deny: vec![".env".to_string()],
@@ -767,10 +882,9 @@ fn test_deny_symlink_to_denied_target_is_served() {
     sb.host_create_file(".env", b"secret");
     symlink(".env", sb.root.join("link")).unwrap();
 
-    // The symlink's own name 'link' does not match '.env', so it is served.
-    let entry = sb.lookup_root("link");
-    assert!(
-        !entry.is_ok(),
-        "known limitation: symlink to a denied target is served"
-    );
+    // The link entry is served: its own name `link` is not denied.
+    assert!(sb.lookup_root("link").is_ok());
+
+    // Following the link resolves the target name, which is denied.
+    TestSandbox::assert_errno(sb.lookup_root(".env"), LINUX_ENOENT);
 }

@@ -18,10 +18,10 @@ use std::{
 use std::collections::HashSet;
 #[cfg(target_os = "macos")]
 use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "macos")]
 use std::{
     ffi::{CStr, CString, OsStr},
-    os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
 };
 
@@ -693,6 +693,33 @@ fn validate_shape(state: &PassthroughState, readonly: bool, invalid_root: bool) 
     Ok(())
 }
 
+/// Refuse to restore a stored inode whose path the destination deny list hides.
+///
+/// Denied names are never interned during normal operation, so a stored path
+/// can only match when the deny list grew after capture (or comes from a mount
+/// with different patterns). Re-internering it would re-expose a path the caller
+/// asked to hide, so fail closed with an explicit error.
+fn reject_denied_restore_path(
+    fs: &PassthroughFs,
+    saved: &InodeState,
+    pinned: &File,
+) -> io::Result<()> {
+    if fs.deny.is_empty() || saved.components.is_empty() {
+        return Ok(());
+    }
+    let is_dir = pinned.metadata()?.file_type().is_dir();
+    let relative = crate::backends::passthroughfs::deny::join_path(&saved.components);
+    if fs
+        .deny
+        .matches_path(relative.as_os_str().as_bytes(), is_dir)
+    {
+        return Err(invalid_state(
+            "restored passthrough inode is hidden by the mount deny list",
+        ));
+    }
+    Ok(())
+}
+
 fn rebuild(
     fs: &PassthroughFs,
     mut state: PassthroughState,
@@ -720,6 +747,7 @@ fn rebuild(
         let fd = open_inode_components(fs, &saved.components)?;
         let pinned = unsafe { File::from_raw_fd(fd) };
         verify_reopened(&pinned, saved.inode, verified)?;
+        reject_denied_restore_path(fs, saved, &pinned)?;
         let (alt_key, data) =
             inode_data_from_fd(fs, &inodes, saved, &path_ids, pinned.as_raw_fd())?;
         if inodes.get_alt(&alt_key).is_some() {
@@ -1022,7 +1050,7 @@ fn open_macos_inode_for_path(fs: &PassthroughFs, inode_id: u64) -> io::Result<Ow
             // Open the link object, never its target. Darwin's no-follow flags can
             // conflict with O_SYMLINK; this trusted /.vol identity path has no
             // guest-provided components (as in inode's metadata-stat reopen).
-            let path = inode::vol_path(dev, ino);
+            let path = platform::vol_path(dev, ino);
             let fd = unsafe { libc::open(path.as_ptr(), flags | libc::O_CLOEXEC) };
             if fd < 0 {
                 Err(io::Error::last_os_error())
@@ -1140,6 +1168,34 @@ mod tests {
             std::fs::metadata(root.path().join("data")).unwrap().ino()
         );
         assert_eq!(capture(&destination).unwrap(), encoded);
+    }
+
+    #[test]
+    fn restore_refuses_a_path_the_destination_deny_list_hides() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("secret"), b"x").unwrap();
+        let source = backend(root.path());
+        source.init(FsOptions::empty()).unwrap();
+        source.lookup(context(), 1, c"secret").unwrap();
+        let encoded = capture(&source).unwrap();
+
+        // Restoring into a mount whose deny list now hides the stored path must
+        // fail closed instead of re-interning the hidden name.
+        let destination = PassthroughFs::new(super::super::PassthroughConfig {
+            root_dir: root.path().to_path_buf(),
+            inject_init: false,
+            stat_virtualization: StatVirtualization::Off,
+            deny: vec!["secret".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        destination.init(FsOptions::empty()).unwrap();
+
+        let error = restore(&destination, &encoded).unwrap_err();
+        assert!(
+            error.to_string().contains("hidden by the mount deny list"),
+            "{error}"
+        );
     }
 
     #[test]

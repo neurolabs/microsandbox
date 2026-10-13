@@ -470,6 +470,14 @@ impl LaunchContract {
         // These mount settings are supplied after host-side mount resolution, so
         // reject unsupported intent before replacement as well as at launch.
         for mount in &config.spec.mounts {
+            // Deny lists ship only with the current machine-protocol runtime; a
+            // v0.6.x runtime would reject the `deny=` mount option, so refuse
+            // with an upgrade-required error instead of a generic parse failure.
+            if let VolumeMount::Bind { deny, .. } = mount
+                && !deny.is_empty()
+            {
+                return unsupported("bind mount deny lists");
+            }
             if self.patch < 16
                 && let VolumeMount::Bind { host, .. } = mount
                 && host.is_file()
@@ -860,6 +868,44 @@ mod tests {
         LaunchContract {
             patch: 18,
             machine: false,
+        }
+        .validate_launch_intent(&config)
+        .unwrap();
+    }
+
+    #[test]
+    fn launch_rejects_bind_deny_for_legacy_runtime() {
+        let mut config = SandboxConfig::default();
+        config.spec.mounts = vec![VolumeMount::Bind {
+            host: "/host/data".into(),
+            guest: "/data".into(),
+            options: microsandbox_types::MountOptions::default(),
+            stat_virtualization: microsandbox_types::StatVirtualization::Strict,
+            host_permissions: microsandbox_types::HostPermissions::Private,
+            follow_root_symlinks: false,
+            quota_mib: None,
+            deny: vec![".env".into()],
+        }];
+
+        // A v0.6.x runtime does not accept the `deny=` mount option; the SDK must
+        // refuse with an upgrade-required error rather than a generic parse error.
+        let legacy = LaunchContract {
+            patch: 18,
+            machine: false,
+        };
+        assert!(
+            legacy
+                .validate_launch_intent(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("bind mount deny lists"),
+            "legacy runtime must reject deny lists"
+        );
+
+        // The current machine-protocol runtime supports deny.
+        LaunchContract {
+            patch: 18,
+            machine: true,
         }
         .validate_launch_intent(&config)
         .unwrap();
