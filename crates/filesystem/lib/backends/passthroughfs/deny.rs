@@ -302,6 +302,7 @@ impl DenyList {
     ///
     /// `is_dir` reports whether the entry is a directory; see
     /// [`Self::matches_basename`].
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn matches_path(&self, rel: &[u8], is_dir: bool) -> bool {
         self.matches_path_with_case(rel, is_dir, self.default_case_insensitive)
     }

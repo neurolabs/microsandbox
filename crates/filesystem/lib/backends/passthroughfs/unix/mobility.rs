@@ -709,12 +709,18 @@ fn reject_denied_restore_path(
     }
     let is_dir = pinned.metadata()?.file_type().is_dir();
     let relative = crate::backends::passthroughfs::deny::join_path(&saved.components);
-    // The pinned fd is the entry itself, which cannot reveal a casefold parent
-    // directory, so this uses the mount-level case behavior. Restore is
-    // fail-closed: an entry whose path matches is refused.
+    // Case folding is a property of the directory the entry lives in, not of the
+    // mount root. Probe the entry's containing directory: the pinned fd is the
+    // entry itself and cannot reveal a casefolded parent, so using the mount-level
+    // setting would let a handle through that live lookup hides on a
+    // case-sensitive mount with a folded child directory.
+    let parent = &saved.components[..saved.components.len() - 1];
+    let parent_fd = open_components(fs, parent, directory_open_flags() | libc::O_NOFOLLOW)?;
+    let case_insensitive = fs.deny_case_insensitive_from_fd(parent_fd);
+    unsafe { libc::close(parent_fd) };
     if fs
         .deny
-        .matches_path(relative.as_os_str().as_bytes(), is_dir)
+        .matches_path_with_case(relative.as_os_str().as_bytes(), is_dir, case_insensitive)
     {
         return Err(invalid_state(
             "restored passthrough inode is hidden by the mount deny list",
