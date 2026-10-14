@@ -3236,10 +3236,7 @@ fn machine_cli_args(
                 // `VolumeMount` is non-exhaustive across crates. Launch preflight
                 // rejects any variant this builder does not understand, so an
                 // unrecognized mount must not reach here.
-                debug_assert!(
-                    false,
-                    "unrecognized volume mount reached launch argument builder"
-                );
+                unreachable!("unrecognized volume mount reached launch argument builder");
             }
         }
     }
