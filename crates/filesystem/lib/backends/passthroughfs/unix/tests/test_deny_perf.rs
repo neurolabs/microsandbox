@@ -244,6 +244,11 @@ fn build_fs(root: &Path, patterns: &[&str]) -> PassthroughFs {
     let cfg = PassthroughConfig {
         root_dir: root.to_path_buf(),
         deny: patterns.iter().map(|p| p.to_string()).collect(),
+        // A path deny pattern (`data/**/*.secret`) is rejected on a writable
+        // mount, so every scenario, including the deny-free baseline, must share
+        // the same read-only mount or the path scenario panics in `new` and the
+        // benchmark cannot compare mounts.
+        readonly: true,
         ..Default::default()
     };
     let fs = PassthroughFs::new(cfg).unwrap();
