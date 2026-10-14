@@ -65,7 +65,11 @@ fn test_deny_case_variant_matches_host_case_capability() {
 /// case-sensitive mount root, `fold` carries `FS_CASEFOLD_FL`, so the guest
 /// resolves `fold/data` to `fold/Data`; a deny path `fold/data/secret` must still
 /// hide the file once `fold`'s fold is known.
+///
+/// Linux-only: the test seeds the per-directory `FS_CASEFOLD_FL` cache through
+/// `InodeData::case_insensitive`, which exists only on Linux.
 #[test]
+#[cfg(target_os = "linux")]
 fn test_deny_path_pattern_folds_with_ancestor_directory() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
         deny: vec!["fold/data/secret".to_string()],
