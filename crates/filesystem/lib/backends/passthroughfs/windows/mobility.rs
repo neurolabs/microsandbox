@@ -22,8 +22,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use super::{
-    DirHandle, DirSnapshotEntry, HandleData, InodeData, InodeTable, LINUX_O_ACCMODE, PassthroughFs,
-    host_error, inode::VirtualMetadata, is_reserved_name, open_options_from_flags,
+    DT_DIR, DirHandle, DirSnapshotEntry, HandleData, InodeData, InodeTable, LINUX_O_ACCMODE,
+    PassthroughFs, host_error, inode::VirtualMetadata, is_reserved_name, open_options_from_flags,
     reject_reparse_metadata,
 };
 use crate::backends::{mobility, passthroughfs::quota::QuotaState};
@@ -975,6 +975,19 @@ fn rebuild(
         let snapshot = saved.entries.as_ref().map(|entries| {
             entries
                 .iter()
+                // A restored snapshot bypasses live lookup and readdir filtering,
+                // so the destination deny list must be re-applied here. Otherwise
+                // a name that was visible at capture but is hidden at the
+                // destination would be served from the cached listing. Mirrors the
+                // Unix `rebuild` re-filter. A name that cannot be decoded cannot be
+                // re-checked, so fail closed by dropping it.
+                .filter(|entry| {
+                    let Ok(name) = std::str::from_utf8(&entry.name) else {
+                        return false;
+                    };
+                    let child = path.join(name);
+                    !fs.deny_matches_path(&child, entry.file_type == DT_DIR)
+                })
                 .map(|entry| DirSnapshotEntry {
                     inode: entry.inode,
                     name: entry.name.clone(),
@@ -1222,5 +1235,49 @@ mod tests {
                 .unwrap();
             assert_eq!(new_alias.inode, first.inode);
         }
+    }
+
+    #[test]
+    fn restored_directory_snapshot_drops_names_hidden_by_destination_deny() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("sub")).unwrap();
+        std::fs::write(temp.path().join("sub/.env"), b"secret").unwrap();
+        std::fs::write(temp.path().join("sub/visible"), b"ok").unwrap();
+
+        let source = backend(temp.path(), false, false);
+        let sub = source.lookup(context(), 1, c"sub").unwrap().inode;
+        let (handle, _) = source.opendir(context(), sub, 0).unwrap();
+        let handle = handle.unwrap();
+        let captured = source.readdir(context(), sub, handle, 4096, 0).unwrap();
+        assert!(
+            captured.iter().any(|entry| entry.name == b".env"),
+            "the denied name must be visible at capture time"
+        );
+        let bytes = capture(&source).unwrap();
+
+        // Restoring into a mount whose deny list now hides `.env` must drop it
+        // from the rebuilt directory snapshot instead of re-serving the cached
+        // listing that still names it.
+        let mut cfg = PassthroughConfig::new(temp.path().to_path_buf());
+        cfg.inject_init = false;
+        cfg.stat_virtualization = StatVirtualization::Off;
+        cfg.deny = vec![".env".to_string()];
+        let destination = PassthroughFs::new(cfg).unwrap();
+        destination.init(FsOptions::empty()).unwrap();
+        restore(&destination, &bytes).unwrap();
+
+        let restored = destination
+            .readdir(context(), sub, handle, 4096, 0)
+            .unwrap();
+        let names: Vec<&[u8]> = restored.iter().map(|entry| &entry.name[..]).collect();
+
+        assert!(
+            !names.contains(&b".env".as_slice()),
+            "a denied name must not be served from a restored snapshot: {names:?}"
+        );
+        assert!(
+            names.contains(&b"visible".as_slice()),
+            "allowed names must remain visible: {names:?}"
+        );
     }
 }
