@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -437,18 +437,21 @@ describe("MountBuilder", () => {
 });
 
 function denyFixtureCases(): Array<{ pattern: string; readonly: boolean; expect: string }> {
+  // Anchor to the workspace root (the nearest ancestor Cargo.toml declaring
+  // `[workspace]`) so a nested checkout with its own copy cannot be picked up
+  // and the fixture path has a single definition.
+  const relative = "packages/microsandbox-types/rust/tests/fixtures/deny/patterns.json";
   let dir = dirname(fileURLToPath(import.meta.url));
   for (;;) {
-    const candidate = resolve(dir, "sdk/rust/tests/fixtures/deny/patterns.json");
-    try {
-      return JSON.parse(readFileSync(candidate, "utf8"));
-    } catch {
-      const parent = dirname(dir);
-      if (parent === dir) {
-        throw new Error("shared deny fixture not found in any ancestor");
-      }
-      dir = parent;
+    const manifest = resolve(dir, "Cargo.toml");
+    if (existsSync(manifest) && readFileSync(manifest, "utf8").includes("[workspace]")) {
+      return JSON.parse(readFileSync(resolve(dir, relative), "utf8"));
     }
+    const parent = dirname(dir);
+    if (parent === dir) {
+      throw new Error("workspace root (Cargo.toml with [workspace]) not found");
+    }
+    dir = parent;
   }
 }
 

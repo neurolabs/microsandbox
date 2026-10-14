@@ -26,5 +26,8 @@ base64.workspace = true
 cap-std.workspace = true
 chrono.workspace = true
 
+[dev-dependencies]
+microsandbox-types = { workspace = true, features = ["test-support"] }
+
 [build-dependencies]
 cbindgen = "0.29"

@@ -17,6 +17,9 @@ mod registry;
 pub mod snapshot;
 mod validation;
 
+#[cfg(feature = "test-support")]
+pub mod fixtures;
+
 #[cfg(feature = "ts")]
 pub mod typescript;
 

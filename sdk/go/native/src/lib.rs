@@ -8335,15 +8335,9 @@ mod tests {
             expect: String,
         }
 
-        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let path = manifest
-            .ancestors()
-            .map(|dir| dir.join("sdk/rust/tests/fixtures/deny/patterns.json"))
-            .find(|candidate| candidate.is_file())
-            .expect("shared deny fixture not found in any ancestor");
-        let raw = std::fs::read_to_string(&path)
-            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
-        let cases: Vec<Case> = serde_json::from_str(&raw).expect("parse deny fixture");
+        let cases: Vec<Case> =
+            serde_json::from_str(microsandbox_types::fixtures::DENY_FIXTURE_JSON)
+                .expect("parse deny fixture");
         assert!(!cases.is_empty(), "fixture must not be empty");
 
         for case in cases {

@@ -705,9 +705,6 @@ class MountConfig:
     #: a host file bind rejects them because it has no namespace to filter).
     #: A path pattern (``sub/secret``) requires a read-only mount, since a
     #: writable guest could rename an ancestor directory to bypass it.
-    #:
-    #: Appended after ``owned_kind`` so adding it left the positional field
-    #: order of every pre-existing ``MountConfig`` field unchanged.
     deny: list[str] | None = None
 
     def _to_dict(self) -> dict:

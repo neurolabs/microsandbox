@@ -28,14 +28,19 @@ from microsandbox import (
 def _deny_fixture_cases() -> list[dict]:
     """Load the shared cross-SDK deny-pattern disposition fixture.
 
-    Walk upward from this test file so the fixture is found regardless of the
-    checkout location, failing clearly if it moves.
+    Anchor to the workspace root (the nearest ancestor ``Cargo.toml`` declaring
+    ``[workspace]``) and resolve the fixture from there, so a nested checkout
+    with its own copy cannot be picked up and the path has a single definition.
     """
+    relative = Path("packages/microsandbox-types/rust/tests/fixtures/deny/patterns.json")
     for directory in Path(__file__).resolve().parents:
-        candidate = directory / "sdk/rust/tests/fixtures/deny/patterns.json"
-        if candidate.is_file():
-            return json.loads(candidate.read_text())
-    raise AssertionError("shared deny fixture not found in any ancestor")
+        manifest = directory / "Cargo.toml"
+        if manifest.is_file() and "[workspace]" in manifest.read_text():
+            fixture = directory / relative
+            if not fixture.is_file():
+                raise AssertionError(f"shared deny fixture missing at {fixture}")
+            return json.loads(fixture.read_text())
+    raise AssertionError("workspace root (Cargo.toml with [workspace]) not found")
 
 
 def test_bind_default_omits_policies() -> None:

@@ -676,10 +676,12 @@ jobs:
           cargo +stable test --no-default-features -p microsandbox-filesystem --lib --target ${{ matrix.rust_target }} dax_
 
   # ---------------------------------------------------------------------------
-  # Compile the cfg-gated filesystem backends for targets this host cannot run,
-  # so a backend that only builds on Windows or macOS can never silently stop
-  # compiling again (the root cause of the Windows deny-backend compile break).
-  # `cargo check` does not link, so both targets cross-check on Linux.
+  # Cross-check the non-linux cfg-gated filesystem backends (Windows and macOS)
+  #
+  # A backend gated to another platform can silently stop compiling;
+  # `cargo check` does not link, so both targets cross-check
+  # cheaply here. The native Windows build is also covered by `windows-quality`;
+  # this job is the only compile guard for macOS.
   # ---------------------------------------------------------------------------
   filesystem-backend-crosscheck:
     name: Filesystem backend cross-check
@@ -705,11 +707,11 @@ jobs:
       # `--no-default-features` avoids the `embed-binaries` OUT_DIR payload, which
       # is not available in this cross-check; the deny code is not feature-gated,
       # so this still compiles and covers the C1 windows-backend break.
-      - name: Check Windows filesystem backend
-        run: cargo +stable check --no-default-features -p microsandbox-filesystem --target x86_64-pc-windows-msvc
-
       - name: Check macOS filesystem backend
         run: cargo +stable check --no-default-features -p microsandbox-filesystem --target aarch64-apple-darwin
+
+      - name: Check Windows filesystem backend
+        run: cargo +stable check --no-default-features -p microsandbox-filesystem --target x86_64-pc-windows-msvc
 
   windows-build:
     name: Build Windows ${{ matrix.component }} (${{ matrix.target }})

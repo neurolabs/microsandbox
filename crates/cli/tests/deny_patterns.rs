@@ -2,9 +2,8 @@
 //!
 //! The CLI delegates `deny` validation to the shared
 //! `microsandbox_types::validate_deny_list` (via the SDK/runtime), so it must
-//! produce the same disposition as every other SDK for the fixture matrix.
-
-use std::path::PathBuf;
+//! produce the same disposition as every other SDK for the fixture matrix,
+//! embedded here as `microsandbox_types::fixtures::DENY_FIXTURE_JSON`.
 
 use serde::Deserialize;
 
@@ -15,29 +14,9 @@ struct Case {
     expect: String,
 }
 
-/// Locate the shared fixture by walking up from this crate's manifest directory
-/// until a directory containing `sdk/rust/tests/fixtures/deny/patterns.json` is
-/// found. Resolving from the workspace root this way fails clearly if the
-/// fixture moves, instead of relying on a fixed `../../` depth.
-fn fixture_path() -> PathBuf {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for dir in manifest.ancestors() {
-        let candidate = dir.join("sdk/rust/tests/fixtures/deny/patterns.json");
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    panic!(
-        "shared deny fixture not found in any ancestor of {}",
-        manifest.display()
-    );
-}
-
 fn fixture_cases() -> Vec<Case> {
-    let path = fixture_path();
-    let raw = std::fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
-    serde_json::from_str(&raw).unwrap()
+    serde_json::from_str(microsandbox_types::fixtures::DENY_FIXTURE_JSON)
+        .expect("parse shared deny fixture")
 }
 
 #[test]

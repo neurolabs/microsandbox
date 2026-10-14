@@ -1,11 +1,9 @@
 //! Shared cross-SDK deny-pattern disposition fixture.
 //!
-//! `sdk/rust/tests/fixtures/deny/patterns.json` is the single source of the
-//! pattern -> disposition matrix. Every language SDK loads it and asserts that
-//! its own validation path produces the same `accept`/`reject` disposition, so
-//! a pattern accepted by one SDK is accepted (or refused) by all of them.
-
-use std::path::PathBuf;
+//! `microsandbox_types::fixtures::DENY_FIXTURE_JSON` embeds the single source of
+//! the pattern -> disposition matrix. Every language SDK loads it and asserts
+//! that its own validation path produces the same `accept`/`reject` disposition,
+//! so a pattern accepted by one SDK is accepted (or refused) by all of them.
 
 use serde::Deserialize;
 
@@ -30,10 +28,8 @@ struct Case {
 
 /// Load the shared deny-pattern fixture.
 fn fixture_cases() -> Vec<Case> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/deny/patterns.json");
-    let raw = std::fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
-    serde_json::from_str(&raw).unwrap()
+    serde_json::from_str(microsandbox_types::fixtures::DENY_FIXTURE_JSON)
+        .expect("parse shared deny fixture")
 }
 
 //--------------------------------------------------------------------------------------------------

@@ -1091,9 +1091,6 @@ async fn scoped_header_downgrade_refuses_without_changing_the_catalog() {
 }
 
 /// A real serialized `SandboxSpec` carrying a bind mount with a deny list.
-///
-/// Deserialized from the current persisted shape and re-serialized, so it is the
-/// exact production JSON an active catalog row holds, not a hand-built literal.
 fn bind_deny_config() -> String {
     let source = serde_json::json!({
         "name": "bind-deny-fixture",
