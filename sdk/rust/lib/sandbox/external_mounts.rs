@@ -838,7 +838,7 @@ mod tests {
         // captured pattern is still present.
         let mut config = SandboxBuilder::new("restore")
             .volume("/data", |m| {
-                m.bind("/tmp/d").deny(["*", "!*.txt", "secret.txt"])
+                m.bind("/tmp/d").deny(["*", "secret.txt", "!*.txt"])
             })
             .config
             .into_config();
