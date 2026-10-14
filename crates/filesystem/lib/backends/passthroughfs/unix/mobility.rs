@@ -1287,6 +1287,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn restore_does_not_abort_when_the_containing_directory_is_unreadable() {
         // A searchable-but-unreadable parent (mode `0111`) rejects `O_RDONLY`, but
         // the entry is still reachable through the `O_PATH` restore walk. Probing
