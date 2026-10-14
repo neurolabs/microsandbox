@@ -116,3 +116,75 @@ async fn deny_policy_survives_snapshot_restore_and_hides_the_path() {
     }
     cleanup(&child_name).await;
 }
+
+/// A full (execution-state) snapshot must capture and enforce the bind deny policy
+/// too. The disk path records it directly in the manifest, while the full path
+/// resolves external mounts from the checkpoint closure, so a regression there
+/// would silently re-expose a hidden path on restore.
+#[msb_test]
+async fn full_snapshot_captures_bind_deny_and_refuses_a_weakened_restore() {
+    let suffix = std::process::id();
+    let source_name = format!("deny-full-src-{suffix}");
+    let child_name = format!("deny-full-child-{suffix}");
+    let snapshot_name = format!("deny-full-snap-{suffix}");
+
+    let host = tempfile::tempdir().unwrap();
+    std::fs::write(host.path().join(".env"), b"secret").unwrap();
+    std::fs::write(host.path().join("visible.txt"), b"ok").unwrap();
+
+    cleanup(&source_name).await;
+    cleanup(&child_name).await;
+
+    let source = Sandbox::builder(&source_name)
+        .image("alpine:3.20")
+        .cpus(1)
+        .memory(512)
+        .replace()
+        .volume("/data", |mount| mount.bind(host.path()).deny([".env"]))
+        .create()
+        .await
+        .expect("create deny-bearing source");
+
+    // Full capture requires the source to be running, so snapshot before stopping.
+    let snapshot = Snapshot::builder(&snapshot_name)
+        .from_sandbox(&source_name)
+        .full()
+        .create()
+        .await
+        .expect("full snapshot");
+
+    // The full manifest resolves external mounts from the closure, but the deny
+    // policy must still be recorded for restore to compare.
+    let policies = snapshot
+        .manifest()
+        .external_mount_policies()
+        .expect("read captured deny policy");
+    let has_policy = policies.as_ref().is_some_and(|policies| {
+        policies
+            .iter()
+            .any(|policy| policy.guest_path == "/data" && policy.deny == [".env".to_string()])
+    });
+    assert!(
+        has_policy,
+        "full snapshot must capture the bind deny policy: {policies:?}"
+    );
+
+    let _ = source.stop().await;
+    cleanup(&source_name).await;
+
+    // A full restore that drops the captured deny list must be refused.
+    let weakened = Sandbox::restore(&snapshot_name)
+        .name(&child_name)
+        .volume("/data", |mount| mount.bind(host.path()))
+        .restore()
+        .await;
+    let error = weakened
+        .err()
+        .expect("full restore that drops the captured deny list must be refused")
+        .to_string();
+    assert!(
+        error.contains("weaken bind-mount deny policy"),
+        "refusal must name the weakened deny policy: {error}"
+    );
+    cleanup(&child_name).await;
+}

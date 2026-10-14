@@ -1002,6 +1002,13 @@ async fn capture_full_snapshot(
         // so restores do not step that timeline to host time unless they ask to.
         manifest.set_guest_clock(sandbox_config.spec.runtime.guest_clock.unwrap_or_default())?;
         manifest.set_owned_volumes(closure.checkpoint().owned_volumes.clone())?;
+        // A full snapshot resolves external mounts from the checkpoint closure, not
+        // from the manifest, so the guest paths stay unrecorded. The deny policy must
+        // still be captured: restore compares it even when the mapping comes from the
+        // closure, so without it a destination bind with a dropped deny list would
+        // silently re-expose a hidden path.
+        manifest
+            .set_external_mount_policies(captured_mount_policies(&sandbox_config.spec.mounts)?)?;
         manifest
             .validate()
             .map_err(|error| MicrosandboxError::SnapshotIntegrity(error.to_string()))?;
