@@ -848,7 +848,7 @@ msb snap restore worker:snap --name child -v /host/project:/work:deny=.env
 ```
 </CodeGroup>
 
-Snapshots written before deny capture, and snapshots whose mounts carry no deny list, record no captured policy. Restore treats that as unknown and continues, so older snapshots keep restoring as before. A disk-only restore that boots fresh still enforces the destination deny list on the new mount.
+Snapshots written before deny capture, and snapshots whose mounts carry no deny list, record no captured policy. Restore treats that as unknown and continues, so older snapshots keep restoring as before. A disk-only restore that boots fresh still enforces the destination deny list on the new mount. Conversely, a deny-bearing snapshot marks its policy as must-understand, so an SDK or CLI that predates bind deny refuses to restore it rather than silently dropping the policy.
 
 Direct forking children do not inherit host binds by default: when a child does not inherit resources it must re-declare a deny-bearing bind with a deny list at least as strict as the source's. Restoring on the same host with inherited resources reconnects the source mount and keeps its deny list.
 

@@ -12,6 +12,13 @@ use crate::error::{SnapshotManifestError, SnapshotManifestResult};
 /// Optional (not must-understand) key listing guest paths whose host-side backing is not captured.
 pub const EXTERNAL_MOUNTS_EXTENSION: &str = "microsandbox.external-mounts";
 
+/// Must-understand key carrying the captured bind-mount deny policy.
+///
+/// Kept separate from [`EXTERNAL_MOUNTS_EXTENSION`] so an older reader refuses a
+/// deny-bearing snapshot rather than silently restoring a destination that drops
+/// the policy, while a deny-free snapshot stays byte-identical and advisory.
+pub const BIND_MOUNT_DENY_EXTENSION: &str = "microsandbox.bind-mount-deny";
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -19,19 +26,19 @@ pub const EXTERNAL_MOUNTS_EXTENSION: &str = "microsandbox.external-mounts";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ExternalMountsExtension {
     guest_paths: Vec<String>,
-    /// Captured host-side deny policy per guest path.
-    ///
-    /// Additive and omitted when no mount carries a deny list, so a deny-less
-    /// manifest keeps the exact bytes an older reader already released.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+}
+
+/// Captured bind-mount deny policy carried under its own must-understand key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct BindMountDenyExtension {
     policies: Vec<ExternalMountPolicy>,
 }
 
 /// A captured bind-mount host-side deny policy, keyed by guest path.
 ///
-/// Only bind mounts carry a deny list today; the policy is recorded separately
-/// from the guest paths so a restore can detect a weakened deny list without
-/// changing the digest of snapshots that carry none.
+/// Only bind mounts carry a deny list today; the policy is recorded under a
+/// must-understand extension so an older reader refuses a deny-bearing snapshot
+/// instead of silently restoring a destination that drops the policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalMountPolicy {
     /// Guest mount path the policy applies to.
@@ -60,11 +67,8 @@ impl Manifest {
             return Ok(());
         }
 
-        let value = serde_json::to_value(ExternalMountsExtension {
-            guest_paths,
-            policies: Vec::new(),
-        })
-        .map_err(|error| SnapshotManifestError::ManifestParse(error.to_string()))?;
+        let value = serde_json::to_value(ExternalMountsExtension { guest_paths })
+            .map_err(|error| SnapshotManifestError::ManifestParse(error.to_string()))?;
         self.extensions
             .insert(EXTERNAL_MOUNTS_EXTENSION.into(), value);
 
@@ -73,9 +77,11 @@ impl Manifest {
 
     /// Record the captured deny policy for each host-backed bind mount.
     ///
-    /// Must be called after [`Manifest::set_external_mounts`] so the recorded
-    /// guest paths remain the source of truth. A mount with an empty deny list
-    /// contributes no entry, so a deny-less snapshot keeps its released bytes.
+    /// Written under the must-understand [`BIND_MOUNT_DENY_EXTENSION`] and added
+    /// to `requires`, so an older reader refuses a deny-bearing snapshot rather
+    /// than restoring a destination that drops the policy. A mount with an empty
+    /// deny list contributes no entry and a deny-less snapshot keeps its released
+    /// bytes.
     pub fn set_external_mount_policies(
         &mut self,
         mut policies: Vec<ExternalMountPolicy>,
@@ -83,39 +89,38 @@ impl Manifest {
         policies.retain(|policy| !policy.deny.is_empty());
         policies.sort_by(|left, right| left.guest_path.cmp(&right.guest_path));
 
+        self.requires.retain(|key| key != BIND_MOUNT_DENY_EXTENSION);
+
         if policies.is_empty() {
+            self.extensions.remove(BIND_MOUNT_DENY_EXTENSION);
             return Ok(());
         }
 
-        let guest_paths = self.external_mounts()?;
-        let value = serde_json::to_value(ExternalMountsExtension {
-            guest_paths,
-            policies,
-        })
-        .map_err(|error| SnapshotManifestError::ManifestParse(error.to_string()))?;
+        let value = serde_json::to_value(BindMountDenyExtension { policies })
+            .map_err(|error| SnapshotManifestError::ManifestParse(error.to_string()))?;
         self.extensions
-            .insert(EXTERNAL_MOUNTS_EXTENSION.into(), value);
+            .insert(BIND_MOUNT_DENY_EXTENSION.into(), value);
+        self.requires.push(BIND_MOUNT_DENY_EXTENSION.into());
+        self.requires.sort();
+        self.requires.dedup();
 
         Ok(())
     }
 
-    /// Read the recorded deny policy; snapshots without the policy field record `None`.
+    /// Read the recorded deny policy; snapshots without the policy record `None`.
     ///
     /// `None` means the snapshot predates deny-policy capture (or carried no
     /// deny list); callers must treat it as unknown, never as an empty list.
     pub fn external_mount_policies(
         &self,
     ) -> SnapshotManifestResult<Option<Vec<ExternalMountPolicy>>> {
-        let Some(value) = self.extensions.get(EXTERNAL_MOUNTS_EXTENSION) else {
+        let Some(value) = self.extensions.get(BIND_MOUNT_DENY_EXTENSION) else {
             return Ok(None);
         };
-        if value.get("policies").is_none() {
-            return Ok(None);
-        }
 
-        let extension: ExternalMountsExtension =
+        let extension: BindMountDenyExtension =
             serde_json::from_value(value.clone()).map_err(|error| {
-                SnapshotManifestError::ManifestParse(format!("invalid external mounts: {error}"))
+                SnapshotManifestError::ManifestParse(format!("invalid bind mount deny: {error}"))
             })?;
 
         Ok(Some(extension.policies))

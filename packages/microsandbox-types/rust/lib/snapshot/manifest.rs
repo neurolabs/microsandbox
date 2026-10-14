@@ -44,6 +44,7 @@ pub const SUPPORTED_REQUIRES: &[&str] = &[
     super::GUEST_CLOCK_EXTENSION,
     super::RESTORE_DEFAULTS_EXTENSION,
     super::OWNED_VOLUMES_EXTENSION,
+    super::BIND_MOUNT_DENY_EXTENSION,
 ];
 
 //--------------------------------------------------------------------------------------------------
@@ -967,26 +968,47 @@ mod tests {
     }
 
     #[test]
-    fn external_mount_policies_are_additive_and_legacy_reads_as_unknown() {
-        use super::super::{EXTERNAL_MOUNTS_EXTENSION, ExternalMountPolicy};
+    fn bind_mount_deny_policy_is_a_required_extension_and_legacy_reads_as_unknown() {
+        use super::super::{
+            BIND_MOUNT_DENY_EXTENSION, EXTERNAL_MOUNTS_EXTENSION, ExternalMountPolicy,
+        };
 
         let mut manifest = descriptor();
         manifest.set_external_mounts(vec!["/data".into()]).unwrap();
 
-        // A deny-less capture adds no policy field and keeps the same bytes.
+        // A deny-less capture records no policy extension and keeps the released bytes.
         let without_policy = manifest.to_canonical_bytes().unwrap();
         assert_eq!(manifest.external_mount_policies().unwrap(), None);
         manifest.set_external_mount_policies(Vec::new()).unwrap();
         assert_eq!(manifest.to_canonical_bytes().unwrap(), without_policy);
+        assert!(manifest.requires.is_empty());
 
-        // A deny-bearing capture records the policy and round-trips.
+        // A deny-bearing capture records the policy under its own must-understand
+        // extension, so an older reader refuses the snapshot instead of silently
+        // restoring a destination that re-exposes the captured files.
         manifest
             .set_external_mount_policies(vec![ExternalMountPolicy {
                 guest_path: "/data".into(),
                 deny: vec![".env".into()],
             }])
             .unwrap();
-        let restored = Manifest::from_bytes(&manifest.to_canonical_bytes().unwrap()).unwrap();
+        assert!(
+            manifest
+                .requires
+                .iter()
+                .any(|key| key == BIND_MOUNT_DENY_EXTENSION),
+            "a deny-bearing snapshot must require its policy extension"
+        );
+        assert!(
+            manifest.extensions.contains_key(BIND_MOUNT_DENY_EXTENSION),
+            "the requirement must name a present extension"
+        );
+        assert!(manifest.unsupported_requires().is_empty());
+
+        // The guest paths stay in the advisory extension, independent of the policy.
+        assert_eq!(manifest.external_mounts().unwrap(), ["/data"]);
+
+        let mut restored = Manifest::from_bytes(&manifest.to_canonical_bytes().unwrap()).unwrap();
         assert_eq!(
             restored.external_mount_policies().unwrap(),
             Some(vec![ExternalMountPolicy {
@@ -995,12 +1017,23 @@ mod tests {
             }])
         );
 
+        // Clearing the policy removes both the extension and its requirement.
+        restored.set_external_mount_policies(Vec::new()).unwrap();
+        assert!(
+            !restored
+                .requires
+                .iter()
+                .any(|key| key == BIND_MOUNT_DENY_EXTENSION)
+        );
+        assert!(!restored.extensions.contains_key(BIND_MOUNT_DENY_EXTENSION));
+
         // A legacy extension without the field reads as unknown, never empty.
-        manifest.extensions.insert(
+        let mut legacy = descriptor();
+        legacy.extensions.insert(
             EXTERNAL_MOUNTS_EXTENSION.into(),
             serde_json::json!({ "guest_paths": ["/data"] }),
         );
-        assert_eq!(manifest.external_mount_policies().unwrap(), None);
+        assert_eq!(legacy.external_mount_policies().unwrap(), None);
     }
 
     #[test]
