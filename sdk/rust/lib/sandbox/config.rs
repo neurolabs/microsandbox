@@ -2719,6 +2719,7 @@ mod layering_tests {
             ssh: _,
             metrics: _,
             snapshots: _,
+            exec: _,
         } = crate::config::GlobalConfig::default();
         // Every global field is mapped here, excluded below, or handled separately.
         // Each mapped field has its own null semantics; omission always stays sparse.
@@ -2841,6 +2842,7 @@ mod layering_tests {
             json!({"paths":{"msb":"/host/msb"}}),
             json!({"runtime":{"block_writeback":{"mode":"off"}}}),
             json!({"registries":{"ca_certs":"/host/ca.pem"}}),
+            json!({"exec":{"buffer_bytes":1048576}}),
             json!({"ssh":{"inactivity_timeout_secs":30}}),
             json!({"metrics":{"capacity":128}}),
             json!({"snapshots":{"max_filesystem_state_mib":64}}),
