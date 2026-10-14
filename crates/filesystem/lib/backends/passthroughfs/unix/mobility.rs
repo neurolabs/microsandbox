@@ -709,15 +709,20 @@ fn reject_denied_restore_path(
     }
     let is_dir = pinned.metadata()?.file_type().is_dir();
     let relative = crate::backends::passthroughfs::deny::join_path(&saved.components);
-    // Case folding is a property of the directory the entry lives in, not of the
-    // mount root. Probe the entry's containing directory: the pinned fd is the
-    // entry itself and cannot reveal a casefolded parent, so using the mount-level
-    // setting would let a handle through that live lookup hides on a
-    // case-sensitive mount with a folded child directory.
+    // Case folding is a property of each directory the path crosses, not of the
+    // mount root. The pinned fd is the entry itself and cannot reveal a folded
+    // parent, so reopen the containing directory (and, for a path pattern, every
+    // ancestor) instead of using the mount-level setting. Otherwise a saved handle
+    // could be re-interned for a path that live lookup hides.
     let parent = &saved.components[..saved.components.len() - 1];
-    let parent_fd = open_components(fs, parent, directory_open_flags() | libc::O_NOFOLLOW)?;
-    let case_insensitive = fs.deny_case_insensitive_from_fd(parent_fd);
-    unsafe { libc::close(parent_fd) };
+    let case_insensitive = if fs.deny.needs_path_reconstruction() {
+        deny_path_case_insensitive_for_components(fs, parent)
+    } else {
+        let parent_fd = open_components(fs, parent, directory_open_flags() | libc::O_NOFOLLOW)?;
+        let case_insensitive = fs.deny_case_insensitive_from_fd(parent_fd);
+        unsafe { libc::close(parent_fd) };
+        case_insensitive
+    };
     if fs
         .deny
         .matches_path_with_case(relative.as_os_str().as_bytes(), is_dir, case_insensitive)
@@ -727,6 +732,50 @@ fn reject_denied_restore_path(
         ));
     }
     Ok(())
+}
+
+/// Case behavior for matching a path pattern against entries in the directory
+/// with the given mount-relative components.
+///
+/// Mirrors [`PassthroughFs::deny_path_case_insensitive`] for restore, where the
+/// destination inode table is not yet populated: reopen each directory the path
+/// crosses and fold if any of them does. A probe failure over-matches so restore
+/// stays fail-closed.
+#[cfg(target_os = "linux")]
+fn deny_path_case_insensitive_for_components(
+    fs: &PassthroughFs,
+    dir_components: &[Vec<u8>],
+) -> bool {
+    if fs.deny.is_empty() {
+        return false;
+    }
+    if fs.deny.default_case_insensitive() {
+        return true;
+    }
+    for end in 0..=dir_components.len() {
+        let Ok(fd) = open_components(
+            fs,
+            &dir_components[..end],
+            directory_open_flags() | libc::O_NOFOLLOW,
+        ) else {
+            return true;
+        };
+        let folds = fs.deny_case_insensitive_from_fd(fd);
+        unsafe { libc::close(fd) };
+        if folds {
+            return true;
+        }
+    }
+    false
+}
+
+/// Case behavior for matching a path pattern against entries in a directory.
+#[cfg(not(target_os = "linux"))]
+fn deny_path_case_insensitive_for_components(
+    fs: &PassthroughFs,
+    _dir_components: &[Vec<u8>],
+) -> bool {
+    fs.deny.default_case_insensitive()
 }
 
 fn rebuild(
@@ -795,7 +844,11 @@ fn rebuild(
         let fd = open_components(fs, components, directory_open_flags())?;
         let file = unsafe { File::from_raw_fd(fd) };
         verify_reopened(&file, saved.inode, verified)?;
-        let case_insensitive = fs.deny_case_insensitive_from_fd(file.as_raw_fd());
+        let case_insensitive = if fs.deny.needs_path_reconstruction() {
+            deny_path_case_insensitive_for_components(fs, components)
+        } else {
+            fs.deny_case_insensitive_from_fd(file.as_raw_fd())
+        };
         let snapshot = saved.entries.as_ref().map(|entries| DirSnapshot {
             entries: entries
                 .iter()

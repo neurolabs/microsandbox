@@ -342,7 +342,15 @@ fn build_snapshot(
     };
 
     // Filter out entries matching the deny list.
-    let case_insensitive = fs.deny_case_insensitive_from_fd(fd);
+    //
+    // A path pattern matches the whole mount-relative path, so fold when this
+    // directory or any ancestor folds; a basename pattern only depends on this
+    // directory's own case behavior.
+    let case_insensitive = if fs.deny.needs_path_reconstruction() {
+        fs.deny_path_case_insensitive(parent)
+    } else {
+        fs.deny_case_insensitive_from_fd(fd)
+    };
     entries.retain(|entry| {
         // A dir-only pattern (`node_modules/`) can only be enforced with a known
         // type. When the filesystem did not report one and the `fstatat` fallback

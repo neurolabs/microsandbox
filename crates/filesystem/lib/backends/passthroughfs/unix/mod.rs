@@ -550,7 +550,11 @@ impl PassthroughFs {
         if name == b"." || name == b".." {
             return false;
         }
-        let case_insensitive = self.deny_case_insensitive(parent);
+        let case_insensitive = if self.deny.needs_path_reconstruction() {
+            self.deny_path_case_insensitive(parent)
+        } else {
+            self.deny_case_insensitive(parent)
+        };
         if !self.deny.needs_path_reconstruction() {
             return self
                 .deny
@@ -653,6 +657,49 @@ impl PassthroughFs {
     /// Case behavior of the directory `dir_inode` for deny matching.
     #[cfg(not(target_os = "linux"))]
     fn deny_case_insensitive(&self, _dir_inode: u64) -> bool {
+        self.deny.default_case_insensitive()
+    }
+
+    /// Case behavior for matching a path pattern against an entry in `parent`.
+    ///
+    /// A path pattern matches the whole mount-relative path, so a casefold on
+    /// any directory the path crosses can change one of its components (Linux
+    /// ext4/btrfs set `FS_CASEFOLD_FL` per directory). Fold the comparison when
+    /// the entry's directory or any ancestor folds. This over-matches inside a
+    /// casefold tree, which is the safe direction: it can only hide more, never
+    /// re-expose a name the destination deny list hides.
+    #[cfg(target_os = "linux")]
+    fn deny_path_case_insensitive(&self, parent: u64) -> bool {
+        if self.deny.is_empty() {
+            return false;
+        }
+        if self.deny.default_case_insensitive() {
+            return true;
+        }
+        let mut current = parent;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            if self.deny_case_insensitive(current) {
+                return true;
+            }
+            if current == 1 || !seen.insert(current) {
+                return false;
+            }
+            let data = self.inodes.read().unwrap().get(&current).cloned();
+            let Some(data) = data else {
+                return false;
+            };
+            let next = data.anchor_parent.load(Ordering::Acquire);
+            if next == 0 {
+                return false;
+            }
+            current = next;
+        }
+    }
+
+    /// Case behavior for matching a path pattern against an entry in `parent`.
+    #[cfg(not(target_os = "linux"))]
+    fn deny_path_case_insensitive(&self, _parent: u64) -> bool {
         self.deny.default_case_insensitive()
     }
 

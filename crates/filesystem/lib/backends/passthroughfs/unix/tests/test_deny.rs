@@ -57,6 +57,46 @@ fn test_deny_case_variant_matches_host_case_capability() {
 }
 
 //--------------------------------------------------------------------------------------------------
+// Tests: a path pattern folds with the case of every directory it crosses
+//--------------------------------------------------------------------------------------------------
+
+/// A path pattern must match a differently-cased component whose containing
+/// directory folds case, even when a deeper directory is case-sensitive. On a
+/// case-sensitive mount root, `fold` carries `FS_CASEFOLD_FL`, so the guest
+/// resolves `fold/data` to `fold/Data`; a deny path `fold/data/secret` must still
+/// hide the file once `fold`'s fold is known.
+#[test]
+fn test_deny_path_pattern_folds_with_ancestor_directory() {
+    let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
+        deny: vec!["fold/data/secret".to_string()],
+        // A path pattern is only admitted on a read-only mount.
+        readonly: true,
+        ..cfg
+    });
+    sb.host_create_file("fold/Data/secret", b"hidden");
+
+    let fold = sb.fs.lookup(sb.ctx(), ROOT_INODE, c"fold").unwrap().inode;
+    let data = sb.fs.lookup(sb.ctx(), fold, c"Data").unwrap().inode;
+
+    // With `fold` treated as case-sensitive (its real flag unknown here), the
+    // differently-cased intermediate component does not match.
+    assert!(
+        sb.fs.lookup(sb.ctx(), data, c"secret").is_ok(),
+        "a case-sensitive ancestor must not fold an intermediate path component"
+    );
+
+    // Simulate `FS_CASEFOLD_FL` on `fold`: the same lookup must now be denied.
+    {
+        let inodes = sb.fs.inodes.read().unwrap();
+        inodes.get(&fold).unwrap().case_insensitive.store(
+            crate::backends::passthroughfs::deny::CASE_INSENSITIVE,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    TestSandbox::assert_errno(sb.fs.lookup(sb.ctx(), data, c"secret"), LINUX_ENOENT);
+}
+
+//--------------------------------------------------------------------------------------------------
 // Tests: structural `.`/`..` entries are never denied
 //--------------------------------------------------------------------------------------------------
 
