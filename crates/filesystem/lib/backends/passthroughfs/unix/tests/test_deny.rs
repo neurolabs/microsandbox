@@ -27,26 +27,33 @@ fn test_deny_basename_lookup() {
 // Tests: case-sensitivity follows the host mount capability
 //--------------------------------------------------------------------------------------------------
 
-/// On a case-sensitive mount/filesystem (the default for the Linux test temp dir),
-/// deny matching stays byte-exact: `.env` does not hide a differently-cased
-/// `.ENV`, because the host would treat those as distinct files. Over-folding
-/// here would wrongly hide legitimate distinct files.
+/// Deny matching follows the host's actual case capability: on a case-sensitive
+/// mount `.env` does not hide a differently-cased `.ENV` (the host treats them as
+/// distinct files, so over-folding would wrongly hide a legitimate file), while on
+/// a case-insensitive mount the pattern folds and hides it.
+///
+/// The expectation is derived from the mount probe instead of assuming a
+/// case-sensitive temp dir: default APFS/HFS+ (macOS) and FAT are
+/// case-insensitive, so a hard-coded expectation fails on those hosts.
 #[test]
-fn test_deny_case_variant_not_hidden_on_case_sensitive_mount() {
+fn test_deny_case_variant_matches_host_case_capability() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
         deny: vec![".env".to_string()],
         ..cfg
     });
     sb.host_create_file(".ENV", b"case variant");
 
-    // On a case-sensitive root the differently-cased name is a distinct file
-    // and is served. On a case-insensitive host the probe folds and this lookup
-    // would be ENOENT; that branch is covered by the Windows test suite.
-    let entry = sb.lookup_root(".ENV");
-    assert!(
-        entry.is_ok(),
-        "case-sensitive host must not fold a denied basename over a distinct file"
-    );
+    if sb.fs.deny.default_case_insensitive() {
+        // The mount folds case, so `.ENV` and `.env` are the same file and the
+        // denied basename hides it.
+        TestSandbox::assert_errno(sb.lookup_root(".ENV"), LINUX_ENOENT);
+    } else {
+        let entry = sb.lookup_root(".ENV");
+        assert!(
+            entry.is_ok(),
+            "case-sensitive host must not fold a denied basename over a distinct file"
+        );
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
