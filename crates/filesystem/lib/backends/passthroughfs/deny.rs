@@ -65,6 +65,17 @@ pub(crate) const CASE_INSENSITIVE: u8 = 2;
 // Types
 //--------------------------------------------------------------------------------------------------
 
+/// Result of matching a name or path against one case variant of the list.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CaseMatch {
+    /// A deny pattern matched last: the entry is hidden.
+    Ignore,
+    /// A negation (`!`) matched last: the entry is explicitly allowed.
+    Allow,
+    /// No pattern matched.
+    Nothing,
+}
+
 /// A matcher for a bind-mount `deny` list of gitignore-style patterns.
 ///
 /// Wraps [`ignore::gitignore::Gitignore`]. The matcher is never empty; an
@@ -309,6 +320,16 @@ impl DenyList {
 
     /// [`Self::matches_path`] with an explicit case setting for the directory
     /// the entry lives in.
+    ///
+    /// When folding is forced by a casefold directory on an otherwise
+    /// case-sensitive mount (`case_insensitive` is `true` while the mount default
+    /// is case-sensitive), the whole path is folded. That is safe for deny rules
+    /// (it can only hide more) but would broaden an `!` allow rule: folding a
+    /// negation lets it rescue a differently-cased sibling the deny rule hides.
+    /// An allow may therefore only rescue a folded match when it also wins
+    /// without folding, so a per-directory fold can never re-expose a path. On a
+    /// mount that folds case uniformly the whole-mount fold is correct and a
+    /// negation folds as git's `core.ignorecase` does.
     pub(crate) fn matches_path_with_case(
         &self,
         rel: &[u8],
@@ -317,6 +338,20 @@ impl DenyList {
     ) -> bool {
         if is_structural_entry(rel) {
             return false;
+        }
+        if case_insensitive && !self.default_case_insensitive {
+            return match self.case_match(rel, is_dir, true) {
+                // Denied under folding: keep it hidden.
+                CaseMatch::Ignore => true,
+                // Nothing matched even when folded: not denied.
+                CaseMatch::Nothing => false,
+                // A negation won under folding. Trust it only when a negation
+                // also wins byte-exactly, so folding a negation cannot rescue a
+                // differently-cased sibling of a denied path.
+                CaseMatch::Allow => {
+                    !matches!(self.case_match(rel, is_dir, false), CaseMatch::Allow)
+                }
+            };
         }
         self.is_ignored_bytes(rel, is_dir, case_insensitive)
     }
@@ -346,23 +381,41 @@ impl DenyList {
     }
 
     fn is_ignored_bytes(&self, bytes: &[u8], is_dir: bool, case_insensitive: bool) -> bool {
+        matches!(
+            self.case_match(bytes, is_dir, case_insensitive),
+            CaseMatch::Ignore
+        )
+    }
+
+    /// Match `bytes` (a component name or mount-relative path) against the list
+    /// with the given case setting, distinguishing a negation win from no match.
+    ///
+    /// Fails closed: a casefold directory that cannot fold a non-ASCII pattern,
+    /// or a name that cannot be decoded into a path, reports
+    /// [`CaseMatch::Ignore`] so the entry is never exposed by a matcher that
+    /// could not evaluate it.
+    fn case_match(&self, bytes: &[u8], is_dir: bool, case_insensitive: bool) -> CaseMatch {
         let matcher = if case_insensitive {
             // A casefold directory on a case-sensitive mount cannot safely fold
             // a non-ASCII pattern (`matcher_insensitive` is `None`); deny it
             // rather than under-match.
             match &self.matcher_insensitive {
                 Some(matcher) => matcher,
-                None => return true,
+                None => return CaseMatch::Ignore,
             }
         } else {
             &self.matcher_sensitive
         };
         match name_as_path(bytes) {
-            Some(path) => matches!(matcher.matched(path, is_dir), Match::Ignore(_)),
+            Some(path) => match matcher.matched(path, is_dir) {
+                Match::Ignore(_) => CaseMatch::Ignore,
+                Match::Whitelist(_) => CaseMatch::Allow,
+                Match::None => CaseMatch::Nothing,
+            },
             // A name that cannot be decoded into a path (non-Unix invalid
             // UTF-8) can never be matched; deny it rather than let it bypass the
             // deny list. Fail closed.
-            None => true,
+            None => CaseMatch::Ignore,
         }
     }
 }
@@ -992,5 +1045,42 @@ mod tests {
         assert!(list.matches_basename(b"other.txt", false));
         assert!(!list.matches_basename(b"keep.txt", false));
         assert!(list.matches_basename(b".env", false));
+    }
+
+    #[test]
+    fn ancestor_fold_does_not_broaden_a_negation() {
+        // `fold` folds case on an otherwise case-sensitive mount, but `Data` does
+        // not, so `secret` and `SECRET` are distinct files. The deny must hide
+        // `secret` even though the allow rule targets `SECRET`; folding the
+        // negation must not rescue the differently-cased sibling.
+        let patterns = vec![
+            "fold/Data/secret".to_string(),
+            "!fold/Data/SECRET".to_string(),
+        ];
+        let list = DenyList::build(&patterns, false).unwrap();
+
+        assert!(list.matches_path_with_case(b"fold/DATA/secret", false, true));
+        // The allow rule itself only resolves by folding, so the conservative
+        // rule also hides its own spelling rather than risk exposing a sibling.
+        assert!(list.matches_path_with_case(b"fold/DATA/SECRET", false, true));
+    }
+
+    #[test]
+    fn ancestor_fold_keeps_an_exactly_matching_allowlist() {
+        // An allow rule that wins byte-exactly stays effective under a
+        // per-directory fold; only negations that need folding are distrusted.
+        let patterns = vec!["sub/*".to_string(), "!sub/keep.txt".to_string()];
+        let list = DenyList::build(&patterns, false).unwrap();
+
+        assert!(!list.matches_path_with_case(b"sub/keep.txt", false, true));
+        assert!(list.matches_path_with_case(b"sub/other.txt", false, true));
+    }
+
+    #[test]
+    fn uniform_case_insensitive_mount_folds_a_negation() {
+        // On a mount that folds case uniformly, `secret` and `SECRET` are the same
+        // entry, so the differently-cased allow rule must still apply.
+        let list = DenyList::build(&["secret".to_string(), "!SECRET".to_string()], true).unwrap();
+        assert!(!list.matches_path_with_case(b"secret", false, true));
     }
 }
