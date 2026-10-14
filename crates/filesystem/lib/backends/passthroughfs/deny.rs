@@ -54,6 +54,13 @@ const CASE_VALIDATION_PREFIX: &str = "msbcaseprobe";
 /// the process, so concurrent builders on the same mount root do not collide.
 static CASE_PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Per-directory casefold state has not been probed yet.
+pub(crate) const CASE_UNKNOWN: u8 = 0;
+/// The directory matches case-sensitively.
+pub(crate) const CASE_SENSITIVE: u8 = 1;
+/// The directory folds case (`FS_CASEFOLD_FL` set).
+pub(crate) const CASE_INSENSITIVE: u8 = 2;
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -63,14 +70,28 @@ static CASE_PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Wraps [`ignore::gitignore::Gitignore`]. The matcher is never empty; an
 /// empty deny list matches nothing.
 ///
-/// Matching honors the case-sensitivity of the mount root's filesystem. When
-/// the root sits on a case-insensitive filesystem (Windows NTFS, default
-/// macOS APFS, etc.), patterns and candidate names are folded so a pattern like
-/// `.env` also hides `.ENV` and `.Env`; otherwise matching is byte-exact. This
+/// Matching honors the case-sensitivity of the *directory being matched*. Two
+/// compiled variants are built from the same patterns: a byte-exact one and a
+/// case-insensitive one. The mount default comes from the root's filesystem
+/// (Windows NTFS and default macOS APFS fold case; a Linux writable mount is
+/// probed and a read-only one inferred from its type), while Linux
+/// casefold-capable filesystems (ext4/btrfs) can fold per directory via
+/// `FS_CASEFOLD_FL`, so the caller selects the variant per directory. This
 /// mirrors git's `core.ignorecase` behavior for `.gitignore`.
 #[derive(Debug)]
 pub(crate) struct DenyList {
-    matcher: Gitignore,
+    /// Byte-exact matcher, used when the matched directory does not fold case.
+    matcher_sensitive: Gitignore,
+    /// Case-insensitive matcher, used when the matched directory folds case.
+    ///
+    /// `None` when a non-ASCII pattern is present on a case-sensitive mount: the
+    /// `ignore` crate folds ASCII-only, so such a pattern cannot be matched
+    /// case-insensitively. A casefold directory then fails closed instead
+    /// (`is_ignored_bytes` returns `true`) rather than falling back to an
+    /// under-matching insensitive matcher.
+    matcher_insensitive: Option<Gitignore>,
+    /// Whether the mount root itself folds case (see the type docs).
+    default_case_insensitive: bool,
     /// Whether any pattern needs the full mount-relative path (has an interior
     /// `/`, i.e. a separator that is not merely a trailing dir-only marker).
     ///
@@ -123,20 +144,26 @@ impl DenyList {
         Self::build(patterns, case_insensitive)
     }
 
-    /// Build a matcher with an explicit case-sensitivity setting.
+    /// Build a matcher with an explicit mount-root case setting.
     ///
-    /// Case-insensitivity must be configured *before* the globs are added: the
-    /// `ignore` crate compiles each glob with the builder's current setting, and
-    /// a later change only affects globs added afterward. Setting it after the
-    /// loop would silently leave matching case-sensitive on NTFS/APFS.
-    fn build(patterns: &[String], case_insensitive: bool) -> io::Result<Self> {
-        let mut builder = GitignoreBuilder::new(Path::new("/"));
-        builder.case_insensitive(case_insensitive).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("failed to configure deny matcher: {err}"),
-            )
-        })?;
+    /// Both the case-sensitive and case-insensitive variants are compiled here,
+    /// before any matching, so a later per-directory casefold decision (Linux
+    /// ext4/btrfs) only selects between already-initialized matchers. Case
+    /// behavior must be configured *before* the globs are added: the `ignore`
+    /// crate compiles each glob with the builder's current setting, and a later
+    /// change only affects globs added afterward.
+    fn build(patterns: &[String], default_case_insensitive: bool) -> io::Result<Self> {
+        // A mount root that already folds case cannot match a non-ASCII pattern
+        // case-insensitively (`ignore` folds ASCII-only), so reject it rather
+        // than silently under-match.
+        if default_case_insensitive {
+            for pattern in patterns {
+                if !pattern.is_ascii() {
+                    return Err(non_ascii_case_error(pattern));
+                }
+            }
+        }
+
         let mut needs_path_reconstruction = false;
         let mut has_dir_only_patterns = false;
         for pattern in patterns {
@@ -152,22 +179,39 @@ impl DenyList {
                     format!("invalid deny pattern {pattern:?}: {err}"),
                 )
             })?;
-            // The `ignore` crate folds globs with ASCII-only case-folding, so a
-            // non-ASCII pattern cannot be matched case-insensitively: a pattern
-            // like `café` would silently fail to hide `CAFÉ`. Reject it on a
-            // case-insensitive mount rather than under-match.
-            if case_insensitive && !pattern.is_ascii() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "deny pattern {pattern:?} contains non-ASCII characters, which cannot be \
-                         matched case-insensitively on this filesystem; use an ASCII pattern or a \
-                         case-sensitive mount"
-                    ),
-                ));
-            }
             needs_path_reconstruction |= pattern.trim_end_matches('/').contains('/');
             has_dir_only_patterns |= pattern.ends_with('/');
+        }
+
+        let matcher_sensitive = Self::compile(patterns, false)?;
+        // The insensitive variant is only built when every pattern folds
+        // correctly (ASCII); otherwise a casefold directory fails closed.
+        let matcher_insensitive = patterns
+            .iter()
+            .all(|pattern| pattern.is_ascii())
+            .then(|| Self::compile(patterns, true))
+            .transpose()?;
+
+        Ok(Self {
+            matcher_sensitive,
+            matcher_insensitive,
+            default_case_insensitive,
+            needs_path_reconstruction,
+            has_dir_only_patterns,
+            empty: patterns.is_empty(),
+        })
+    }
+
+    /// Compile every pattern into one [`Gitignore`] with the given case setting.
+    fn compile(patterns: &[String], case_insensitive: bool) -> io::Result<Gitignore> {
+        let mut builder = GitignoreBuilder::new(Path::new("/"));
+        builder.case_insensitive(case_insensitive).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("failed to configure deny matcher: {err}"),
+            )
+        })?;
+        for pattern in patterns {
             builder.add_line(None, pattern).map_err(|err| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -175,17 +219,11 @@ impl DenyList {
                 )
             })?;
         }
-        let matcher = builder.build().map_err(|err| {
+        builder.build().map_err(|err| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("failed to build deny matcher: {err}"),
             )
-        })?;
-        Ok(Self {
-            matcher,
-            needs_path_reconstruction,
-            has_dir_only_patterns,
-            empty: patterns.is_empty(),
         })
     }
 
@@ -204,6 +242,12 @@ impl DenyList {
         self.has_dir_only_patterns
     }
 
+    /// The mount-root case behavior, used when a directory's casefold state is
+    /// unknown or the caller has no directory to probe.
+    pub(crate) fn default_case_insensitive(&self) -> bool {
+        self.default_case_insensitive
+    }
+
     /// Whether the single entry `name` matches the deny list.
     ///
     /// Only meaningful when [`Self::needs_path_reconstruction`] is `false`; a
@@ -219,7 +263,28 @@ impl DenyList {
     /// full mount-relative path, so silently calling this with path patterns
     /// would let a matching path slip through — the deny check must fall back
     /// to [`Self::matches_path`] instead.
+    ///
+    /// The Windows backend matches without a directory to probe, so it uses this
+    /// mount-default variant; the Unix backends select per directory via
+    /// [`Self::matches_basename_with_case`], leaving this reachable on non-Windows
+    /// only from tests.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn matches_basename(&self, name: &[u8], is_dir: bool) -> bool {
+        self.matches_basename_with_case(name, is_dir, self.default_case_insensitive)
+    }
+
+    /// [`Self::matches_basename`] with an explicit case setting for the directory
+    /// the entry lives in.
+    ///
+    /// Linux ext4/btrfs can enable case folding per directory, so callers that
+    /// can observe the directory's `FS_CASEFOLD_FL` pass it here instead of the
+    /// mount default.
+    pub(crate) fn matches_basename_with_case(
+        &self,
+        name: &[u8],
+        is_dir: bool,
+        case_insensitive: bool,
+    ) -> bool {
         debug_assert!(!self.needs_path_reconstruction);
         // `.` and `..` are structural entries; denying them would break path
         // walks and directory listings. Exempt them here so every caller gets
@@ -227,7 +292,7 @@ impl DenyList {
         if is_structural_entry(name) {
             return false;
         }
-        self.is_ignored_bytes(name, is_dir)
+        self.is_ignored_bytes(name, is_dir, case_insensitive)
     }
 
     /// Whether the full mount-relative path `rel` (relative to the mount root)
@@ -238,10 +303,21 @@ impl DenyList {
     /// `is_dir` reports whether the entry is a directory; see
     /// [`Self::matches_basename`].
     pub(crate) fn matches_path(&self, rel: &[u8], is_dir: bool) -> bool {
+        self.matches_path_with_case(rel, is_dir, self.default_case_insensitive)
+    }
+
+    /// [`Self::matches_path`] with an explicit case setting for the directory
+    /// the entry lives in.
+    pub(crate) fn matches_path_with_case(
+        &self,
+        rel: &[u8],
+        is_dir: bool,
+        case_insensitive: bool,
+    ) -> bool {
         if is_structural_entry(rel) {
             return false;
         }
-        self.is_ignored_bytes(rel, is_dir)
+        self.is_ignored_bytes(rel, is_dir, case_insensitive)
     }
 
     /// Whether a single entry `name` directly under the mount-relative directory
@@ -268,9 +344,20 @@ impl DenyList {
         self.matches_path(rel.as_bytes(), is_dir)
     }
 
-    fn is_ignored_bytes(&self, bytes: &[u8], is_dir: bool) -> bool {
+    fn is_ignored_bytes(&self, bytes: &[u8], is_dir: bool, case_insensitive: bool) -> bool {
+        let matcher = if case_insensitive {
+            // A casefold directory on a case-sensitive mount cannot safely fold
+            // a non-ASCII pattern (`matcher_insensitive` is `None`); deny it
+            // rather than under-match.
+            match &self.matcher_insensitive {
+                Some(matcher) => matcher,
+                None => return true,
+            }
+        } else {
+            &self.matcher_sensitive
+        };
         match name_as_path(bytes) {
-            Some(path) => matches!(self.matcher.matched(path, is_dir), Match::Ignore(_)),
+            Some(path) => matches!(matcher.matched(path, is_dir), Match::Ignore(_)),
             // A name that cannot be decoded into a path (non-Unix invalid
             // UTF-8) can never be matched; deny it rather than let it bypass the
             // deny list. Fail closed.
@@ -314,7 +401,11 @@ fn mount_is_case_insensitive(_root: &Path, _readonly: bool) -> bool {
 /// FAT: insensitive.
 /// NTFS: insensitive by default, can be configured per directory.
 ///
-/// We don't detect case sensitivity per directory, but per mount.
+/// This detects the *mount root's* case behavior. Linux ext4/btrfs can enable
+/// case folding on individual directories regardless of the root, so the Unix
+/// backend additionally probes `FS_CASEFOLD_FL` per directory (see
+/// [`dir_is_casefold`]) and selects the matcher's case-insensitive variant for a
+/// folding directory.
 ///
 /// On writable mounts this uses git's `core.ignorecase` probe: create a probe
 /// file with a known mixed-case name, then check whether a case variant of
@@ -336,16 +427,21 @@ fn mount_is_case_insensitive(root: &Path, readonly: bool) -> bool {
     let seq = CASE_PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
     let probe_name = format!("{CASE_PROBE_PREFIX}-{}-{seq}", std::process::id());
     let validation_name = format!("{}-{}-{seq}", CASE_VALIDATION_PREFIX, std::process::id());
-    let probe = ProbeFile {
-        path: root.join(&probe_name),
-    };
+    let probe_path = root.join(&probe_name);
     let validation = root.join(&validation_name);
 
     let result = (|| -> std::io::Result<bool> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&probe.path)?;
+            .open(&probe_path)?;
+        // Create the cleanup guard only after `create_new` succeeded. If the
+        // probe name already exists (a leftover from an interrupted process
+        // whose PID was reused), `open` fails and dropping a guard built before
+        // it would delete that pre-existing host file.
+        let _guard = ProbeFile {
+            path: probe_path.clone(),
+        };
         std::io::Write::write_all(&mut file, b"probe")?;
         // If the case-flipped name resolves, the same file was found by a
         // differently-cased name, so the filesystem is case-insensitive.
@@ -427,6 +523,44 @@ fn is_structural_entry(name: &[u8]) -> bool {
     name == b"." || name == b".."
 }
 
+/// Error for a non-ASCII pattern that must be matched case-insensitively.
+///
+/// `ignore` folds ASCII-only, so a non-ASCII pattern would silently fail to
+/// hide a differently-cased name. Rejecting it is the only honest option.
+fn non_ascii_case_error(pattern: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "deny pattern {pattern:?} contains non-ASCII characters, which cannot be \
+             matched case-insensitively on this filesystem; use an ASCII pattern or a \
+             case-sensitive mount"
+        ),
+    )
+}
+
+/// Read the `FS_CASEFOLD_FL` flag from an open directory descriptor.
+///
+/// Case folding is a per-directory property on casefold-capable filesystems
+/// (ext4/btrfs), so the deny matcher consults the directory itself instead of
+/// trusting the mount-level filesystem type. Returns `None` when the flags
+/// cannot be read (for example a filesystem that does not implement
+/// `FS_IOC_GETFLAGS`), so callers fall back to the mount-level case behavior.
+#[cfg(target_os = "linux")]
+pub(crate) fn dir_is_casefold(fd: std::os::fd::RawFd) -> Option<bool> {
+    // `FS_IOC_GETFLAGS` = `_IOR('f', 1, long)`; `FS_CASEFOLD_FL` is a kernel
+    // inode flag shared by ext4 and btrfs.
+    const FS_IOC_GETFLAGS: libc::c_ulong = 0x8008_6601;
+    const FS_CASEFOLD_FL: libc::c_long = 0x4000_0000;
+
+    let mut flags: libc::c_long = 0;
+    let ret = unsafe { libc::ioctl(fd, FS_IOC_GETFLAGS, &mut flags as *mut libc::c_long) };
+    if ret == 0 {
+        Some(flags & FS_CASEFOLD_FL != 0)
+    } else {
+        None
+    }
+}
+
 /// Build a `Path` from raw entry-name bytes.
 ///
 /// On Unix the bytes are used verbatim (arbitrary non-UTF8 names are legal);
@@ -488,6 +622,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn probe_file_guard_removes_file_on_drop() {
         // The RAII guard must remove the probe file on every exit path,
         // including an early `?` return from the write/probe sequence.
@@ -559,6 +694,44 @@ mod tests {
         let path_patterns = vec!["sub/.env".to_string()];
         let insensitive = DenyList::build(&path_patterns, true).unwrap();
         assert!(insensitive.matches_path(b"sub/.ENV", false));
+    }
+
+    #[test]
+    fn per_directory_casefold_selects_insensitive_matcher() {
+        // A mount whose root is case-sensitive can still contain a casefold
+        // directory (Linux ext4/btrfs `FS_CASEFOLD_FL`). The caller selects the
+        // compiled variant per directory, so the same `DenyList` hides `.ENV`
+        // only inside the folding directory.
+        let list = DenyList::build(&[".env".to_string()], false).unwrap();
+
+        // Mount-default (case-sensitive) directory: byte-exact.
+        assert!(!list.matches_basename_with_case(b".ENV", false, false));
+        assert!(list.matches_basename_with_case(b".env", false, false));
+
+        // Casefold directory: the insensitive variant folds.
+        assert!(list.matches_basename_with_case(b".ENV", false, true));
+        assert!(list.matches_basename_with_case(b".env", false, true));
+
+        // Path matching selects the same way.
+        let path_list = DenyList::build(&["sub/.env".to_string()], false).unwrap();
+        assert!(!path_list.matches_path_with_case(b"sub/.ENV", false, false));
+        assert!(path_list.matches_path_with_case(b"sub/.ENV", false, true));
+    }
+
+    #[test]
+    fn casefold_directory_with_non_ascii_pattern_fails_closed() {
+        // `ignore` folds ASCII-only, so a non-ASCII pattern cannot be matched
+        // case-insensitively. On a case-sensitive mount such a pattern is valid,
+        // but a casefold directory must deny rather than fall back to an
+        // under-matching insensitive matcher.
+        let list = DenyList::build(&["café".to_string()], false).unwrap();
+
+        // Byte-exact matching on the sensitive default still works...
+        assert!(list.matches_basename(b"caf\xc3\xa9", false));
+        assert!(!list.matches_basename(b"other", false));
+
+        // ...but inside a casefold directory every name fails closed.
+        assert!(list.matches_basename_with_case(b"other", false, true));
     }
 
     #[test]

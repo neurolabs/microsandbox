@@ -332,6 +332,9 @@ fn do_lookup_linux(
         aliases: std::sync::RwLock::new(std::collections::BTreeSet::new()),
         anchor_children: std::sync::atomic::AtomicU64::new(0),
         retained_fd: std::sync::Mutex::new(None),
+        case_insensitive: std::sync::atomic::AtomicU8::new(
+            crate::backends::passthroughfs::deny::CASE_UNKNOWN,
+        ),
     });
     inodes.insert(inode_num, alt_key, data.clone());
     register_alias_locked(&mut inodes, &data, alias);

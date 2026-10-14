@@ -137,10 +137,23 @@ pub(super) fn decide_rename_deny(
         (None, None)
     };
 
+    // Case behavior is per directory (Linux ext4/btrfs casefold), so resolve
+    // each parent's once and reuse it for every check below.
+    let old_case = fs.deny_case_insensitive(old.dir);
+    let new_case = fs.deny_case_insensitive(new.dir);
+
     // Authoritative deny decision against the pinned source type.
-    if fs.deny_matches_name_in_dir(old_comps.as_deref(), old.name.to_bytes(), source_is_dir)
-        || fs.deny_matches_name_in_dir(new_comps.as_deref(), new.name.to_bytes(), source_is_dir)
-    {
+    if fs.deny_matches_name_in_dir(
+        old_comps.as_deref(),
+        old.name.to_bytes(),
+        source_is_dir,
+        old_case,
+    ) || fs.deny_matches_name_in_dir(
+        new_comps.as_deref(),
+        new.name.to_bytes(),
+        source_is_dir,
+        new_case,
+    ) {
         return Ok(RenameDecision::Deny);
     }
 
@@ -152,7 +165,12 @@ pub(super) fn decide_rename_deny(
             .map(|st| platform::mode_file_type(st.st_mode) == platform::MODE_DIR)
             .unwrap_or(false);
         if dest_is_dir
-            && fs.deny_matches_name_in_dir(new_comps.as_deref(), new.name.to_bytes(), true)
+            && fs.deny_matches_name_in_dir(
+                new_comps.as_deref(),
+                new.name.to_bytes(),
+                true,
+                new_case,
+            )
         {
             return Ok(RenameDecision::Deny);
         }
@@ -162,7 +180,12 @@ pub(super) fn decide_rename_deny(
         // otherwise land the directory at the denied name.
         if flags & RENAME_EXCHANGE != 0 {
             if dest_is_dir
-                && fs.deny_matches_name_in_dir(old_comps.as_deref(), old.name.to_bytes(), true)
+                && fs.deny_matches_name_in_dir(
+                    old_comps.as_deref(),
+                    old.name.to_bytes(),
+                    true,
+                    old_case,
+                )
             {
                 return Ok(RenameDecision::Deny);
             }

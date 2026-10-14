@@ -342,9 +342,20 @@ fn build_snapshot(
     };
 
     // Filter out entries matching the deny list.
+    let case_insensitive = fs.deny_case_insensitive_from_fd(fd);
     entries.retain(|entry| {
-        let is_dir = entry.file_type == platform::DIRENT_DIR;
-        !fs.deny_matches_name_in_dir(parent_components.as_deref(), &entry.name, is_dir)
+        // A dir-only pattern (`node_modules/`) can only be enforced with a known
+        // type. When the filesystem did not report one and the `fstatat` fallback
+        // also failed, treat the entry as a directory so the rule still hides it
+        // (fail closed) instead of leaving it visible.
+        let is_dir = entry.file_type == platform::DIRENT_DIR
+            || (entry.file_type == platform::DIRENT_UNKNOWN && fs.deny.has_dir_only_patterns());
+        !fs.deny_matches_name_in_dir(
+            parent_components.as_deref(),
+            &entry.name,
+            is_dir,
+            case_insensitive,
+        )
     });
 
     if inject_init

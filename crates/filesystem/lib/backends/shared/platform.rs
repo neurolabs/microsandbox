@@ -171,6 +171,8 @@ pub(crate) const DIRENT_REG: u32 = libc::DT_REG as u32;
 
 pub(crate) const DIRENT_DIR: u32 = libc::DT_DIR as u32;
 
+pub(crate) const DIRENT_UNKNOWN: u32 = libc::DT_UNKNOWN as u32;
+
 pub(crate) const DIRENT_LNK: u32 = libc::DT_LNK as u32;
 
 pub(crate) const DIRENT_CHR: u32 = libc::DT_CHR as u32;

@@ -504,6 +504,8 @@ impl PassthroughFs {
             anchor_children: AtomicU64::new(0),
             #[cfg(target_os = "linux")]
             retained_fd: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            case_insensitive: std::sync::atomic::AtomicU8::new(deny::CASE_UNKNOWN),
             #[cfg(target_os = "macos")]
             unlinked_fd: std::sync::atomic::AtomicI64::new(-1),
         });
@@ -548,8 +550,11 @@ impl PassthroughFs {
         if name == b"." || name == b".." {
             return false;
         }
+        let case_insensitive = self.deny_case_insensitive(parent);
         if !self.deny.needs_path_reconstruction() {
-            return self.deny.matches_basename(name, is_dir);
+            return self
+                .deny
+                .matches_basename_with_case(name, is_dir, case_insensitive);
         }
         let root = self.deny_root();
         let Some(parent_components) =
@@ -562,7 +567,7 @@ impl PassthroughFs {
             // Fail closed
             return true;
         };
-        self.deny_matches_name_in_dir(Some(&parent_components), name, is_dir)
+        self.deny_matches_name_in_dir(Some(&parent_components), name, is_dir, case_insensitive)
     }
 
     /// Whether `name` under a parent whose mount-relative components are
@@ -577,23 +582,112 @@ impl PassthroughFs {
     /// by [`inode::parent_path_components`], used only when a path pattern is
     /// active. The caller is responsible for the parent-path resolution and its
     /// fail-closed handling.
+    ///
+    /// `case_insensitive` is the parent directory's case behavior, from
+    /// [`Self::deny_case_insensitive`] or [`Self::deny_case_insensitive_from_fd`].
     fn deny_matches_name_in_dir(
         &self,
         parent_components: Option<&[Vec<u8>]>,
         name: &[u8],
         is_dir: bool,
+        case_insensitive: bool,
     ) -> bool {
         // The structural `.` and `..` entries must never be denied.
         if name == b"." || name == b".." {
             return false;
         }
         if !self.deny.needs_path_reconstruction() {
-            return self.deny.matches_basename(name, is_dir);
+            return self
+                .deny
+                .matches_basename_with_case(name, is_dir, case_insensitive);
         }
         let mut components = parent_components.unwrap_or_default().to_vec();
         components.push(name.to_vec());
-        self.deny
-            .matches_path(deny::join_path(&components).as_os_str().as_bytes(), is_dir)
+        self.deny.matches_path_with_case(
+            deny::join_path(&components).as_os_str().as_bytes(),
+            is_dir,
+            case_insensitive,
+        )
+    }
+
+    /// Case behavior of the directory `dir_inode` for deny matching.
+    ///
+    /// Linux ext4/btrfs can enable case folding per directory (`FS_CASEFOLD_FL`),
+    /// which a mount-root probe cannot see. The flag is probed once per inode and
+    /// cached alongside it, so a casefolded child cannot defeat a deny pattern on
+    /// an otherwise case-sensitive mount. Falls back to the mount default when
+    /// the flag cannot be read (or on non-Linux hosts, where case behavior is a
+    /// volume property).
+    #[cfg(target_os = "linux")]
+    fn deny_case_insensitive(&self, dir_inode: u64) -> bool {
+        if self.deny.is_empty() {
+            return false;
+        }
+        if self.deny.default_case_insensitive() {
+            return true;
+        }
+        let data = self.inodes.read().unwrap().get(&dir_inode).cloned();
+        let Some(data) = data else {
+            return false;
+        };
+        match data.case_insensitive.load(Ordering::Relaxed) {
+            deny::CASE_INSENSITIVE => true,
+            deny::CASE_SENSITIVE => false,
+            _ => {
+                // A casefold-capable filesystem always answers the flag ioctl;
+                // any other result means it does not fold, so keep the
+                // case-sensitive default rather than over-matching the whole
+                // mount.
+                let casefold = self.probe_dir_casefold(dir_inode).unwrap_or(false);
+                let state = if casefold {
+                    deny::CASE_INSENSITIVE
+                } else {
+                    deny::CASE_SENSITIVE
+                };
+                data.case_insensitive.store(state, Ordering::Relaxed);
+                casefold
+            }
+        }
+    }
+
+    /// Case behavior of the directory `dir_inode` for deny matching.
+    #[cfg(not(target_os = "linux"))]
+    fn deny_case_insensitive(&self, _dir_inode: u64) -> bool {
+        self.deny.default_case_insensitive()
+    }
+
+    /// Probe `dir_inode`'s `FS_CASEFOLD_FL` through a fresh directory fd.
+    #[cfg(target_os = "linux")]
+    fn probe_dir_casefold(&self, dir_inode: u64) -> Option<bool> {
+        let fd = crate::backends::passthroughfs::unix::inode::open_inode_fd(
+            self,
+            dir_inode,
+            libc::O_RDONLY | libc::O_DIRECTORY,
+        )
+        .ok()?;
+        let result = deny::dir_is_casefold(fd);
+        unsafe { libc::close(fd) };
+        result
+    }
+
+    /// Case behavior for deny matching from an already-open directory
+    /// descriptor, used where a directory fd is at hand and no inode lookup is
+    /// needed (readdir snapshots, restore).
+    #[cfg(target_os = "linux")]
+    fn deny_case_insensitive_from_fd(&self, fd: RawFd) -> bool {
+        if self.deny.is_empty() {
+            return false;
+        }
+        if self.deny.default_case_insensitive() {
+            return true;
+        }
+        matches!(deny::dir_is_casefold(fd), Some(true))
+    }
+
+    /// Case behavior for deny matching from an already-open directory fd.
+    #[cfg(not(target_os = "linux"))]
+    fn deny_case_insensitive_from_fd(&self, _fd: RawFd) -> bool {
+        self.deny.default_case_insensitive()
     }
 
     /// Canonical mount root used to strip the root prefix when reconstructing

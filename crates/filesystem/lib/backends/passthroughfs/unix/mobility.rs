@@ -709,6 +709,9 @@ fn reject_denied_restore_path(
     }
     let is_dir = pinned.metadata()?.file_type().is_dir();
     let relative = crate::backends::passthroughfs::deny::join_path(&saved.components);
+    // The pinned fd is the entry itself, which cannot reveal a casefold parent
+    // directory, so this uses the mount-level case behavior. Restore is
+    // fail-closed: an entry whose path matches is refused.
     if fs
         .deny
         .matches_path(relative.as_os_str().as_bytes(), is_dir)
@@ -786,6 +789,7 @@ fn rebuild(
         let fd = open_components(fs, components, directory_open_flags())?;
         let file = unsafe { File::from_raw_fd(fd) };
         verify_reopened(&file, saved.inode, verified)?;
+        let case_insensitive = fs.deny_case_insensitive_from_fd(file.as_raw_fd());
         let snapshot = saved.entries.as_ref().map(|entries| DirSnapshot {
             entries: entries
                 .iter()
@@ -798,6 +802,7 @@ fn rebuild(
                         Some(components.as_slice()),
                         &entry.name,
                         entry.file_type == platform::DIRENT_DIR,
+                        case_insensitive,
                     )
                 })
                 .map(|entry| PassthroughDirEntry {
@@ -916,6 +921,9 @@ fn inode_data_from_fd(
             aliases: RwLock::new(aliases),
             anchor_children: std::sync::atomic::AtomicU64::new(anchor_children),
             retained_fd: Mutex::new(None),
+            case_insensitive: std::sync::atomic::AtomicU8::new(
+                crate::backends::passthroughfs::deny::CASE_UNKNOWN,
+            ),
         }),
     ))
 }
