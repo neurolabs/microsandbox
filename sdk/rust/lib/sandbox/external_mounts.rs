@@ -130,6 +130,8 @@ pub(crate) fn require_guest_mounts(
 /// hid. A stricter (superset) deny list is accepted, but a gitignore negation
 /// (`!name`) re-exposes a name, so a negation the capture did not contain is a
 /// weakening even when every captured positive pattern is still present.
+/// Reordering matters too because gitignore is last-match-wins, so the captured
+/// patterns must appear in the destination as an order-preserving subsequence.
 /// `None` means the capture predates policy recording and is treated as unknown,
 /// never as an empty list.
 fn reject_weakened_deny(
@@ -151,14 +153,22 @@ fn reject_weakened_deny(
             VolumeMount::Bind { deny, .. } => deny,
             _ => &[],
         };
-        let drops_captured = !policy
+        // Gitignore rules are last-match-wins, so a destination that keeps the
+        // captured patterns but reorders them can still expose a name an earlier
+        // rule hid (e.g. captured ["*", "!*.txt", "secret.txt"] versus destination
+        // ["*", "secret.txt", "!*.txt"]). Require the captured list to be an
+        // order-preserving subsequence of the destination: this rejects drops and
+        // reorders while still allowing extra positive patterns (which only hide
+        // more).
+        let mut remaining = destination_deny.iter();
+        let preserves_order = policy
             .deny
             .iter()
-            .all(|pattern| destination_deny.contains(pattern));
+            .all(|pattern| remaining.by_ref().any(|candidate| candidate == pattern));
         let introduces_negation = destination_deny
             .iter()
             .any(|pattern| pattern.starts_with('!') && !policy.deny.contains(pattern));
-        if drops_captured || introduces_negation {
+        if !preserves_order || introduces_negation {
             return Err(MicrosandboxError::InvalidConfig(format!(
                 "restore would weaken bind-mount deny policy at {}; re-declare the deny list",
                 policy.guest_path
@@ -813,6 +823,33 @@ mod tests {
 
         let refusal = require_guest_mounts(&config, vec!["/data".into()], Some(captured))
             .expect_err("a destination negation that reopens .env must be refused");
+        let error = refusal.to_string();
+
+        assert!(
+            error.contains("weaken bind-mount deny policy at /data"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn restore_rejects_reordered_deny_that_reopens_captured_name() {
+        // Same set, different order: gitignore is last-match-wins, so moving the
+        // `!*.txt` negation after `secret.txt` re-exposes it even though every
+        // captured pattern is still present.
+        let mut config = SandboxBuilder::new("restore")
+            .volume("/data", |m| {
+                m.bind("/tmp/d").deny(["*", "!*.txt", "secret.txt"])
+            })
+            .config
+            .into_config();
+        config.restore_resources.require_complete = true;
+        let captured = vec![ExternalMountPolicy {
+            guest_path: "/data".into(),
+            deny: vec!["*".into(), "!*.txt".into(), "secret.txt".into()],
+        }];
+
+        let refusal = require_guest_mounts(&config, vec!["/data".into()], Some(captured))
+            .expect_err("reordering rules that re-exposes a name must be refused");
         let error = refusal.to_string();
 
         assert!(
