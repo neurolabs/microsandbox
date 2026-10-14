@@ -718,10 +718,20 @@ fn reject_denied_restore_path(
     let case_insensitive = if fs.deny.needs_path_reconstruction() {
         deny_path_case_insensitive_for_components(fs, parent)
     } else {
-        let parent_fd = open_components(fs, parent, directory_open_flags() | libc::O_NOFOLLOW)?;
-        let case_insensitive = fs.deny_case_insensitive_from_fd(parent_fd);
-        unsafe { libc::close(parent_fd) };
-        case_insensitive
+        // Reopen the containing directory to read its casefold flag. A
+        // searchable-but-unreadable parent (mode `0111`) rejects `O_RDONLY` with
+        // `EACCES`, yet the path is still valid and the existing restore walk
+        // reaches it through `O_PATH`. If the directory cannot be probed, match
+        // the folded (case-insensitive) variant so the deny check stays
+        // conservative instead of aborting an otherwise restorable snapshot.
+        match open_components(fs, parent, directory_open_flags() | libc::O_NOFOLLOW) {
+            Ok(parent_fd) => {
+                let case_insensitive = fs.deny_case_insensitive_from_fd(parent_fd);
+                unsafe { libc::close(parent_fd) };
+                case_insensitive
+            }
+            Err(_) => true,
+        }
     };
     if fs
         .deny
@@ -1274,6 +1284,46 @@ mod tests {
             error.to_string().contains("hidden by the mount deny list"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn restore_does_not_abort_when_the_containing_directory_is_unreadable() {
+        // A searchable-but-unreadable parent (mode `0111`) rejects `O_RDONLY`, but
+        // the entry is still reachable through the `O_PATH` restore walk. Probing
+        // that parent's case behavior must fall back to conservative matching
+        // instead of aborting an otherwise valid restore.
+        use std::os::unix::fs::PermissionsExt;
+
+        // Root bypasses the directory read check, so the regression only
+        // reproduces for a non-root caller.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("keep"), b"x").unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o111)).unwrap();
+
+        let source = backend(root.path());
+        source.init(FsOptions::empty()).unwrap();
+        let sub_inode = source.lookup(context(), 1, c"sub").unwrap().inode;
+        source.lookup(context(), sub_inode, c"keep").unwrap();
+        let encoded = capture(&source).unwrap();
+
+        // The deny pattern does not match `sub/keep`, so the restore must succeed.
+        let destination = PassthroughFs::new(super::super::PassthroughConfig {
+            root_dir: root.path().to_path_buf(),
+            inject_init: false,
+            stat_virtualization: StatVirtualization::Off,
+            deny: vec!["secret".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        destination.init(FsOptions::empty()).unwrap();
+
+        restore(&destination, &encoded).unwrap();
     }
 
     #[test]
