@@ -97,7 +97,7 @@ pub struct PassthroughConfig {
     /// Gitignore-style patterns whose matching paths are hidden from the guest.
     ///
     /// Empty means no paths are denied.
-    pub deny: Vec<String>,
+    pub hide_path: Vec<String>,
 
     /// Explicit external-mount checkpoint policy and destination diagnostic report.
     pub external_checkpoint: Option<super::super::ExternalCheckpointOptions>,
@@ -192,7 +192,8 @@ impl PassthroughFs {
             )
         });
 
-        let deny = super::super::deny::DenyList::new(&root, &cfg.deny, cfg.readonly)?;
+        let hide_path =
+            super::super::hide_path::HidePathList::new(&root, &cfg.hide_path, cfg.readonly)?;
 
         Ok(Self {
             cfg,
@@ -205,7 +206,7 @@ impl PassthroughFs {
             init_file,
             stat_store,
             quota,
-            deny,
+            hide_path,
             invalid_inodes: RwLock::new(std::collections::BTreeSet::new()),
             map_windows: Mutex::new(DaxWindows::default()),
             dax_files: DaxFiles::default(),
@@ -273,7 +274,7 @@ impl Default for PassthroughConfig {
             quota_bytes: None,
             quota_root: None,
             default_owner: None,
-            deny: Vec::new(),
+            hide_path: Vec::new(),
             external_checkpoint: None,
             owned_checkpoint: None,
         }

@@ -37,7 +37,7 @@ pub struct JsBuiltVolumeMount {
     pub owned_kind: Option<String>,
     pub size_mib: Option<u32>,
     pub quota_mib: Option<u32>,
-    pub deny: Option<Vec<String>>,
+    pub hide_path: Option<Vec<String>>,
     pub format: Option<String>,
     pub fstype: Option<String>,
     /// `"strict" | "relaxed" | "off"` for bind/named and owned-directory mounts;
@@ -312,9 +312,9 @@ impl JsMountBuilder {
     /// A path pattern (`sub/secret`) requires a read-only mount, since a writable
     /// guest could rename an ancestor directory to bypass it.
     #[napi]
-    pub fn deny(&mut self, patterns: Vec<String>) -> &Self {
+    pub fn hide_path(&mut self, patterns: Vec<String>) -> &Self {
         let prev = self.take_inner();
-        self.inner = Some(prev.deny(patterns));
+        self.inner = Some(prev.hide_path(patterns));
         self
     }
 
@@ -438,7 +438,7 @@ fn to_built_mount(mount: RustVolumeMount) -> JsBuiltVolumeMount {
             quota_mib,
             // TODO: surface follow_root_symlinks in the Node opt-out API.
             follow_root_symlinks: _,
-            deny,
+            hide_path,
             ..
         } => JsBuiltVolumeMount {
             kind: "bind".into(),
@@ -454,7 +454,11 @@ fn to_built_mount(mount: RustVolumeMount) -> JsBuiltVolumeMount {
             owned_kind: None,
             size_mib: None,
             quota_mib,
-            deny: if deny.is_empty() { None } else { Some(deny) },
+            hide_path: if hide_path.is_empty() {
+                None
+            } else {
+                Some(hide_path)
+            },
             format: None,
             fstype: None,
             stat_virtualization: Some(sv_str(stat_virtualization)),
@@ -497,7 +501,7 @@ fn to_built_mount(mount: RustVolumeMount) -> JsBuiltVolumeMount {
                 owned_kind: None,
                 size_mib,
                 quota_mib,
-                deny: None,
+                hide_path: None,
                 format: None,
                 fstype: None,
                 stat_virtualization: Some(sv_str(stat_virtualization)),
@@ -532,7 +536,7 @@ fn to_built_mount(mount: RustVolumeMount) -> JsBuiltVolumeMount {
                 owned_kind: Some(kind.into()),
                 size_mib,
                 quota_mib,
-                deny: None,
+                hide_path: None,
                 format: None,
                 fstype: None,
                 stat_virtualization: directory.then(|| sv_str(stat_virtualization)),
@@ -559,7 +563,7 @@ fn to_built_mount(mount: RustVolumeMount) -> JsBuiltVolumeMount {
             owned_kind: None,
             size_mib,
             quota_mib: None,
-            deny: None,
+            hide_path: None,
             format: None,
             fstype: None,
             stat_virtualization: None,
@@ -587,7 +591,7 @@ fn to_built_mount(mount: RustVolumeMount) -> JsBuiltVolumeMount {
             owned_kind: None,
             size_mib: None,
             quota_mib: None,
-            deny: None,
+            hide_path: None,
             format: Some(
                 match format {
                     RustDiskImageFormat::Qcow2 => "qcow2",

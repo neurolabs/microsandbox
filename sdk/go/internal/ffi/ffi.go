@@ -1844,7 +1844,7 @@ type MountSpec struct {
 	Nodev              bool     `json:"nodev,omitempty"`
 	SizeMiB            uint32   `json:"size_mib,omitempty"`
 	QuotaMiB           uint32   `json:"quota_mib,omitempty"`
-	Deny               []string `json:"deny,omitempty"`
+	HidePath               []string `json:"hide_path,omitempty"`
 	StatVirtualization string   `json:"stat_virtualization,omitempty"`
 	HostPermissions    string   `json:"host_permissions,omitempty"`
 	OverrideUid        *uint32  `json:"override_uid,omitempty"`

@@ -164,8 +164,8 @@ pub struct PassthroughFs {
     init_file: Option<Mutex<File>>,
     stat_store: Option<StatStore>,
     quota: Option<super::quota::DirQuota>,
-    /// Matcher for the deny list (empty = allow everything).
-    deny: super::deny::DenyList,
+    /// Matcher for the hide-path list (empty = allow everything).
+    hide_path: super::hide_path::HidePathList,
     invalid_inodes: RwLock<std::collections::BTreeSet<u64>>,
     /// Installed DAX mappings, keyed by guest address.
     map_windows: Mutex<DaxWindows>,
@@ -254,15 +254,15 @@ impl PassthroughFs {
         }
     }
 
-    /// Whether `name` in `parent` is denied by the deny list.
+    /// Whether `name` in `parent` is denied by the hide-path list.
     ///
     /// Fails closed (returns `true`) when the parent-inode path cannot be
-    /// reconstructed under active path patterns, so a deny list is never
+    /// reconstructed under active path patterns, so a hide-path list is never
     /// silently bypassed on an unresolvable path.
     ///
     /// `is_dir` defines whether the entry is a directory, enabling support for
-    /// dir-only deny patterns.
-    pub(super) fn deny_matches_name(&self, parent: u64, name: &CStr, is_dir: bool) -> bool {
+    /// dir-only hide-path patterns.
+    pub(super) fn hide_path_matches_name(&self, parent: u64, name: &CStr, is_dir: bool) -> bool {
         let name_bytes = name.to_bytes();
         // The structural `.` and `..` entries must never be denied, otherwise a
         // `.*` or `*` pattern would break path walks and directory listings.
@@ -273,20 +273,20 @@ impl PassthroughFs {
         // not name a denied long name. Resolving the long name needs the live
         // child path and `GetLongPathNameW`, which is not available on every
         // volume; fail closed instead by denying any `~`+digit component while
-        // a deny list is active. This over-matches — a legitimately named
+        // a hide-path list is active. This over-matches — a legitimately named
         // `report~1` is hidden too — in the safe direction required for NTFS.
-        if !self.deny.is_empty()
+        if !self.hide_path.is_empty()
             && let Ok(component) = canonical_component(name)
             && short_name_alias(component.as_ref())
         {
             return true;
         }
-        if !self.deny.needs_path_reconstruction() {
-            return self.deny.matches_basename(name_bytes, is_dir);
+        if !self.hide_path.needs_path_reconstruction() {
+            return self.hide_path.matches_basename(name_bytes, is_dir);
         }
         let Ok(parent_data) = self.inode(parent) else {
             // Fail closed: an unresolvable parent under active path patterns
-            // must deny, never allow.
+            // must hide_path, never allow.
             return true;
         };
 
@@ -298,7 +298,8 @@ impl PassthroughFs {
         let Ok(name_str) = std::str::from_utf8(name_bytes) else {
             return true;
         };
-        self.deny.matches_relative(&rel_parent, name_str, is_dir)
+        self.hide_path
+            .matches_relative(&rel_parent, name_str, is_dir)
     }
 
     /// Whether the entry at `path` (a host path under the mount root) is denied,
@@ -306,23 +307,23 @@ impl PassthroughFs {
     ///
     /// Path-backed backends re-resolve an entry by path on inode-scoped
     /// operations: `opendir` on Windows re-reads the live directory, so it must
-    /// re-apply the deny rule to avoid exposing a directory that replaced an
+    /// re-apply the hide-path rule to avoid exposing a directory that replaced an
     /// allowed file at a directory-only-denied name. Fails closed when the path
     /// cannot be matched.
     ///
-    /// Unlike [`Self::deny_matches_name`], this does not apply the fail-closed
+    /// Unlike [`Self::hide_path_matches_name`], this does not apply the fail-closed
     /// 8.3 short-name over-match: it only ever receives canonical long names —
     /// host paths interned by lookup (which the over-match already denied while
-    /// a deny list is active) or stored canonical paths from a checkpoint. A
+    /// a hide-path list is active) or stored canonical paths from a checkpoint. A
     /// legitimate long name may itself contain a `~`+digit shape, so
-    /// over-matching here would over-deny real entries; callers must not pass a
+    /// over-matching here would over-hide_path real entries; callers must not pass a
     /// guest-supplied short alias to this function.
-    pub(super) fn deny_matches_path(&self, path: &Path, is_dir: bool) -> bool {
+    pub(super) fn hide_path_matches_path(&self, path: &Path, is_dir: bool) -> bool {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             return true;
         };
-        if !self.deny.needs_path_reconstruction() {
-            return self.deny.matches_basename(name.as_bytes(), is_dir);
+        if !self.hide_path.needs_path_reconstruction() {
+            return self.hide_path.matches_basename(name.as_bytes(), is_dir);
         }
         let Some(parent) = path.parent() else {
             return true;
@@ -330,7 +331,7 @@ impl PassthroughFs {
         let Some(rel_parent) = relative_path_string(parent, &self.root) else {
             return true;
         };
-        self.deny.matches_relative(&rel_parent, name, is_dir)
+        self.hide_path.matches_relative(&rel_parent, name, is_dir)
     }
 }
 
@@ -340,7 +341,7 @@ impl PassthroughFs {
 
 /// The mount-relative path of `path` under `root`, as a `/`-separated string.
 ///
-/// Returns `None` when `path` is not lexically under `root`, so a deny check can
+/// Returns `None` when `path` is not lexically under `root`, so a hide-path check can
 /// fail closed. The root itself yields the empty string.
 fn relative_path_string(path: &Path, root: &Path) -> Option<String> {
     let rel = path.strip_prefix(root).ok()?;
@@ -379,11 +380,11 @@ fn validate_component(name: &CStr) -> io::Result<&str> {
     Ok(component)
 }
 
-/// Map a guest-supplied component to the on-disk name a deny decision must use.
+/// Map a guest-supplied component to the on-disk name a hide_path decision must use.
 ///
 /// The current implementation validates the component and returns it unchanged:
 /// Win32 alternate names (8.3 short names) are handled by a fail-closed
-/// over-match in [`PassthroughFs::deny_matches_name`], because resolving the
+/// over-match in [`PassthroughFs::hide_path_matches_name`], because resolving the
 /// long name requires a live child path and `GetLongPathNameW` is not available
 /// on every volume. The [`Cow`] return leaves room for a future long-name
 /// resolver without changing callers.
@@ -395,8 +396,8 @@ fn canonical_component(name: &CStr) -> io::Result<Cow<'_, str>> {
 ///
 /// Short names encode a `~` followed by one or more decimal digits (for example
 /// `NODE_M~1`). Any component of that shape is treated as a possible alias and
-/// denied while a deny list is active, so a denied long name can never be
-/// reached through its short form. See [`PassthroughFs::deny_matches_name`].
+/// denied while a hide-path list is active, so a denied long name can never be
+/// reached through its short form. See [`PassthroughFs::hide_path_matches_name`].
 fn short_name_alias(component: &str) -> bool {
     component
         .as_bytes()

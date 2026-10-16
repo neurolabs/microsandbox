@@ -968,7 +968,7 @@ mod tests {
     }
 
     #[test]
-    fn bind_mount_deny_policy_is_a_required_extension_and_legacy_reads_as_unknown() {
+    fn bind_mount_hide_path_policy_is_a_required_extension_and_legacy_reads_as_unknown() {
         use super::super::{
             BIND_MOUNT_DENY_EXTENSION, EXTERNAL_MOUNTS_EXTENSION, ExternalMountPolicy,
         };
@@ -976,20 +976,20 @@ mod tests {
         let mut manifest = descriptor();
         manifest.set_external_mounts(vec!["/data".into()]).unwrap();
 
-        // A deny-less capture records no policy extension and keeps the released bytes.
+        // A hide_path-less capture records no policy extension and keeps the released bytes.
         let without_policy = manifest.to_canonical_bytes().unwrap();
         assert_eq!(manifest.external_mount_policies().unwrap(), None);
         manifest.set_external_mount_policies(Vec::new()).unwrap();
         assert_eq!(manifest.to_canonical_bytes().unwrap(), without_policy);
         assert!(manifest.requires.is_empty());
 
-        // A deny-bearing capture records the policy under its own must-understand
+        // A hide_path-bearing capture records the policy under its own must-understand
         // extension, so an older reader refuses the snapshot instead of silently
         // restoring a destination that re-exposes the captured files.
         manifest
             .set_external_mount_policies(vec![ExternalMountPolicy {
                 guest_path: "/data".into(),
-                deny: vec![".env".into()],
+                hide_path: vec![".env".into()],
             }])
             .unwrap();
         assert!(
@@ -997,7 +997,7 @@ mod tests {
                 .requires
                 .iter()
                 .any(|key| key == BIND_MOUNT_DENY_EXTENSION),
-            "a deny-bearing snapshot must require its policy extension"
+            "a hide_path-bearing snapshot must require its policy extension"
         );
         assert!(
             manifest.extensions.contains_key(BIND_MOUNT_DENY_EXTENSION),
@@ -1013,7 +1013,7 @@ mod tests {
             restored.external_mount_policies().unwrap(),
             Some(vec![ExternalMountPolicy {
                 guest_path: "/data".into(),
-                deny: vec![".env".into()],
+                hide_path: vec![".env".into()],
             }])
         );
 

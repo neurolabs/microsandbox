@@ -64,7 +64,7 @@ pub(crate) fn do_create(
         return Err(platform::eacces());
     }
 
-    if fs.deny_matches_name(parent, name.to_bytes(), false) {
+    if fs.hide_path_matches_name(parent, name.to_bytes(), false) {
         return Err(platform::eacces());
     }
 
@@ -179,7 +179,7 @@ pub(crate) fn do_mkdir(
         return Err(platform::eacces());
     }
 
-    if fs.deny_matches_name(parent, name.to_bytes(), true) {
+    if fs.hide_path_matches_name(parent, name.to_bytes(), true) {
         return Err(platform::eacces());
     }
 
@@ -244,7 +244,7 @@ pub(crate) fn do_mknod(
         return Err(platform::eacces());
     }
 
-    if fs.deny_matches_name(parent, name.to_bytes(), false) {
+    if fs.hide_path_matches_name(parent, name.to_bytes(), false) {
         return Err(platform::eacces());
     }
 
@@ -341,7 +341,7 @@ pub(crate) fn do_symlink(
         return Err(platform::eacces());
     }
 
-    if fs.deny_matches_name(parent, name.to_bytes(), false) {
+    if fs.hide_path_matches_name(parent, name.to_bytes(), false) {
         return Err(platform::eacces());
     }
 
@@ -467,7 +467,7 @@ pub(crate) fn do_link(
     // A hard link shares the source inode's type, so a dir-only rule must be
     // decided from the source's real type rather than assuming a
     // non-directory. Stat the source only when a dir-only pattern is present.
-    let source_is_dir = if fs.deny.has_dir_only_patterns() {
+    let source_is_dir = if fs.hide_path.has_dir_only_patterns() {
         let inode_fd = inode::get_inode_fd(fs, inode)?;
         let st = platform::fstat(inode_fd.raw())?;
         platform::mode_file_type(st.st_mode) == platform::MODE_DIR
@@ -475,7 +475,7 @@ pub(crate) fn do_link(
         false
     };
 
-    if fs.deny_matches_name(newparent, newname.to_bytes(), source_is_dir) {
+    if fs.hide_path_matches_name(newparent, newname.to_bytes(), source_is_dir) {
         return Err(platform::eacces());
     }
 

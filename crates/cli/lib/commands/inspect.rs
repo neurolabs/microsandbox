@@ -54,15 +54,15 @@ fn mount_flags_suffix(options: MountOptions) -> String {
     format!(" ({})", flags.join(","))
 }
 
-/// Render the deny-list suffix for a bind mount in `msb inspect` output.
+/// Render the hide_path-list suffix for a bind mount in `msb inspect` output.
 ///
-/// Returns an empty string when there is no deny list so common mounts stay
-/// terse; otherwise renders `[deny=a, b]` with the patterns comma-joined.
-fn deny_suffix(deny: &[String]) -> String {
-    if deny.is_empty() {
+/// Returns an empty string when there is no hide-path list so common mounts stay
+/// terse; otherwise renders `[hide-path=a, b]` with the patterns comma-joined.
+fn hide_path_suffix(hide_path: &[String]) -> String {
+    if hide_path.is_empty() {
         String::new()
     } else {
-        format!(" [deny={}]", deny.join(", "))
+        format!(" [hide-path={}]", hide_path.join(", "))
     }
 }
 
@@ -332,7 +332,7 @@ pub async fn run(args: InspectArgs) -> anyhow::Result<()> {
                         host_permissions,
                         follow_root_symlinks,
                         quota_mib,
-                        deny,
+                        hide_path,
                         ..
                     } => {
                         let flags = mount_flags_suffix(*options);
@@ -344,9 +344,9 @@ pub async fn run(args: InspectArgs) -> anyhow::Result<()> {
                         let quota = quota_mib
                             .map(|mib| format!(" [quota={mib}MiB]"))
                             .unwrap_or_default();
-                        let deny = deny_suffix(deny);
+                        let hide_path = hide_path_suffix(hide_path);
                         println!(
-                            "  {guest:<16}\u{2192} {}{flags}{suffix}{quota}{deny}",
+                            "  {guest:<16}\u{2192} {}{flags}{suffix}{quota}{hide_path}",
                             host.display()
                         );
                     }
@@ -553,29 +553,32 @@ mod tests {
     }
 
     #[test]
-    fn deny_suffix_empty_list_is_terse() {
-        assert_eq!(deny_suffix(&[]), "");
+    fn hide_path_suffix_empty_list_is_terse() {
+        assert_eq!(hide_path_suffix(&[]), "");
     }
 
     #[test]
-    fn deny_suffix_single_pattern() {
-        assert_eq!(deny_suffix(&[".env".to_string()]), " [deny=.env]");
+    fn hide_path_suffix_single_pattern() {
+        assert_eq!(hide_path_suffix(&[".env".to_string()]), " [hide-path=.env]");
     }
 
     #[test]
-    fn deny_suffix_multiple_patterns_are_comma_joined() {
+    fn hide_path_suffix_multiple_patterns_are_comma_joined() {
         let patterns = vec![
             ".env".to_string(),
             "*.log".to_string(),
             "sub/secret".to_string(),
         ];
-        assert_eq!(deny_suffix(&patterns), " [deny=.env, *.log, sub/secret]");
+        assert_eq!(
+            hide_path_suffix(&patterns),
+            " [hide-path=.env, *.log, sub/secret]"
+        );
     }
 
     #[test]
-    fn inspect_mount_line_renders_deny_suffix() {
+    fn inspect_mount_line_renders_hide_path_suffix() {
         // The suffix is appended verbatim to the `msb inspect` mount listing.
         let patterns = vec!["a".to_string(), "b".to_string()];
-        assert_eq!(deny_suffix(&patterns), " [deny=a, b]");
+        assert_eq!(hide_path_suffix(&patterns), " [hide-path=a, b]");
     }
 }

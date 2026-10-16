@@ -58,7 +58,7 @@ pub(crate) fn do_readdir(
 ) -> io::Result<Vec<DirEntry<'static>>> {
     let handles = fs.dir_handles.read().unwrap();
     // The handle must belong to the requested directory: a mismatched nodeid
-    // would otherwise reconstruct deny paths (and `init.krun` injection) from the
+    // would otherwise reconstruct hide_path paths (and `init.krun` injection) from the
     // wrong inode while still reading this handle's fd. Mirrors the Windows
     // backend, which rejects the same mismatch with EBADF.
     let data = handles
@@ -93,7 +93,7 @@ pub(crate) fn do_readdir_for_each(
 ) -> io::Result<()> {
     let handles = fs.dir_handles.read().unwrap();
     // The handle must belong to the requested directory: a mismatched nodeid
-    // would otherwise reconstruct deny paths (and `init.krun` injection) from the
+    // would otherwise reconstruct hide_path paths (and `init.krun` injection) from the
     // wrong inode while still reading this handle's fd. Mirrors the Windows
     // backend, which rejects the same mismatch with EBADF.
     let data = handles
@@ -168,7 +168,7 @@ pub(crate) fn do_readdirplus_for_each(
 ) -> io::Result<()> {
     let handles = fs.dir_handles.read().unwrap();
     // The handle must belong to the requested directory: a mismatched nodeid
-    // would otherwise reconstruct deny paths (and `init.krun` injection) from the
+    // would otherwise reconstruct hide_path paths (and `init.krun` injection) from the
     // wrong inode while still reading this handle's fd. Mirrors the Windows
     // backend, which rejects the same mismatch with EBADF.
     let data = handles
@@ -327,8 +327,8 @@ fn build_snapshot(
     // table walk on Linux, an `F_GETPATH` syscall on macOS) for every entry in
     // the directory. Fail closed: an unresolvable parent path under active path
     // patterns denies the whole directory, matching the per-name behavior.
-    let parent_components = if fs.deny.needs_path_reconstruction() {
-        let root = fs.deny_root();
+    let parent_components = if fs.hide_path.needs_path_reconstruction() {
+        let root = fs.hide_path_root();
         match inode::parent_path_components(&fs.inodes, parent, root) {
             Some(components) => Some(components),
             None => {
@@ -341,15 +341,15 @@ fn build_snapshot(
         None
     };
 
-    // Filter out entries matching the deny list.
+    // Filter out entries matching the hide-path list.
     //
     // A path pattern matches the whole mount-relative path, so fold when this
     // directory or any ancestor folds; a basename pattern only depends on this
     // directory's own case behavior.
-    let case_insensitive = if fs.deny.needs_path_reconstruction() {
-        fs.deny_path_case_insensitive(parent)
+    let case_insensitive = if fs.hide_path.needs_path_reconstruction() {
+        fs.hide_path_pattern_case_insensitive(parent)
     } else {
-        fs.deny_case_insensitive_from_fd(fd)
+        fs.hide_path_case_insensitive_from_fd(fd)
     };
     entries.retain(|entry| {
         // A dir-only pattern (`node_modules/`) can only be enforced with a known
@@ -357,8 +357,9 @@ fn build_snapshot(
         // also failed, treat the entry as a directory so the rule still hides it
         // (fail closed) instead of leaving it visible.
         let is_dir = entry.file_type == platform::DIRENT_DIR
-            || (entry.file_type == platform::DIRENT_UNKNOWN && fs.deny.has_dir_only_patterns());
-        !fs.deny_matches_name_in_dir(
+            || (entry.file_type == platform::DIRENT_UNKNOWN
+                && fs.hide_path.has_dir_only_patterns());
+        !fs.hide_path_matches_name_in_dir(
             parent_components.as_deref(),
             &entry.name,
             is_dir,
@@ -388,7 +389,7 @@ fn build_snapshot(
 
 /// Resolve the dirent type of `name` within directory `dirfd`. If the
 /// filesystem did not supply one (`DT_UNKNOWN`), use `fstatat` without
-/// following symlinks so a dir-only deny pattern still hides directories.
+/// following symlinks so a dir-only hide-path pattern still hides directories.
 fn resolve_dirent_type(dirfd: i32, d_type: u32, name: &[u8]) -> u32 {
     if d_type != libc::DT_UNKNOWN as u32 {
         return d_type;
@@ -436,7 +437,7 @@ fn read_dir_entries(fd: i32) -> io::Result<Vec<PassthroughDirEntry>> {
                 .unwrap_or(name_slice.len());
 
             // When the filesystem did not supply a dirent type, resolve it via
-            // `fstatat` to support dir-only deny patterns.
+            // `fstatat` to support dir-only hide-path patterns.
             let file_type = resolve_dirent_type(fd, d_type, &name_slice[..name_len]);
 
             entries.push(PassthroughDirEntry {
@@ -493,7 +494,7 @@ fn read_dir_entries(fd: i32) -> io::Result<Vec<PassthroughDirEntry>> {
             unsafe { std::slice::from_raw_parts(entry.d_name.as_ptr() as *const u8, name_len) };
 
         // When the filesystem did not supply a dirent type, resolve it via
-        // `fstatat` to support dir-only deny patterns.
+        // `fstatat` to support dir-only hide-path patterns.
         let file_type =
             resolve_dirent_type(unsafe { libc::dirfd(dirp) }, entry.d_type as u32, name);
 

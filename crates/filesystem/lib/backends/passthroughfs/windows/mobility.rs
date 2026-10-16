@@ -866,10 +866,10 @@ fn validate_shape(
     Ok(())
 }
 
-/// Refuse to restore a stored path the destination deny list hides.
+/// Refuse to restore a stored path the destination hide-path list hides.
 ///
 /// Denied names are never interned during normal operation, so a stored path
-/// can only match when the deny list grew after capture (or comes from a mount
+/// can only match when the hide-path list grew after capture (or comes from a mount
 /// with different patterns). Re-interning it would re-expose a path the caller
 /// asked to hide, so fail closed with an explicit error. Mirrors the Unix
 /// `reject_denied_restore_path`; the empty component list is the mount root,
@@ -879,13 +879,13 @@ fn reject_denied_restore_path(
     components: &[Vec<u16>],
     path: &Path,
 ) -> io::Result<()> {
-    if fs.deny.is_empty() || components.is_empty() {
+    if fs.hide_path.is_empty() || components.is_empty() {
         return Ok(());
     }
     let is_dir = fs.safe_metadata(path)?.file_type().is_dir();
-    if fs.deny_matches_path(path, is_dir) {
+    if fs.hide_path_matches_path(path, is_dir) {
         return Err(invalid_state(
-            "restored passthrough inode is hidden by the mount deny list",
+            "restored passthrough inode is hidden by the mount hide-path list",
         ));
     }
     Ok(())
@@ -976,7 +976,7 @@ fn rebuild(
             entries
                 .iter()
                 // A restored snapshot bypasses live lookup and readdir filtering,
-                // so the destination deny list must be re-applied here. Otherwise
+                // so the destination hide-path list must be re-applied here. Otherwise
                 // a name that was visible at capture but is hidden at the
                 // destination would be served from the cached listing. Mirrors the
                 // Unix `rebuild` re-filter. A name that cannot be decoded cannot be
@@ -986,7 +986,7 @@ fn rebuild(
                         return false;
                     };
                     let child = path.join(name);
-                    !fs.deny_matches_path(&child, entry.file_type == DT_DIR)
+                    !fs.hide_path_matches_path(&child, entry.file_type == DT_DIR)
                 })
                 .map(|entry| DirSnapshotEntry {
                     inode: entry.inode,
@@ -1238,7 +1238,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_directory_snapshot_drops_names_hidden_by_destination_deny() {
+    fn restored_directory_snapshot_drops_names_hidden_by_destination_hide_path() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("sub")).unwrap();
         std::fs::write(temp.path().join("sub/.env"), b"secret").unwrap();
@@ -1255,13 +1255,13 @@ mod tests {
         );
         let bytes = capture(&source).unwrap();
 
-        // Restoring into a mount whose deny list now hides `.env` must drop it
+        // Restoring into a mount whose hide-path list now hides `.env` must drop it
         // from the rebuilt directory snapshot instead of re-serving the cached
         // listing that still names it.
         let mut cfg = PassthroughConfig::new(temp.path().to_path_buf());
         cfg.inject_init = false;
         cfg.stat_virtualization = StatVirtualization::Off;
-        cfg.deny = vec![".env".to_string()];
+        cfg.hide_path = vec![".env".to_string()];
         let destination = PassthroughFs::new(cfg).unwrap();
         destination.init(FsOptions::empty()).unwrap();
         restore(&destination, &bytes).unwrap();

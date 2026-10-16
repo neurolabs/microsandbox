@@ -637,16 +637,16 @@ fn reject_dropped_cloud_create_fields(config: &SandboxConfig) -> MicrosandboxRes
         return Err(unsupported("named volume inline create"));
     }
 
-    // The cloud wire format has no deny field, so a non-empty deny list would
+    // The cloud wire format has no hide_path field, so a non-empty hide-path list would
     // silently create a sandbox that exposes the files the caller asked to
-    // hide; deny lists are only enforceable on host bind mounts.
+    // hide; hide-path lists are only enforceable on host bind mounts.
     if config
         .spec
         .mounts
         .iter()
-        .any(|mount| matches!(mount, VolumeMount::Bind { deny, .. } if !deny.is_empty()))
+        .any(|mount| matches!(mount, VolumeMount::Bind { hide_path, .. } if !hide_path.is_empty()))
     {
-        return Err(unsupported("bind mount deny list"));
+        return Err(unsupported("bind mount hide-path list"));
     }
     if config
         .spec
@@ -1006,7 +1006,7 @@ mod tests {
             .build()
             .unwrap();
         let error = crate::backend::with_backend(backend, async {
-            SandboxBuilder::new("http-deny-cloud")
+            SandboxBuilder::new("http-hide_path-cloud")
                 .image("alpine")
                 .network(|network| {
                     network.http(|h| {
@@ -1634,17 +1634,17 @@ mod tests {
     }
 
     #[test]
-    fn cloud_create_request_rejects_bind_mount_deny_list() {
+    fn cloud_create_request_rejects_bind_mount_hide_path_list() {
         let mut config = base_cloud_config();
         config.spec.mounts.push(
             crate::sandbox::MountBuilder::new("/data")
                 .bind("/data")
-                .deny([".env"])
+                .hide_path([".env"])
                 .build()
                 .unwrap(),
         );
 
-        assert_unsupported_config_field(config, "bind mount deny list");
+        assert_unsupported_config_field(config, "bind mount hide-path list");
     }
 
     #[test]

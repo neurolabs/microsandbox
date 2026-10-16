@@ -104,11 +104,11 @@ fn fs_for(path: &Path) -> PassthroughFs {
     fs
 }
 
-fn fs_for_deny(path: &Path, deny: Vec<String>) -> PassthroughFs {
+fn fs_for_hide_path(path: &Path, hide_path: Vec<String>) -> PassthroughFs {
     let fs = PassthroughFs::new(PassthroughConfig {
         root_dir: path.to_path_buf(),
         inject_init: false,
-        deny,
+        hide_path,
         ..Default::default()
     })
     .unwrap();
@@ -1559,16 +1559,16 @@ fn no_symlink_root_allows_deep_real_path() {
 }
 
 //--------------------------------------------------------------------------------------------------
-// Tests: deny-list enforcement
+// Tests: hide_path-list enforcement
 //--------------------------------------------------------------------------------------------------
 
 /// A denied basename is invisible via lookup.
 #[test]
-fn deny_basename_lookup_hidden() {
+fn hide_path_basename_lookup_hidden() {
     let temp = TempDir::new();
     std::fs::write(temp.path.join(".env"), b"secret").unwrap();
     std::fs::write(temp.path.join("visible.txt"), b"ok").unwrap();
-    let fs = fs_for_deny(&temp.path, vec![".env".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec![".env".to_string()]);
 
     expect_errno(fs.lookup(context(), ROOT_INODE, c".env"), LINUX_ENOENT);
 
@@ -1579,13 +1579,13 @@ fn deny_basename_lookup_hidden() {
 /// On a case-insensitive filesystem (NTFS, the Windows default), a denied
 /// basename is also hidden under a differently-cased variant: `.env` must hide
 /// `.ENV` and `.Env`, because the host resolves all of them to the same file.
-/// Without this, a guest could bypass the deny list by requesting a case
+/// Without this, a guest could bypass the hide-path list by requesting a case
 /// variant. This test assumes the temp dir is on case-insensitive NTFS.
 #[test]
-fn deny_basename_hides_case_variant() {
+fn hide_path_basename_hides_case_variant() {
     let temp = TempDir::new();
     std::fs::write(temp.path.join(".env"), b"secret").unwrap();
-    let fs = fs_for_deny(&temp.path, vec![".env".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec![".env".to_string()]);
 
     expect_errno(fs.lookup(context(), ROOT_INODE, c".ENV"), LINUX_ENOENT);
     expect_errno(fs.lookup(context(), ROOT_INODE, c".Env"), LINUX_ENOENT);
@@ -1593,9 +1593,9 @@ fn deny_basename_hides_case_variant() {
 
 /// Creating a denied basename returns EACCES.
 #[test]
-fn deny_basename_create_rejected() {
+fn hide_path_basename_create_rejected() {
     let temp = TempDir::new();
-    let fs = fs_for_deny(&temp.path, vec![".secrets".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec![".secrets".to_string()]);
 
     expect_errno(
         fs.create(
@@ -1627,9 +1627,9 @@ fn deny_basename_create_rejected() {
 
 /// Creating a denied directory returns EACCES.
 #[test]
-fn deny_mkdir_rejected() {
+fn hide_path_mkdir_rejected() {
     let temp = TempDir::new();
-    let fs = fs_for_deny(&temp.path, vec![".hidden_dir".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec![".hidden_dir".to_string()]);
 
     expect_errno(
         fs.mkdir(
@@ -1657,9 +1657,9 @@ fn deny_mkdir_rejected() {
 
 /// Renaming into a denied target name returns EACCES.
 #[test]
-fn deny_rename_to_denied_target() {
+fn hide_path_rename_to_denied_target() {
     let temp = TempDir::new();
-    let fs = fs_for_deny(&temp.path, vec![".forbidden".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec![".forbidden".to_string()]);
 
     fs.create(
         context(),
@@ -1702,10 +1702,10 @@ fn deny_rename_to_denied_target() {
 /// with the unix dir-only rename-over-hidden-dir test), rather than leaking
 /// the hidden directory's existence through a raw EISDIR.
 #[test]
-fn deny_rename_file_over_hidden_dir_rejected() {
+fn hide_path_rename_file_over_hidden_dir_rejected() {
     let temp = TempDir::new();
     std::fs::create_dir(temp.path.join("node_modules")).unwrap();
-    let fs = fs_for_deny(&temp.path, vec!["node_modules/".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec!["node_modules/".to_string()]);
 
     fs.create(
         context(),
@@ -1739,10 +1739,10 @@ fn deny_rename_file_over_hidden_dir_rejected() {
 /// so the source-type check catches this rather than leaking the hidden file
 /// through a raw ENOTDIR.
 #[test]
-fn deny_rename_dir_over_hidden_file_rejected() {
+fn hide_path_rename_dir_over_hidden_file_rejected() {
     let temp = TempDir::new();
     std::fs::write(temp.path.join(".env"), b"secret").unwrap();
-    let fs = fs_for_deny(&temp.path, vec![".env".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec![".env".to_string()]);
 
     fs.mkdir(
         context(),
@@ -1762,10 +1762,10 @@ fn deny_rename_dir_over_hidden_file_rejected() {
 
 /// Unlink of a denied name returns EACCES.
 #[test]
-fn deny_unlink_rejected() {
+fn hide_path_unlink_rejected() {
     let temp = TempDir::new();
     std::fs::write(temp.path.join(".protected"), b"protected").unwrap();
-    let fs = fs_for_deny(&temp.path, vec![".protected".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec![".protected".to_string()]);
 
     expect_errno(
         fs.unlink(context(), ROOT_INODE, c".protected"),
@@ -1775,10 +1775,10 @@ fn deny_unlink_rejected() {
 
 /// Rmdir of a denied directory returns EACCES.
 #[test]
-fn deny_rmdir_rejected() {
+fn hide_path_rmdir_rejected() {
     let temp = TempDir::new();
     std::fs::create_dir(temp.path.join(".protected_dir")).unwrap();
-    let fs = fs_for_deny(&temp.path, vec![".protected_dir".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec![".protected_dir".to_string()]);
 
     expect_errno(
         fs.rmdir(context(), ROOT_INODE, c".protected_dir"),
@@ -1788,12 +1788,12 @@ fn deny_rmdir_rejected() {
 
 /// Denied entries are omitted from readdir.
 #[test]
-fn deny_readdir_omits_entries() {
+fn hide_path_readdir_omits_entries() {
     let temp = TempDir::new();
     std::fs::write(temp.path.join(".env"), b"hidden").unwrap();
     std::fs::write(temp.path.join("data.log"), b"hidden").unwrap();
     std::fs::write(temp.path.join("visible.txt"), b"ok").unwrap();
-    let fs = fs_for_deny(&temp.path, vec![".env".to_string(), "*.log".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec![".env".to_string(), "*.log".to_string()]);
 
     let (handle, _) = fs
         .opendir(context(), ROOT_INODE, LINUX_O_DIRECTORY as u32)
@@ -1817,14 +1817,14 @@ fn deny_readdir_omits_entries() {
 }
 
 /// Denied entries are omitted from readdirplus too (parity with the unix
-/// `test_deny_readdirplus_omits_entries` test).
+/// `test_hide_path_readdirplus_omits_entries` test).
 #[test]
-fn deny_readdirplus_omits_entries() {
+fn hide_path_readdirplus_omits_entries() {
     let temp = TempDir::new();
     std::fs::write(temp.path.join(".env"), b"hidden").unwrap();
     std::fs::write(temp.path.join("data.log"), b"hidden").unwrap();
     std::fs::write(temp.path.join("visible.txt"), b"ok").unwrap();
-    let fs = fs_for_deny(&temp.path, vec![".env".to_string(), "*.log".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec![".env".to_string(), "*.log".to_string()]);
 
     let (handle, _) = fs
         .opendir(context(), ROOT_INODE, LINUX_O_DIRECTORY as u32)
@@ -1853,10 +1853,10 @@ fn deny_readdirplus_omits_entries() {
 /// `opendir` re-resolves the live path and must re-apply the directory-only
 /// rule; otherwise the replacement directory's contents are exposed.
 #[test]
-fn deny_dir_only_opendir_rechecks_replaced_directory() {
+fn hide_path_dir_only_opendir_rechecks_replaced_directory() {
     let temp = TempDir::new();
     std::fs::write(temp.path.join("node_modules"), b"file").unwrap();
-    let fs = fs_for_deny(&temp.path, vec!["node_modules/".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec!["node_modules/".to_string()]);
 
     // A directory-only pattern allows the existing file, so lookup succeeds.
     let entry = fs.lookup(context(), ROOT_INODE, c"node_modules").unwrap();
@@ -1875,10 +1875,10 @@ fn deny_dir_only_opendir_rechecks_replaced_directory() {
 /// `lookup`; otherwise the children of a directory that replaced an allowed
 /// file at a directory-only-denied name are readable without `opendir`.
 #[test]
-fn deny_dir_only_child_lookup_rechecks_replaced_parent() {
+fn hide_path_dir_only_child_lookup_rechecks_replaced_parent() {
     let temp = TempDir::new();
     std::fs::write(temp.path.join("node_modules"), b"file").unwrap();
-    let fs = fs_for_deny(&temp.path, vec!["node_modules/".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec!["node_modules/".to_string()]);
 
     let entry = fs.lookup(context(), ROOT_INODE, c"node_modules").unwrap();
 
@@ -1892,10 +1892,10 @@ fn deny_dir_only_child_lookup_rechecks_replaced_parent() {
 
 /// Writes anchored on the replaced parent are rejected too, not just reads.
 #[test]
-fn deny_dir_only_create_in_replaced_parent_rejected() {
+fn hide_path_dir_only_create_in_replaced_parent_rejected() {
     let temp = TempDir::new();
     std::fs::write(temp.path.join("node_modules"), b"file").unwrap();
-    let fs = fs_for_deny(&temp.path, vec!["node_modules/".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec!["node_modules/".to_string()]);
 
     let entry = fs.lookup(context(), ROOT_INODE, c"node_modules").unwrap();
 
@@ -1919,12 +1919,12 @@ fn deny_dir_only_create_in_replaced_parent_rejected() {
 
 /// A nested path pattern hides the matching path but not its siblings.
 #[test]
-fn deny_path_pattern_nested() {
+fn hide_path_pattern_nested() {
     let temp = TempDir::new();
     std::fs::create_dir(temp.path.join("sub")).unwrap();
     std::fs::write(temp.path.join("sub").join(".env"), b"secret").unwrap();
     std::fs::write(temp.path.join("sub").join("visible.txt"), b"ok").unwrap();
-    let fs = fs_for_deny(&temp.path, vec!["sub/.env".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec!["sub/.env".to_string()]);
 
     // The parent directory itself is reachable.
     let dir = fs.lookup(context(), ROOT_INODE, c"sub").unwrap();
@@ -1939,11 +1939,11 @@ fn deny_path_pattern_nested() {
 /// A recursive path pattern hides nested matches at any depth (parity with the
 /// unix `**/env.secret` test).
 #[test]
-fn deny_recursive_path_pattern_nested() {
+fn hide_path_recursive_path_pattern_nested() {
     let temp = TempDir::new();
     std::fs::create_dir_all(temp.path.join("a").join("b")).unwrap();
     std::fs::write(temp.path.join("a").join("b").join("env.secret"), b"secret").unwrap();
-    let fs = fs_for_deny(&temp.path, vec!["**/env.secret".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec!["**/env.secret".to_string()]);
 
     let a = fs.lookup(context(), ROOT_INODE, c"a").unwrap();
     let b = fs.lookup(context(), a.inode, c"b").unwrap();
@@ -1953,10 +1953,10 @@ fn deny_recursive_path_pattern_nested() {
 /// Path patterns gate create within a hidden subtree (parity with the unix
 /// `sub/.secret` create test).
 #[test]
-fn deny_path_pattern_create_rejected_in_hidden_subtree() {
+fn hide_path_pattern_create_rejected_in_hidden_subtree() {
     let temp = TempDir::new();
     std::fs::create_dir(temp.path.join("sub")).unwrap();
-    let fs = fs_for_deny(&temp.path, vec!["sub/.secret".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec!["sub/.secret".to_string()]);
 
     let dir = fs.lookup(context(), ROOT_INODE, c"sub").unwrap();
     let flags = (LINUX_O_CREAT | LINUX_O_RDWR) as u32;
@@ -1988,40 +1988,40 @@ fn deny_path_pattern_create_rejected_in_hidden_subtree() {
     .unwrap();
 }
 
-/// A non-UTF-8 leaf name is rejected by name validation before the deny list
+/// A non-UTF-8 leaf name is rejected by name validation before the hide-path list
 /// is consulted: `validate_component` (`windows/mod.rs`) returns `EINVAL` for
-/// names that cannot be decoded, which runs ahead of any deny matching.
+/// names that cannot be decoded, which runs ahead of any hide-path matching.
 #[test]
-fn deny_path_pattern_non_utf8_name_is_invalid() {
+fn hide_path_pattern_non_utf8_name_is_invalid() {
     let temp = TempDir::new();
-    let fs = fs_for_deny(&temp.path, vec!["sub/secret".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec!["sub/secret".to_string()]);
 
     // The parent directory is reachable.
     let dir = fs.lookup(context(), ROOT_INODE, c"sub").unwrap();
 
     // A name that is not valid UTF-8 fails component validation with EINVAL,
-    // before the deny list is consulted.
+    // before the hide-path list is consulted.
     let name = CStr::from_bytes_with_nul(b"secret\xff\0").unwrap();
     expect_errno(fs.lookup(context(), dir.inode, name), LINUX_EINVAL);
 }
 
-/// Every name-taking op validates the component before consulting the deny
+/// Every name-taking op validates the component before consulting the hide_path
 /// list, so a non-UTF-8 name fails with EINVAL rather than EACCES (parity with
 /// lookup). NTFS is UTF-16, so such a name is invalid input on Windows; the
-/// deny check still runs for valid names and returns EACCES.
+/// hide-path check still runs for valid names and returns EACCES.
 #[test]
-fn deny_non_utf8_name_is_invalid_on_all_ops() {
+fn hide_path_non_utf8_name_is_invalid_on_all_ops() {
     let temp = TempDir::new();
-    let fs = fs_for_deny(&temp.path, vec!["sub/secret".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec!["sub/secret".to_string()]);
 
     // The parent directory is reachable.
     let dir = fs.lookup(context(), ROOT_INODE, c"sub").unwrap();
 
     // A name that is not valid UTF-8 cannot be matched against a path pattern;
-    // it must fail validation with EINVAL before the deny check runs.
+    // it must fail validation with EINVAL before the hide-path check runs.
     let name = CStr::from_bytes_with_nul(b"secret\xff\0").unwrap();
 
-    // create validates before the deny check.
+    // create validates before the hide-path check.
     let flags = (LINUX_O_CREAT | LINUX_O_RDWR) as u32;
     expect_errno(
         fs.create(
@@ -2037,10 +2037,10 @@ fn deny_non_utf8_name_is_invalid_on_all_ops() {
         LINUX_EINVAL,
     );
 
-    // unlink validates before the deny check.
+    // unlink validates before the hide-path check.
     expect_errno(fs.unlink(context(), dir.inode, name), LINUX_EINVAL);
 
-    // rename validates both names before the deny check.
+    // rename validates both names before the hide-path check.
     expect_errno(
         fs.rename(context(), dir.inode, c"ok.txt", dir.inode, name, 0),
         LINUX_EINVAL,
@@ -2053,9 +2053,9 @@ fn deny_non_utf8_name_is_invalid_on_all_ops() {
 
 /// Non-denied names remain fully read-write.
 #[test]
-fn deny_normal_ops_unchanged() {
+fn hide_path_normal_ops_unchanged() {
     let temp = TempDir::new();
-    let fs = fs_for_deny(&temp.path, vec![".env".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec![".env".to_string()]);
 
     // Create, write, and read all work on a non-denied name.
     let flags = (LINUX_O_CREAT | LINUX_O_RDWR) as u32;
@@ -2074,7 +2074,7 @@ fn deny_normal_ops_unchanged() {
     let handle = handle.unwrap();
 
     let mut reader = SourceReader {
-        bytes: b"hello deny".to_vec(),
+        bytes: b"hello hide_path".to_vec(),
         pos: 0,
     };
     fs.write(
@@ -2094,7 +2094,7 @@ fn deny_normal_ops_unchanged() {
     let mut writer = CaptureWriter { bytes: Vec::new() };
     fs.read(context(), entry.inode, handle, &mut writer, 10, 0, None, 0)
         .unwrap();
-    assert_eq!(writer.bytes, b"hello deny");
+    assert_eq!(writer.bytes, b"hello hide_path");
 
     // Unlink still works on a non-denied name.
     fs.unlink(context(), ROOT_INODE, c"writeable.txt").unwrap();
@@ -2107,7 +2107,7 @@ fn deny_normal_ops_unchanged() {
 }
 
 //--------------------------------------------------------------------------------------------------
-// Tests: deny unlink error parity (existence/type oracle)
+// Tests: hide_path unlink error parity (existence/type oracle)
 //--------------------------------------------------------------------------------------------------
 
 /// A denied name that exists returns EACCES, never deleting the file.
@@ -2115,19 +2115,19 @@ fn deny_normal_ops_unchanged() {
 fn unlink_denied_name_returns_eacces_when_present() {
     let temp = TempDir::new();
     std::fs::write(temp.path.join(".env"), b"secret").unwrap();
-    let fs = fs_for_deny(&temp.path, vec![".env".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec![".env".to_string()]);
 
     expect_errno(fs.unlink(context(), ROOT_INODE, c".env"), LINUX_EACCES);
     assert!(temp.path.join(".env").exists(), "denied file must survive");
 }
 
-/// A denied name that does *not* exist returns EACCES, not ENOENT: the deny
+/// A denied name that does *not* exist returns EACCES, not ENOENT: the hide_path
 /// decision is made before any host stat, so unlink cannot reveal whether the
 /// hidden name exists.
 #[test]
 fn unlink_denied_name_returns_eacces_when_absent() {
     let temp = TempDir::new();
-    let fs = fs_for_deny(&temp.path, vec![".env".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec![".env".to_string()]);
 
     expect_errno(fs.unlink(context(), ROOT_INODE, c".env"), LINUX_EACCES);
 }
@@ -2145,7 +2145,7 @@ fn unlink_denied_reparse_point_returns_eacces() {
     if std::os::windows::fs::symlink_dir(&target, temp.path.join(".env")).is_err() {
         return;
     }
-    let fs = fs_for_deny(&temp.path, vec![".env".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec![".env".to_string()]);
 
     expect_errno(fs.unlink(context(), ROOT_INODE, c".env"), LINUX_EACCES);
 }
@@ -2153,10 +2153,10 @@ fn unlink_denied_reparse_point_returns_eacces() {
 /// A directory-only rule (`node_modules/`) hides the directory from unlink with
 /// EACCES rather than leaking it through a raw EISDIR.
 #[test]
-fn unlink_dir_only_deny_still_hides_directory() {
+fn unlink_dir_only_hide_path_still_hides_directory() {
     let temp = TempDir::new();
     std::fs::create_dir(temp.path.join("node_modules")).unwrap();
-    let fs = fs_for_deny(&temp.path, vec!["node_modules/".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec!["node_modules/".to_string()]);
 
     expect_errno(
         fs.unlink(context(), ROOT_INODE, c"node_modules"),
@@ -2170,7 +2170,7 @@ fn unlink_dir_only_deny_still_hides_directory() {
 fn unlink_allowed_file_succeeds() {
     let temp = TempDir::new();
     std::fs::write(temp.path.join("plain.txt"), b"ok").unwrap();
-    let fs = fs_for_deny(&temp.path, vec![".env".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec![".env".to_string()]);
 
     fs.unlink(context(), ROOT_INODE, c"plain.txt").unwrap();
     assert!(!temp.path.join("plain.txt").exists());
@@ -2187,7 +2187,7 @@ fn unlink_allowed_file_succeeds() {
 fn lookup_denied_name_via_trailing_dot_is_hidden() {
     let temp = TempDir::new();
     std::fs::write(temp.path.join(".env"), b"secret").unwrap();
-    let fs = fs_for_deny(&temp.path, vec![".env".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec![".env".to_string()]);
 
     match fs.lookup(context(), ROOT_INODE, c".env.") {
         Ok(_) => panic!("trailing-dot name must not resolve to the hidden file"),
@@ -2203,7 +2203,7 @@ fn lookup_denied_name_via_trailing_dot_is_hidden() {
 fn lookup_denied_name_via_trailing_space_is_hidden() {
     let temp = TempDir::new();
     std::fs::write(temp.path.join(".env"), b"secret").unwrap();
-    let fs = fs_for_deny(&temp.path, vec![".env".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec![".env".to_string()]);
 
     match fs.lookup(context(), ROOT_INODE, c".env ") {
         Ok(_) => panic!("trailing-space name must not resolve to the hidden file"),
@@ -2217,13 +2217,13 @@ fn lookup_denied_name_via_trailing_space_is_hidden() {
 /// A denied long name reached through its 8.3 short alias (`NODE_M~1`) is
 /// hidden. Short names are only generated on volumes with
 /// `NtfsDisable8dot3NameCreation` disabled; the backend denies any `~`+digit
-/// component while a deny list is active (over-match, fail closed), so the
+/// component while a hide-path list is active (over-match, fail closed), so the
 /// guarantee holds even where the volume generates no short name.
 #[test]
 fn lookup_denied_long_name_via_short_alias_is_hidden() {
     let temp = TempDir::new();
     std::fs::create_dir(temp.path.join("node_modules")).unwrap();
-    let fs = fs_for_deny(&temp.path, vec!["node_modules/".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec!["node_modules/".to_string()]);
 
     expect_errno(fs.lookup(context(), ROOT_INODE, c"NODE_M~1"), LINUX_ENOENT);
 }
@@ -2232,7 +2232,7 @@ fn lookup_denied_long_name_via_short_alias_is_hidden() {
 #[test]
 fn create_denied_name_via_trailing_dot_is_rejected() {
     let temp = TempDir::new();
-    let fs = fs_for_deny(&temp.path, vec![".env".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec![".env".to_string()]);
 
     let result = fs.create(
         context(),
@@ -2254,30 +2254,30 @@ fn create_denied_name_via_trailing_dot_is_rejected() {
 }
 
 //--------------------------------------------------------------------------------------------------
-// Tests: deny re-application on restore
+// Tests: hide_path re-application on restore
 //--------------------------------------------------------------------------------------------------
 
-/// A checkpoint captured with an empty deny list must not re-intern a path the
-/// destination deny list hides.
+/// A checkpoint captured with an empty hide-path list must not re-intern a path the
+/// destination hide-path list hides.
 #[test]
-fn windows_restore_refuses_path_hidden_by_destination_deny() {
+fn windows_restore_refuses_path_hidden_by_destination_hide_path() {
     let temp = TempDir::new();
     std::fs::write(temp.path.join(".env"), b"secret").unwrap();
     let source = fs_for(&temp.path);
     source.lookup(context(), ROOT_INODE, c".env").unwrap();
     let bytes = source.capture_state().unwrap();
 
-    let destination = fs_for_deny(&temp.path, vec![".env".to_string()]);
+    let destination = fs_for_hide_path(&temp.path, vec![".env".to_string()]);
     assert!(
         destination.restore_state(&bytes).is_err(),
-        "restore must refuse a canonical path hidden by the destination deny list"
+        "restore must refuse a canonical path hidden by the destination hide-path list"
     );
 }
 
-/// A saved hardlink alias whose name the destination deny list now hides must
+/// A saved hardlink alias whose name the destination hide-path list now hides must
 /// not be re-interned either.
 #[test]
-fn windows_restore_reapplies_deny_to_aliases() {
+fn windows_restore_reapplies_hide_path_to_aliases() {
     let temp = TempDir::new();
     std::fs::write(temp.path.join("first"), b"contents").unwrap();
     std::fs::hard_link(temp.path.join("first"), temp.path.join(".env")).unwrap();
@@ -2286,15 +2286,15 @@ fn windows_restore_reapplies_deny_to_aliases() {
     source.lookup(context(), ROOT_INODE, c".env").unwrap();
     let bytes = source.capture_state().unwrap();
 
-    let destination = fs_for_deny(&temp.path, vec![".env".to_string()]);
+    let destination = fs_for_hide_path(&temp.path, vec![".env".to_string()]);
     assert!(
         destination.restore_state(&bytes).is_err(),
-        "restore must not re-intern an alias the destination deny list hides"
+        "restore must not re-intern an alias the destination hide-path list hides"
     );
 }
 
 //--------------------------------------------------------------------------------------------------
-// Tests: inode-scoped deny coherence
+// Tests: inode-scoped hide_path coherence
 //--------------------------------------------------------------------------------------------------
 
 /// A path-backed inode whose allowed file was replaced by a directory at a
@@ -2303,7 +2303,7 @@ fn windows_restore_reapplies_deny_to_aliases() {
 fn setattr_on_replaced_dir_only_denied_path_is_refused() {
     let temp = TempDir::new();
     std::fs::write(temp.path.join("node_modules"), b"file").unwrap();
-    let fs = fs_for_deny(&temp.path, vec!["node_modules/".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec!["node_modules/".to_string()]);
     let entry = fs.lookup(context(), ROOT_INODE, c"node_modules").unwrap();
 
     std::fs::remove_file(temp.path.join("node_modules")).unwrap();
@@ -2328,7 +2328,7 @@ fn setattr_on_replaced_dir_only_denied_path_is_refused() {
 fn opendir_after_replacement_dir_does_not_expose_contents() {
     let temp = TempDir::new();
     std::fs::write(temp.path.join("node_modules"), b"file").unwrap();
-    let fs = fs_for_deny(&temp.path, vec!["node_modules/".to_string()]);
+    let fs = fs_for_hide_path(&temp.path, vec!["node_modules/".to_string()]);
     let entry = fs.lookup(context(), ROOT_INODE, c"node_modules").unwrap();
 
     std::fs::remove_file(temp.path.join("node_modules")).unwrap();

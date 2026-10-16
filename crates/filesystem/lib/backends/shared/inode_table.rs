@@ -94,10 +94,10 @@ pub(crate) struct InodeData {
     #[cfg(target_os = "linux")]
     pub retained_fd: Mutex<Option<File>>,
 
-    /// Cached per-directory casefold state for deny matching (Linux only).
+    /// Cached per-directory casefold state for hide-path matching (Linux only).
     ///
     /// Case folding is a per-directory property (ext4/btrfs `FS_CASEFOLD_FL`),
-    /// so the deny matcher selects its case-insensitive variant per directory.
+    /// so the hide_path matcher selects its case-insensitive variant per directory.
     /// Holds `CASE_UNKNOWN` until a directory fd has been probed with
     /// `FS_IOC_GETFLAGS`; the value is dropped with the inode when its refcount
     /// reaches zero, so it is re-probed for any later re-interning.

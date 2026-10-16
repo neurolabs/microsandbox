@@ -680,7 +680,7 @@ func TestFFIWireShape_Volumes(t *testing.T) {
 		WithImage("alpine"),
 		WithMounts(map[string]MountConfig{
 			"/data":    Mount.Named("vol-a", MountOptions{}),
-			"/host":    Mount.Bind("/var/lib", MountOptions{Readonly: true, Noexec: true, Nosuid: true, Nodev: true, Deny: []string{".env", "sub/secret"}}),
+			"/host":    Mount.Bind("/var/lib", MountOptions{Readonly: true, Noexec: true, Nosuid: true, Nodev: true, HidePath: []string{".env", "sub/secret"}}),
 			"/scratch": Mount.Tmpfs(TmpfsOptions{SizeMiB: 128, Noexec: true, Nosuid: true}),
 			"/img":     Mount.Disk("/tmp/pool.img", DiskOptions{Format: "raw", Readonly: true}),
 		}),
@@ -692,9 +692,9 @@ func TestFFIWireShape_Volumes(t *testing.T) {
 	if v := volumes["/host"].(map[string]any); v["bind"] != "/var/lib" || v["readonly"] != true || v["noexec"] != true || v["nosuid"] != true || v["nodev"] != true {
 		t.Fatalf("/host = %v", v)
 	}
-	hostDeny := volumes["/host"].(map[string]any)["deny"].([]any)
+	hostDeny := volumes["/host"].(map[string]any)["hide_path"].([]any)
 	if len(hostDeny) != 2 || hostDeny[0] != ".env" || hostDeny[1] != "sub/secret" {
-		t.Fatalf("/host deny = %v", hostDeny)
+		t.Fatalf("/host hide_path = %v", hostDeny)
 	}
 	if v := volumes["/scratch"].(map[string]any); v["tmpfs"] != true || v["size_mib"] != float64(128) || v["noexec"] != true || v["nosuid"] != true {
 		t.Fatalf("/scratch = %v", v)
@@ -704,8 +704,8 @@ func TestFFIWireShape_Volumes(t *testing.T) {
 	}
 }
 
-func TestFFIWireShape_BindDenyCarriedForNativeValidation(t *testing.T) {
-	// Go never inspects host paths, so a deny list on a bind is carried
+func TestFFIWireShape_BindHidePathCarriedForNativeValidation(t *testing.T) {
+	// Go never inspects host paths, so a hide-path list on a bind is carried
 	// verbatim. The native validator rejects leading '#', wire separators, and
 	// path-on-writable patterns; a host file bind is rejected by the runtime
 	// file-mount resolver. Either way the pattern must reach the boundary
@@ -713,13 +713,13 @@ func TestFFIWireShape_BindDenyCarriedForNativeValidation(t *testing.T) {
 	got := marshalCreateOptions(t,
 		WithImage("alpine"),
 		WithMounts(map[string]MountConfig{
-			"/data": Mount.Bind("/host/data", MountOptions{Deny: []string{"#secret", "sub/secret", "."}}),
+			"/data": Mount.Bind("/host/data", MountOptions{HidePath: []string{"#secret", "sub/secret", "."}}),
 		}),
 	)
 	volumes := mustField(t, got, "volumes").(map[string]any)
-	deny := volumes["/data"].(map[string]any)["deny"].([]any)
+	deny := volumes["/data"].(map[string]any)["hide_path"].([]any)
 	if len(deny) != 3 || deny[0] != "#secret" || deny[1] != "sub/secret" || deny[2] != "." {
-		t.Fatalf("deny = %v", deny)
+		t.Fatalf("hide_path = %v", deny)
 	}
 }
 

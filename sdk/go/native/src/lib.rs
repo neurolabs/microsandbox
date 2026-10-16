@@ -1299,7 +1299,7 @@ struct MountSpec {
     size_mib: Option<u32>,
     quota_mib: Option<u32>,
     #[serde(default)]
-    deny: Vec<String>,
+    hide_path: Vec<String>,
     /// Per-mount stat-virtualization policy ("strict" | "relaxed" | "off").
     /// Only valid for bind / named mounts.
     stat_virtualization: Option<String>,
@@ -2100,16 +2100,16 @@ fn volume_mount(
     let quota_mib = m.quota_mib;
     let override_uid = m.override_uid;
     let override_gid = m.override_gid;
-    let deny = m.deny.clone();
-    for pattern in &deny {
-        microsandbox_types::validate_deny_pattern(pattern)
+    let hide_path = m.hide_path.clone();
+    for pattern in &hide_path {
+        microsandbox_types::validate_hide_path_pattern(pattern)
             .map_err(|err| FfiError::invalid_argument(err.to_string()))?;
     }
-    // Reject deny on anything that is not a bind mount before the owned-mount
+    // Reject hide_path on anything that is not a bind mount before the owned-mount
     // early return below, which would otherwise drop it silently.
-    if !deny.is_empty() && bind.is_none() {
+    if !hide_path.is_empty() && bind.is_none() {
         return Err(FfiError::invalid_argument(
-            "deny is only valid for bind mounts",
+            "hide_path is only valid for bind mounts",
         ));
     }
     let raw_named_mode = m.named_mode.clone();
@@ -2232,7 +2232,7 @@ fn volume_mount(
     // path, so a writable guest can rename an ancestor directory to launder it.
     // The shared validator rejects it in step with the Rust SDK and the runtime.
     if !readonly {
-        microsandbox_types::reject_writable_path_patterns(&deny)
+        microsandbox_types::reject_writable_path_patterns(&hide_path)
             .map_err(|err| FfiError::invalid_argument(err.to_string()))?;
     }
 
@@ -2245,8 +2245,8 @@ fn volume_mount(
             if let Some(quota) = quota_mib {
                 b = b.quota(quota);
             }
-            if !deny.is_empty() {
-                b = b.deny(deny.clone());
+            if !hide_path.is_empty() {
+                b = b.hide_path(hide_path.clone());
             }
             b
         } else if let Some(ref name) = named {
@@ -8117,26 +8117,27 @@ mod tests {
     }
 
     #[test]
-    fn mount_spec_parses_deny_list() {
+    fn mount_spec_parses_hide_path_list() {
         let spec: MountSpec =
-            serde_json::from_str(r#"{"bind":"/host/data","deny":[".env","sub/secret"]}"#).unwrap();
+            serde_json::from_str(r#"{"bind":"/host/data","hide_path":[".env","sub/secret"]}"#)
+                .unwrap();
 
         assert_eq!(spec.bind.as_deref(), Some("/host/data"));
-        assert_eq!(spec.deny, vec![".env", "sub/secret"]);
+        assert_eq!(spec.hide_path, vec![".env", "sub/secret"]);
     }
 
     #[test]
-    fn apply_volume_rejects_deny_with_wire_separator() {
+    fn apply_volume_rejects_hide_path_with_wire_separator() {
         for bad in [",", ":", "\n"] {
             let builder = microsandbox::sandbox::SandboxBuilder::new("test").image("alpine");
             let spec = MountSpec {
                 bind: Some("/host/data".to_string()),
-                deny: vec![format!("a{bad}b")],
+                hide_path: vec![format!("a{bad}b")],
                 ..Default::default()
             };
 
             let err = match apply_volume(builder, "/data", &spec) {
-                Ok(_) => panic!("deny pattern {bad:?} should be rejected"),
+                Ok(_) => panic!("hide-path pattern {bad:?} should be rejected"),
                 Err(err) => err,
             };
             assert!(
@@ -8148,17 +8149,17 @@ mod tests {
     }
 
     #[test]
-    fn apply_volume_rejects_deny_with_surrounding_whitespace() {
+    fn apply_volume_rejects_hide_path_with_surrounding_whitespace() {
         for bad in [" .env", ".env ", " !secret"] {
             let builder = microsandbox::sandbox::SandboxBuilder::new("test").image("alpine");
             let spec = MountSpec {
                 bind: Some("/host/data".to_string()),
-                deny: vec![bad.to_string()],
+                hide_path: vec![bad.to_string()],
                 ..Default::default()
             };
 
             let err = match apply_volume(builder, "/data", &spec) {
-                Ok(_) => panic!("deny pattern {bad:?} should be rejected"),
+                Ok(_) => panic!("hide-path pattern {bad:?} should be rejected"),
                 Err(err) => err,
             };
             assert!(
@@ -8246,16 +8247,16 @@ mod tests {
     }
 
     #[test]
-    fn apply_volume_rejects_empty_deny() {
+    fn apply_volume_rejects_empty_hide_path() {
         let builder = microsandbox::sandbox::SandboxBuilder::new("test").image("alpine");
         let spec = MountSpec {
             bind: Some("/host/data".to_string()),
-            deny: vec![String::new()],
+            hide_path: vec![String::new()],
             ..Default::default()
         };
 
         let err = match apply_volume(builder, "/data", &spec) {
-            Ok(_) => panic!("empty deny pattern should be rejected"),
+            Ok(_) => panic!("empty hide-path pattern should be rejected"),
             Err(err) => err,
         };
         assert!(
@@ -8266,67 +8267,70 @@ mod tests {
     }
 
     #[test]
-    fn apply_volume_rejects_deny_on_named_mount() {
+    fn apply_volume_rejects_hide_path_on_named_mount() {
         let builder = microsandbox::sandbox::SandboxBuilder::new("test").image("alpine");
         let spec = MountSpec {
             named: Some("vol".to_string()),
-            deny: vec![".env".to_string()],
+            hide_path: vec![".env".to_string()],
             ..Default::default()
         };
 
         let err = match apply_volume(builder, "/data", &spec) {
-            Ok(_) => panic!("deny on a named mount should be rejected"),
+            Ok(_) => panic!("hide_path on a named mount should be rejected"),
             Err(err) => err,
         };
         assert!(
-            err.message.contains("deny is only valid for bind mounts"),
+            err.message
+                .contains("hide_path is only valid for bind mounts"),
             "got: {}",
             err.message
         );
     }
 
     #[test]
-    fn apply_volume_rejects_deny_on_owned_mount() {
-        let spec: MountSpec = serde_json::from_str(r#"{"owned":"dir","deny":[".env"]}"#).unwrap();
+    fn apply_volume_rejects_hide_path_on_owned_mount() {
+        let spec: MountSpec =
+            serde_json::from_str(r#"{"owned":"dir","hide_path":[".env"]}"#).unwrap();
 
         let err = match volume_mount("/data", &spec) {
-            Ok(_) => panic!("deny on an owned mount should be rejected"),
+            Ok(_) => panic!("hide_path on an owned mount should be rejected"),
             Err(err) => err,
         };
         assert!(
-            err.message.contains("deny is only valid for bind mounts"),
+            err.message
+                .contains("hide_path is only valid for bind mounts"),
             "got: {}",
             err.message
         );
     }
 
     #[test]
-    fn apply_volume_rejects_writable_path_deny_pattern() {
+    fn apply_volume_rejects_writable_path_hide_path_pattern() {
         let builder = microsandbox::sandbox::SandboxBuilder::new("test").image("alpine");
         let spec = MountSpec {
             bind: Some("/host/data".to_string()),
-            deny: vec!["sub/secret".to_string()],
+            hide_path: vec!["sub/secret".to_string()],
             ..Default::default()
         };
 
         let err = match apply_volume(builder, "/data", &spec) {
-            Ok(_) => panic!("path deny on a writable mount should be rejected"),
+            Ok(_) => panic!("path hide_path on a writable mount should be rejected"),
             Err(err) => err,
         };
         assert!(err.message.contains("path pattern"), "got: {}", err.message);
     }
 
     #[test]
-    fn apply_volume_rejects_deny_with_leading_hash() {
+    fn apply_volume_rejects_hide_path_with_leading_hash() {
         let builder = microsandbox::sandbox::SandboxBuilder::new("test").image("alpine");
         let spec = MountSpec {
             bind: Some("/host/data".to_string()),
-            deny: vec!["#secret".to_string()],
+            hide_path: vec!["#secret".to_string()],
             ..Default::default()
         };
 
         let err = match apply_volume(builder, "/data", &spec) {
-            Ok(_) => panic!("leading-# deny should be rejected"),
+            Ok(_) => panic!("leading-# hide_path should be rejected"),
             Err(err) => err,
         };
         assert!(
@@ -8337,7 +8341,7 @@ mod tests {
     }
 
     #[test]
-    fn deny_pattern_fixture_dispositions_match_go_native_validator() {
+    fn hide_path_pattern_fixture_dispositions_match_go_native_validator() {
         #[derive(serde::Deserialize)]
         struct Case {
             pattern: String,
@@ -8346,8 +8350,8 @@ mod tests {
         }
 
         let cases: Vec<Case> =
-            serde_json::from_str(microsandbox_types::fixtures::DENY_FIXTURE_JSON)
-                .expect("parse deny fixture");
+            serde_json::from_str(microsandbox_types::fixtures::HIDE_PATH_FIXTURE_JSON)
+                .expect("parse hide-path fixture");
         assert!(!cases.is_empty(), "fixture must not be empty");
 
         for case in cases {
@@ -8355,7 +8359,7 @@ mod tests {
             let spec = MountSpec {
                 bind: Some("/host/data".to_string()),
                 readonly: case.readonly,
-                deny: vec![case.pattern.clone()],
+                hide_path: vec![case.pattern.clone()],
                 ..Default::default()
             };
             let result = apply_volume(builder, "/data", &spec);
@@ -8379,11 +8383,11 @@ mod tests {
     }
 
     #[test]
-    fn apply_volume_allows_readonly_path_deny_and_writable_name_only_deny() {
+    fn apply_volume_allows_readonly_path_hide_path_and_writable_name_only_hide_path() {
         let readonly = MountSpec {
             bind: Some("/host/data".to_string()),
             readonly: true,
-            deny: vec!["sub/secret".to_string()],
+            hide_path: vec!["sub/secret".to_string()],
             ..Default::default()
         };
         let builder = microsandbox::sandbox::SandboxBuilder::new("test").image("alpine");
@@ -8392,7 +8396,7 @@ mod tests {
 
         let name_only = MountSpec {
             bind: Some("/host/data".to_string()),
-            deny: vec![".env".to_string(), "node_modules/".to_string()],
+            hide_path: vec![".env".to_string(), "node_modules/".to_string()],
             ..Default::default()
         };
         let builder = microsandbox::sandbox::SandboxBuilder::new("test").image("alpine");

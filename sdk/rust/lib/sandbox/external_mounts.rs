@@ -39,8 +39,8 @@ pub(crate) fn require_recorded_mounts(
     if policies.is_none() && !guest_paths.is_empty() {
         tracing::warn!(
             mounts = guest_paths.len(),
-            "snapshot records external mounts without a captured deny policy; \
-             a restored deny list cannot be compared and is accepted as unknown"
+            "snapshot records external mounts without a captured hide-path policy; \
+             a restored hide-path list cannot be compared and is accepted as unknown"
         );
     }
 
@@ -91,7 +91,7 @@ pub(crate) fn require_guest_mounts(
     let mut mounts = config.spec.mounts.clone();
     canonicalize_volume_mounts(&mut mounts)?;
 
-    reject_weakened_deny(&mounts, captured_policies.as_deref())?;
+    reject_weakened_hide_path(&mounts, captured_policies.as_deref())?;
 
     if !config.restore_resources.require_complete {
         return Ok(());
@@ -123,18 +123,18 @@ pub(crate) fn require_guest_mounts(
     }
 }
 
-/// Refuse a destination deny list that is not at least as strict as the captured one.
+/// Refuse a destination hide-path list that is not at least as strict as the captured one.
 ///
-/// Only bind mounts carry a deny list; a destination that remaps a captured bind
+/// Only bind mounts carry a hide-path list; a destination that remaps a captured bind
 /// to a non-bind or drops one of its patterns would re-expose a path the source
-/// hid. A stricter (superset) deny list is accepted, but a gitignore negation
+/// hid. A stricter (superset) hide-path list is accepted, but a gitignore negation
 /// (`!name`) re-exposes a name, so a negation the capture did not contain is a
 /// weakening even when every captured positive pattern is still present.
 /// Reordering matters too because gitignore is last-match-wins, so the captured
 /// patterns must appear in the destination as an order-preserving subsequence.
 /// `None` means the capture predates policy recording and is treated as unknown,
 /// never as an empty list.
-fn reject_weakened_deny(
+fn reject_weakened_hide_path(
     mounts: &[VolumeMount],
     captured_policies: Option<&[ExternalMountPolicy]>,
 ) -> MicrosandboxResult<()> {
@@ -149,8 +149,8 @@ fn reject_weakened_deny(
         else {
             continue;
         };
-        let destination_deny: &[String] = match destination {
-            VolumeMount::Bind { deny, .. } => deny,
+        let destination_hide_path: &[String] = match destination {
+            VolumeMount::Bind { hide_path, .. } => hide_path,
             _ => &[],
         };
         // Gitignore rules are last-match-wins, so a destination that keeps the
@@ -160,17 +160,17 @@ fn reject_weakened_deny(
         // order-preserving subsequence of the destination: this rejects drops and
         // reorders while still allowing extra positive patterns (which only hide
         // more).
-        let mut remaining = destination_deny.iter();
+        let mut remaining = destination_hide_path.iter();
         let preserves_order = policy
-            .deny
+            .hide_path
             .iter()
             .all(|pattern| remaining.by_ref().any(|candidate| candidate == pattern));
-        let introduces_negation = destination_deny
+        let introduces_negation = destination_hide_path
             .iter()
-            .any(|pattern| pattern.starts_with('!') && !policy.deny.contains(pattern));
+            .any(|pattern| pattern.starts_with('!') && !policy.hide_path.contains(pattern));
         if !preserves_order || introduces_negation {
             return Err(MicrosandboxError::InvalidConfig(format!(
-                "restore would weaken bind-mount deny policy at {}; re-declare the deny list",
+                "restore would weaken bind-mount hide-path policy at {}; re-declare the hide-path list",
                 policy.guest_path
             )));
         }
@@ -179,19 +179,19 @@ fn reject_weakened_deny(
     Ok(())
 }
 
-/// Refuse a branch child whose explicit mounts drop or weaken a source bind's deny list.
+/// Refuse a branch child whose explicit mounts drop or weaken a source bind's hide-path list.
 ///
 /// A local branch clears the source's external binds, so a child that does not
-/// inherit resources must re-declare each deny-bearing bind with a deny list at
+/// inherit resources must re-declare each hide_path-bearing bind with a hide-path list at
 /// least as strict as the source's. Omitting the mount entirely is refused too:
 /// the source bind is gone, so silently proceeding would drop its policy. Callers
-/// use [`require_preserved_inherited_bind_deny`] instead when the child inherits
-/// resources, because the source mount (including its deny list) is reconnected.
-pub(crate) fn require_preserved_bind_deny(
+/// use [`require_preserved_inherited_bind_hide_path`] instead when the child inherits
+/// resources, because the source mount (including its hide-path list) is reconnected.
+pub(crate) fn require_preserved_bind_hide_path(
     source_mounts: &[VolumeMount],
     destination_mounts: &[VolumeMount],
 ) -> MicrosandboxResult<()> {
-    let policies = deny_policies(source_mounts)?;
+    let policies = hide_path_policies(source_mounts)?;
     if policies.is_empty() {
         return Ok(());
     }
@@ -205,28 +205,28 @@ pub(crate) fn require_preserved_bind_deny(
             .any(|mount| mount.guest() == policy.guest_path)
         {
             return Err(MicrosandboxError::InvalidConfig(format!(
-                "branch of a deny-bearing source must re-declare the deny-bearing mount at {}; \
+                "branch of a hide_path-bearing source must re-declare the hide_path-bearing mount at {}; \
                  the child omits it",
                 policy.guest_path
             )));
         }
     }
 
-    reject_weakened_deny(&destination, Some(&policies))
+    reject_weakened_hide_path(&destination, Some(&policies))
 }
 
-/// Refuse a branch child whose explicit mount weakens an inherited deny-bearing bind.
+/// Refuse a branch child whose explicit mount weakens an inherited hide_path-bearing bind.
 ///
-/// With resource inheritance the source's deny-bearing bind is reconnected, so an
+/// With resource inheritance the source's hide_path-bearing bind is reconnected, so an
 /// omitted explicit mount is safe. But an explicit child mount at the same guest path
 /// overrides that inherited source mount, so it must not drop or weaken the source's
-/// deny list. This applies the same weakening check as a restore, without requiring
+/// hide-path list. This applies the same weakening check as a restore, without requiring
 /// the mount to be present merely because it is inherited.
-pub(crate) fn require_preserved_inherited_bind_deny(
+pub(crate) fn require_preserved_inherited_bind_hide_path(
     source_mounts: &[VolumeMount],
     destination_mounts: &[VolumeMount],
 ) -> MicrosandboxResult<()> {
-    let policies = deny_policies(source_mounts)?;
+    let policies = hide_path_policies(source_mounts)?;
     if policies.is_empty() {
         return Ok(());
     }
@@ -234,23 +234,25 @@ pub(crate) fn require_preserved_inherited_bind_deny(
     let mut destination = destination_mounts.to_vec();
     canonicalize_volume_mounts(&mut destination)?;
 
-    reject_weakened_deny(&destination, Some(&policies))
+    reject_weakened_hide_path(&destination, Some(&policies))
 }
 
-/// Capture the deny policies of the source bind mounts, canonicalizing guest paths.
-fn deny_policies(source_mounts: &[VolumeMount]) -> MicrosandboxResult<Vec<ExternalMountPolicy>> {
+/// Capture the hide_path policies of the source bind mounts, canonicalizing guest paths.
+fn hide_path_policies(
+    source_mounts: &[VolumeMount],
+) -> MicrosandboxResult<Vec<ExternalMountPolicy>> {
     let mut source = source_mounts.to_vec();
     canonicalize_volume_mounts(&mut source)?;
 
     Ok(source
         .iter()
         .filter_map(|mount| match mount {
-            VolumeMount::Bind { guest, deny, .. } if !deny.is_empty() => {
-                Some(ExternalMountPolicy {
-                    guest_path: guest.clone(),
-                    deny: deny.clone(),
-                })
-            }
+            VolumeMount::Bind {
+                guest, hide_path, ..
+            } if !hide_path.is_empty() => Some(ExternalMountPolicy {
+                guest_path: guest.clone(),
+                hide_path: hide_path.clone(),
+            }),
             _ => None,
         })
         .collect())
@@ -742,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_rejects_bind_that_drops_captured_deny() {
+    fn restore_rejects_bind_that_drops_captured_hide_path() {
         let mut config = SandboxBuilder::new("restore")
             .volume("/data", |m| m.bind("/tmp/d"))
             .config
@@ -750,7 +752,7 @@ mod tests {
         config.restore_resources.require_complete = true;
         let captured = vec![ExternalMountPolicy {
             guest_path: "/data".into(),
-            deny: vec![".env".into()],
+            hide_path: vec![".env".into()],
         }];
 
         let refusal =
@@ -758,37 +760,37 @@ mod tests {
         let error = refusal.to_string();
 
         assert!(
-            error.contains("weaken bind-mount deny policy at /data"),
+            error.contains("weaken bind-mount hide-path policy at /data"),
             "{error}"
         );
-        assert!(error.contains("re-declare the deny list"), "{error}");
+        assert!(error.contains("re-declare the hide-path list"), "{error}");
     }
 
     #[test]
-    fn restore_accepts_bind_that_preserves_deny() {
+    fn restore_accepts_bind_that_preserves_hide_path() {
         let mut config = SandboxBuilder::new("restore")
-            .volume("/data", |m| m.bind("/tmp/d").deny([".env"]))
+            .volume("/data", |m| m.bind("/tmp/d").hide_path([".env"]))
             .config
             .into_config();
         config.restore_resources.require_complete = true;
         let captured = vec![ExternalMountPolicy {
             guest_path: "/data".into(),
-            deny: vec![".env".into()],
+            hide_path: vec![".env".into()],
         }];
 
         require_guest_mounts(&config, vec!["/data".into()], Some(captured)).unwrap();
     }
 
     #[test]
-    fn restore_accepts_bind_that_strengthens_deny() {
+    fn restore_accepts_bind_that_strengthens_hide_path() {
         let mut config = SandboxBuilder::new("restore")
-            .volume("/data", |m| m.bind("/tmp/d").deny([".env", "*.log"]))
+            .volume("/data", |m| m.bind("/tmp/d").hide_path([".env", "*.log"]))
             .config
             .into_config();
         config.restore_resources.require_complete = true;
         let captured = vec![ExternalMountPolicy {
             guest_path: "/data".into(),
-            deny: vec![".env".into()],
+            hide_path: vec![".env".into()],
         }];
 
         require_guest_mounts(&config, vec!["/data".into()], Some(captured)).unwrap();
@@ -797,28 +799,28 @@ mod tests {
     #[test]
     fn restore_accepts_bind_that_adds_a_positive_pattern() {
         let mut config = SandboxBuilder::new("restore")
-            .volume("/data", |m| m.bind("/tmp/d").deny([".env", ".git"]))
+            .volume("/data", |m| m.bind("/tmp/d").hide_path([".env", ".git"]))
             .config
             .into_config();
         config.restore_resources.require_complete = true;
         let captured = vec![ExternalMountPolicy {
             guest_path: "/data".into(),
-            deny: vec![".env".into()],
+            hide_path: vec![".env".into()],
         }];
 
         require_guest_mounts(&config, vec!["/data".into()], Some(captured)).unwrap();
     }
 
     #[test]
-    fn restore_rejects_destination_negation_that_reopens_captured_deny() {
+    fn restore_rejects_destination_negation_that_reopens_captured_hide_path() {
         let mut config = SandboxBuilder::new("restore")
-            .volume("/data", |m| m.bind("/tmp/d").deny([".env", "!.env"]))
+            .volume("/data", |m| m.bind("/tmp/d").hide_path([".env", "!.env"]))
             .config
             .into_config();
         config.restore_resources.require_complete = true;
         let captured = vec![ExternalMountPolicy {
             guest_path: "/data".into(),
-            deny: vec![".env".into()],
+            hide_path: vec![".env".into()],
         }];
 
         let refusal = require_guest_mounts(&config, vec!["/data".into()], Some(captured))
@@ -826,26 +828,26 @@ mod tests {
         let error = refusal.to_string();
 
         assert!(
-            error.contains("weaken bind-mount deny policy at /data"),
+            error.contains("weaken bind-mount hide-path policy at /data"),
             "{error}"
         );
     }
 
     #[test]
-    fn restore_rejects_reordered_deny_that_reopens_captured_name() {
+    fn restore_rejects_reordered_hide_path_that_reopens_captured_name() {
         // Same set, different order: gitignore is last-match-wins, so moving the
         // `!*.txt` negation after `secret.txt` re-exposes it even though every
         // captured pattern is still present.
         let mut config = SandboxBuilder::new("restore")
             .volume("/data", |m| {
-                m.bind("/tmp/d").deny(["*", "secret.txt", "!*.txt"])
+                m.bind("/tmp/d").hide_path(["*", "secret.txt", "!*.txt"])
             })
             .config
             .into_config();
         config.restore_resources.require_complete = true;
         let captured = vec![ExternalMountPolicy {
             guest_path: "/data".into(),
-            deny: vec!["*".into(), "!*.txt".into(), "secret.txt".into()],
+            hide_path: vec!["*".into(), "!*.txt".into(), "secret.txt".into()],
         }];
 
         let refusal = require_guest_mounts(&config, vec!["/data".into()], Some(captured))
@@ -853,7 +855,7 @@ mod tests {
         let error = refusal.to_string();
 
         assert!(
-            error.contains("weaken bind-mount deny policy at /data"),
+            error.contains("weaken bind-mount hide-path policy at /data"),
             "{error}"
         );
     }

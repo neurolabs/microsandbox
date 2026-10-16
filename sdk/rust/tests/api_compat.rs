@@ -110,7 +110,7 @@ async fn rust_sandbox_fs_handle_api_stays_available(
 }
 
 #[test]
-fn volume_mount_bind_constructor_round_trips_with_default_deny() {
+fn volume_mount_bind_constructor_round_trips_with_default_hide_path() {
     use microsandbox::sandbox::VolumeMount;
 
     // The stable constructor is the external-crate construction path; it must
@@ -119,14 +119,17 @@ fn volume_mount_bind_constructor_round_trips_with_default_deny() {
     let mount = VolumeMount::bind("/host/data", "/data");
     let encoded = serde_json::to_value(&mount).unwrap();
     assert_eq!(encoded["type"], "Bind");
-    assert_eq!(encoded["deny"], serde_json::json!([]));
+    assert_eq!(encoded["hide_path"], serde_json::json!([]));
 
     let decoded: VolumeMount = serde_json::from_value(encoded).unwrap();
     match decoded {
         VolumeMount::Bind {
-            host, guest, deny, ..
+            host,
+            guest,
+            hide_path,
+            ..
         } => {
-            assert!(deny.is_empty());
+            assert!(hide_path.is_empty());
             assert_eq!(host, std::path::PathBuf::from("/host/data"));
             assert_eq!(guest, "/data");
         }

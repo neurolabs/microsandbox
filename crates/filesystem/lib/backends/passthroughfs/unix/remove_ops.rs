@@ -22,7 +22,7 @@ use crate::{
 /// `RENAME_EXCHANGE` flag: atomically swap source and destination.
 ///
 /// This is the Linux value; the macOS branch maps it to `RENAME_SWAP` before
-/// calling `renameatx_np`, but the deny checks below reason about the flag in
+/// calling `renameatx_np`, but the hide-path checks below reason about the flag in
 /// this shared numbering.
 const RENAME_EXCHANGE: u32 = 2;
 
@@ -30,11 +30,11 @@ const RENAME_EXCHANGE: u32 = 2;
 // Types
 //--------------------------------------------------------------------------------------------------
 
-/// Platform-agnostic outcome of the deny decision for a rename.
+/// Platform-agnostic outcome of the hide_path decision for a rename.
 pub(super) enum RenameDecision {
-    /// No deny rule matched and the checked identities are fresh: perform the move.
+    /// No hide-path rule matched and the checked identities are fresh: perform the move.
     Proceed,
-    /// A deny rule matched: the caller returns `EACCES`.
+    /// A hide-path rule matched: the caller returns `EACCES`.
     Deny,
     /// A checked identity went stale: the caller retries from the top.
     Retry,
@@ -52,7 +52,7 @@ pub(super) struct RenameEndpoint<'a> {
 }
 
 /// Expected state of an atomic exchange (`RENAME_EXCHANGE`/`RENAME_SWAP`)
-/// destination, captured when its type drives a directory-only deny decision.
+/// destination, captured when its type drives a directory-only hide_path decision.
 ///
 /// The destination is re-read immediately before the move and the whole
 /// check-and-move is retried when it no longer matches. A destination that was
@@ -96,7 +96,7 @@ impl ExchangeDest {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
-/// Apply the deny rules for a rename, shared by the Linux and macOS branches.
+/// Apply the hide-path rules for a rename, shared by the Linux and macOS branches.
 ///
 /// `source_st` is the source's freshly captured `fstat`, whose type and identity
 /// the decision is pinned to. Returns [`RenameDecision::Deny`] when a pattern
@@ -104,7 +104,7 @@ impl ExchangeDest {
 /// changed under us, and [`RenameDecision::Proceed`] when the move may run. The
 /// platform-specific syscall and any post-rename inode bookkeeping stay in the
 /// caller.
-pub(super) fn decide_rename_deny(
+pub(super) fn decide_rename_hide_path(
     fs: &PassthroughFs,
     old: RenameEndpoint<'_>,
     new: RenameEndpoint<'_>,
@@ -114,22 +114,22 @@ pub(super) fn decide_rename_deny(
     // A rename replaces the destination with the source's type (and, for an
     // exchange, moves the destination onto the source name), so the source's
     // type drives every dir-only decision in both directions.
-    let source_is_dir = fs.deny.has_dir_only_patterns()
+    let source_is_dir = fs.hide_path.has_dir_only_patterns()
         && platform::mode_file_type(source_st.st_mode) == platform::MODE_DIR;
 
     // Resolve each parent's mount-relative path once per attempt and reuse it
-    // across the deny checks below: path patterns need it for every match, and
-    // one resolution dominates the cost of a deny check. Component-only patterns
+    // across the hide-path checks below: path patterns need it for every match, and
+    // one resolution dominates the cost of a hide-path check. Component-only patterns
     // skip resolution entirely (basename fast path). An unresolvable parent fails
-    // closed, mirroring `deny_matches_name`.
-    let (old_comps, new_comps) = if fs.deny.needs_path_reconstruction() {
-        let old_comps = inode::parent_path_components(&fs.inodes, old.dir, fs.deny_root())
+    // closed, mirroring `hide_path_matches_name`.
+    let (old_comps, new_comps) = if fs.hide_path.needs_path_reconstruction() {
+        let old_comps = inode::parent_path_components(&fs.inodes, old.dir, fs.hide_path_root())
             .ok_or_else(platform::eacces)?;
         // Same-directory renames are the dominant case; resolve once.
         let new_comps = if new.dir == old.dir {
             old_comps.clone()
         } else {
-            inode::parent_path_components(&fs.inodes, new.dir, fs.deny_root())
+            inode::parent_path_components(&fs.inodes, new.dir, fs.hide_path_root())
                 .ok_or_else(platform::eacces)?
         };
         (Some(old_comps), Some(new_comps))
@@ -139,16 +139,16 @@ pub(super) fn decide_rename_deny(
 
     // Case behavior is per directory (Linux ext4/btrfs casefold), so resolve
     // each parent's once and reuse it for every check below.
-    let old_case = fs.deny_case_insensitive(old.dir);
-    let new_case = fs.deny_case_insensitive(new.dir);
+    let old_case = fs.hide_path_case_insensitive(old.dir);
+    let new_case = fs.hide_path_case_insensitive(new.dir);
 
-    // Authoritative deny decision against the pinned source type.
-    if fs.deny_matches_name_in_dir(
+    // Authoritative hide_path decision against the pinned source type.
+    if fs.hide_path_matches_name_in_dir(
         old_comps.as_deref(),
         old.name.to_bytes(),
         source_is_dir,
         old_case,
-    ) || fs.deny_matches_name_in_dir(
+    ) || fs.hide_path_matches_name_in_dir(
         new_comps.as_deref(),
         new.name.to_bytes(),
         source_is_dir,
@@ -158,14 +158,14 @@ pub(super) fn decide_rename_deny(
     }
 
     let mut exchange_dest = None;
-    if fs.deny.has_dir_only_patterns() {
+    if fs.hide_path.has_dir_only_patterns() {
         let dest_st = platform::fstatat_nofollow(new.fd.raw(), new.name).ok();
         let dest_is_dir = dest_st
             .as_ref()
             .map(|st| platform::mode_file_type(st.st_mode) == platform::MODE_DIR)
             .unwrap_or(false);
         if dest_is_dir
-            && fs.deny_matches_name_in_dir(
+            && fs.hide_path_matches_name_in_dir(
                 new_comps.as_deref(),
                 new.name.to_bytes(),
                 true,
@@ -180,7 +180,7 @@ pub(super) fn decide_rename_deny(
         // otherwise land the directory at the denied name.
         if flags & RENAME_EXCHANGE != 0 {
             if dest_is_dir
-                && fs.deny_matches_name_in_dir(
+                && fs.hide_path_matches_name_in_dir(
                     old_comps.as_deref(),
                     old.name.to_bytes(),
                     true,
@@ -254,14 +254,14 @@ pub(crate) fn do_unlink(
     // name exists and is a directory. Only dir-only patterns depend on the
     // entry's type, so stat only when one is present; an unresolved type fails
     // closed by matching as a directory.
-    let is_dir = if fs.deny.has_dir_only_patterns() {
+    let is_dir = if fs.hide_path.has_dir_only_patterns() {
         platform::fstatat_nofollow(parent_fd.raw(), name)
             .map(|st| platform::mode_file_type(st.st_mode) == platform::MODE_DIR)
             .unwrap_or(true)
     } else {
         false
     };
-    if fs.deny_matches_name(parent, name.to_bytes(), is_dir) {
+    if fs.hide_path_matches_name(parent, name.to_bytes(), is_dir) {
         return Err(platform::eacces());
     }
 
@@ -388,7 +388,7 @@ pub(crate) fn do_rmdir(
         return Err(platform::eacces());
     }
 
-    if fs.deny_matches_name(parent, name.to_bytes(), true) {
+    if fs.hide_path_matches_name(parent, name.to_bytes(), true) {
         return Err(platform::eacces());
     }
 
@@ -477,7 +477,7 @@ pub(crate) fn do_rename(
 
     #[cfg(target_os = "linux")]
     {
-        // The source type can change between the deny checks and the move,
+        // The source type can change between the hide-path checks and the move,
         // because external writers (host processes, or a second mount on the
         // same host directory) bypass the single-threaded virtio-fs worker that
         // serializes guest requests. A directory swapped in for a file would
@@ -523,7 +523,7 @@ pub(crate) fn do_rename(
             };
             unsafe { libc::close(source_probe_fd) };
 
-            match decide_rename_deny(
+            match decide_rename_hide_path(
                 fs,
                 RenameEndpoint {
                     fd: &old_fd,
@@ -639,7 +639,7 @@ pub(crate) fn do_rename(
     #[cfg(target_os = "macos")]
     {
         // Same verify-identity-and-retry narrowing as the Linux branch: an
-        // external writer can swap the source inode between the deny checks
+        // external writer can swap the source inode between the hide-path checks
         // and the move, letting a directory land at a dir-only-denied
         // destination. Capture the source identity, re-verify the source path
         // still refers to it immediately before the move, and retry on a
@@ -658,7 +658,7 @@ pub(crate) fn do_rename(
 
             let source_st = platform::fstatat_nofollow(old_fd.raw(), oldname)?;
 
-            match decide_rename_deny(
+            match decide_rename_hide_path(
                 fs,
                 RenameEndpoint {
                     fd: &old_fd,

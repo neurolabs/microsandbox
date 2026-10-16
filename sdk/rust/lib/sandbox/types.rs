@@ -66,7 +66,7 @@ pub struct MountBuilder {
     stat_virtualization: Option<StatVirtualization>,
     host_permissions: Option<HostPermissions>,
     follow_root_symlinks: bool,
-    deny: Vec<String>,
+    hide_path: Vec<String>,
     error: Option<crate::MicrosandboxError>,
 }
 
@@ -276,7 +276,7 @@ impl MountBuilder {
             stat_virtualization: None,
             host_permissions: None,
             follow_root_symlinks: false,
-            deny: Vec::new(),
+            hide_path: Vec::new(),
             error: None,
         }
     }
@@ -505,8 +505,8 @@ impl MountBuilder {
     /// bind mounts; a host file bind has no namespace to filter and rejects them.
     /// A path pattern requires a read-only mount, since a writable guest could
     /// rename an ancestor directory to bypass it.
-    pub fn deny(mut self, patterns: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.deny.extend(patterns.into_iter().map(Into::into));
+    pub fn hide_path(mut self, patterns: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.hide_path.extend(patterns.into_iter().map(Into::into));
         self
     }
 
@@ -595,12 +595,12 @@ impl MountBuilder {
                     .into(),
             ));
         }
-        if !self.deny.is_empty() && !is_bind {
+        if !self.hide_path.is_empty() && !is_bind {
             return Err(crate::MicrosandboxError::InvalidConfig(
-                ".deny() is only valid for bind mounts".into(),
+                ".hide_path() is only valid for bind mounts".into(),
             ));
         }
-        microsandbox_types::validate_deny_list(&self.deny, self.options.readonly)
+        microsandbox_types::validate_hide_path_list(&self.hide_path, self.options.readonly)
             .map_err(|err| crate::MicrosandboxError::InvalidConfig(err.to_string()))?;
         if self.disk_format.is_some() && !is_disk {
             return Err(crate::MicrosandboxError::InvalidConfig(
@@ -702,7 +702,7 @@ impl MountBuilder {
                         host_permissions: mount_perms,
                         follow_root_symlinks,
                         quota_mib,
-                        deny,
+                        hide_path,
                         ..
                     } => {
                         *options = self.options;
@@ -710,7 +710,7 @@ impl MountBuilder {
                         *mount_perms = host_permissions;
                         *follow_root_symlinks = self.follow_root_symlinks;
                         *quota_mib = self.quota_mib;
-                        *deny = self.deny.clone();
+                        *hide_path = self.hide_path.clone();
                     }
                     _ => unreachable!("VolumeMount::bind constructs a Bind mount"),
                 }
@@ -1353,12 +1353,12 @@ fn validate_volume_mount(mount: &VolumeMount) -> crate::MicrosandboxResult<()> {
             options,
             stat_virtualization,
             host_permissions,
-            deny,
+            hide_path,
             ..
         } => {
             validate_host_path_wire_safe(host, "bind host path")?;
             validate_virtiofs_policies(*stat_virtualization, *host_permissions, options)?;
-            microsandbox_types::validate_deny_list(deny, options.readonly)
+            microsandbox_types::validate_hide_path_list(hide_path, options.readonly)
                 .map_err(|err| crate::MicrosandboxError::InvalidConfig(err.to_string()))?;
         }
         VolumeMount::Named {
@@ -1590,7 +1590,7 @@ mod tests {
         host_permissions: HostPermissions,
         follow_root_symlinks: bool,
         quota_mib: Option<u32>,
-        deny: Vec<String>,
+        hide_path: Vec<String>,
     ) -> VolumeMount {
         let mut mount = VolumeMount::bind(host, guest);
         match &mut mount {
@@ -1600,7 +1600,7 @@ mod tests {
                 host_permissions: mount_perms,
                 follow_root_symlinks: mount_follow,
                 quota_mib: mount_quota,
-                deny: mount_deny,
+                hide_path: mount_hide_path,
                 ..
             } => {
                 *mount_options = options;
@@ -1608,7 +1608,7 @@ mod tests {
                 *mount_perms = host_permissions;
                 *mount_follow = follow_root_symlinks;
                 *mount_quota = quota_mib;
-                *mount_deny = deny;
+                *mount_hide_path = hide_path;
             }
             _ => unreachable!("VolumeMount::bind constructs a Bind mount"),
         }
@@ -1779,41 +1779,41 @@ mod tests {
     }
 
     #[test]
-    fn test_mount_builder_deny_on_bind() {
+    fn test_mount_builder_hide_path_on_bind() {
         let mount = MountBuilder::new("/data")
             .bind("/host/data")
             // Path patterns (`sub/secret`) require a read-only mount.
             .readonly()
-            .deny([".env", "*.log", "sub/secret"])
+            .hide_path([".env", "*.log", "sub/secret"])
             .build()
             .unwrap();
         match mount {
-            VolumeMount::Bind { deny, .. } => {
-                assert_eq!(deny, vec![".env", "*.log", "sub/secret"]);
+            VolumeMount::Bind { hide_path, .. } => {
+                assert_eq!(hide_path, vec![".env", "*.log", "sub/secret"]);
             }
             other => panic!("expected bind mount, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_mount_builder_deny_rejected_on_non_bind() {
+    fn test_mount_builder_hide_path_rejected_on_non_bind() {
         let err = MountBuilder::new("/data")
             .tmpfs()
-            .deny(["secret"])
+            .hide_path(["secret"])
             .build()
             .unwrap_err();
         assert!(
             err.to_string()
-                .contains(".deny() is only valid for bind mounts")
+                .contains(".hide_path() is only valid for bind mounts")
         );
     }
 
     #[test]
-    fn test_mount_builder_deny_rejects_wire_separators() {
+    fn test_mount_builder_hide_path_rejects_wire_separators() {
         for bad in [",", ":", "\n", "\0"] {
             let err = MountBuilder::new("/data")
                 .bind("/host/data")
-                .deny([format!("a{bad}b")])
+                .hide_path([format!("a{bad}b")])
                 .build()
                 .unwrap_err();
             assert!(
@@ -1824,10 +1824,10 @@ mod tests {
     }
 
     #[test]
-    fn test_mount_builder_deny_rejects_empty_pattern() {
+    fn test_mount_builder_hide_path_rejects_empty_pattern() {
         let err = MountBuilder::new("/data")
             .bind("/host/data")
-            .deny([""])
+            .hide_path([""])
             .build()
             .unwrap_err();
         assert!(
@@ -1837,11 +1837,11 @@ mod tests {
     }
 
     #[test]
-    fn test_mount_builder_deny_rejects_surrounding_whitespace() {
+    fn test_mount_builder_hide_path_rejects_surrounding_whitespace() {
         for bad in [" .env", ".env ", " !secret", "\tsecret"] {
             let err = MountBuilder::new("/data")
                 .bind("/host/data")
-                .deny([bad])
+                .hide_path([bad])
                 .build()
                 .unwrap_err();
             assert!(
@@ -1853,10 +1853,10 @@ mod tests {
     }
 
     #[test]
-    fn test_mount_builder_rejects_path_deny_on_writable_mount() {
+    fn test_mount_builder_rejects_path_hide_path_on_writable_mount() {
         let err = MountBuilder::new("/data")
             .bind("/host/data")
-            .deny(["sub/.env"])
+            .hide_path(["sub/.env"])
             .build()
             .unwrap_err();
         assert!(err.to_string().contains("path pattern"), "{err}");
@@ -1865,14 +1865,14 @@ mod tests {
         MountBuilder::new("/data")
             .bind("/host/data")
             .readonly()
-            .deny(["sub/.env"])
+            .hide_path(["sub/.env"])
             .build()
             .unwrap();
 
         // Name-only and directory-only patterns match anywhere and stay valid.
         MountBuilder::new("/data")
             .bind("/host/data")
-            .deny([".env", "node_modules/"])
+            .hide_path([".env", "node_modules/"])
             .build()
             .unwrap();
     }
@@ -2035,7 +2035,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_volume_mounts_rejects_direct_bind_deny_separators() {
+    fn test_validate_volume_mounts_rejects_direct_bind_hide_path_separators() {
         let mut mount = bind_mount(
             "/host/data",
             "/data",
@@ -2052,7 +2052,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_volume_mounts_rejects_direct_bind_empty_deny_pattern() {
+    fn test_validate_volume_mounts_rejects_direct_bind_empty_hide_path_pattern() {
         let mut mount = bind_mount(
             "/host/data",
             "/data",
@@ -2069,7 +2069,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_volume_mounts_accepts_direct_bind_valid_deny() {
+    fn test_validate_volume_mounts_accepts_direct_bind_valid_hide_path() {
         let mut mount = bind_mount(
             "/host/data",
             "/data",
@@ -2085,7 +2085,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_volume_mounts_rejects_path_deny_on_writable_bind() {
+    fn test_validate_volume_mounts_rejects_path_hide_path_on_writable_bind() {
         let mut mount = bind_mount(
             "/host/data",
             "/data",
@@ -2102,7 +2102,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_volume_mounts_accepts_path_deny_on_readonly_bind() {
+    fn test_validate_volume_mounts_accepts_path_hide_path_on_readonly_bind() {
         let mut mount = bind_mount(
             "/host/data",
             "/data",

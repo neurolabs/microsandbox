@@ -224,7 +224,7 @@ impl PassthroughFs {
         Ok(data)
     }
 
-    /// Re-apply the directory-only deny rule to an inode's live path.
+    /// Re-apply the directory-only hide-path rule to an inode's live path.
     ///
     /// Windows inodes cache a path and are not revalidated against the live
     /// filesystem. A host writer could replace an allowed file at a
@@ -237,7 +237,7 @@ impl PassthroughFs {
         // The synthetic inodes (`ROOT_INODE`, `INIT_INODE`) are never path-backed
         // namespace entries. Exempting them keeps an unknown-inode `EBADF` from
         // shadowing `do_setattr`'s own handling (e.g. `EACCES` for `INIT_INODE`).
-        if inode <= INIT_INODE || !self.deny.has_dir_only_patterns() {
+        if inode <= INIT_INODE || !self.hide_path.has_dir_only_patterns() {
             return Ok(());
         }
         let data = self.inode(inode)?;
@@ -249,7 +249,7 @@ impl PassthroughFs {
             .safe_metadata(&path)
             .map(|metadata| metadata.file_type().is_dir())
             .unwrap_or(true);
-        if self.deny_matches_path(&path, is_dir) {
+        if self.hide_path_matches_path(&path, is_dir) {
             return Err(linux_error(LINUX_ENOENT));
         }
         Ok(())
@@ -265,8 +265,8 @@ impl PassthroughFs {
         // read or write inside the now-hidden directory. The mount root is never
         // denied.
         if parent != ROOT_INODE
-            && self.deny.has_dir_only_patterns()
-            && self.deny_matches_path(&data.path(), true)
+            && self.hide_path.has_dir_only_patterns()
+            && self.hide_path_matches_path(&data.path(), true)
         {
             return Err(linux_error(LINUX_ENOENT));
         }
@@ -286,18 +286,18 @@ impl PassthroughFs {
 
         let path = self.child_path(parent, name)?;
 
-        // A dir-only deny pattern (`node_modules/`) needs the child's type.
+        // A dir-only hide-path pattern (`node_modules/`) needs the child's type.
         // Resolve it from the same metadata used to build the returned entry, so
         // a concurrent file-to-directory replacement cannot skip the rule. If the
         // child cannot be stat'ed, treat it as a directory so a dir-only rule
         // still hides it rather than being skipped on a transient stat failure.
-        if self.deny.has_dir_only_patterns() {
+        if self.hide_path.has_dir_only_patterns() {
             let metadata = self.safe_metadata(&path);
             let is_dir = metadata
                 .as_ref()
                 .map(|m| m.file_type().is_dir())
                 .unwrap_or(true);
-            if self.deny_matches_name(parent, name, is_dir) {
+            if self.hide_path_matches_name(parent, name, is_dir) {
                 return Err(linux_error(LINUX_ENOENT));
             }
             let metadata = metadata?;
@@ -307,7 +307,7 @@ impl PassthroughFs {
 
         // Name-only and path-only patterns do not depend on the entry type, so
         // they are decided before the path is interned.
-        if self.deny_matches_name(parent, name, false) {
+        if self.hide_path_matches_name(parent, name, false) {
             return Err(linux_error(LINUX_ENOENT));
         }
 

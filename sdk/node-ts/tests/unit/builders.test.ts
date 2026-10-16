@@ -373,48 +373,48 @@ describe("MountBuilder", () => {
     expect(() => builder.build()).toThrow(/must not contain ','/);
   });
 
-  it("propagates deny on a bind mount", () => {
+  it("propagates hidePath on a bind mount", () => {
     const m = new MountBuilder("/data")
       .bind("/host/data")
       // Path patterns (`sub/secret`) require a read-only mount.
       .readonly()
-      .deny([".env", "sub/secret"])
+      .hidePath([".env", "sub/secret"])
       .build();
     expect(m).toMatchObject({
       kind: "bind",
-      deny: [".env", "sub/secret"],
+      hidePath: [".env", "sub/secret"],
     });
   });
 
-  it("omits deny when not set", () => {
+  it("omits hidePath when not set", () => {
     const m = new MountBuilder("/data").bind("/host/data").build();
-    expect(m.deny).toBeUndefined();
+    expect(m.hidePath).toBeUndefined();
   });
 
-  it("rejects deny on a named mount at build time", () => {
-    const builder = new MountBuilder("/cache").named("v1").deny([".env"]);
+  it("rejects hidePath on a named mount at build time", () => {
+    const builder = new MountBuilder("/cache").named("v1").hidePath([".env"]);
     expect(() => builder.build()).toThrow(InvalidConfigError);
   });
 
-  it("rejects deny patterns with forbidden separators", () => {
-    const builder = new MountBuilder("/data").bind("/host").deny(["a,b"]);
+  it("rejects hidePath patterns with forbidden separators", () => {
+    const builder = new MountBuilder("/data").bind("/host").hidePath(["a,b"]);
     expect(() => builder.build()).toThrow(InvalidConfigError);
   });
 
-  it("rejects empty, whitespace, and leading-# deny patterns", () => {
+  it("rejects empty, whitespace, and leading-# hidePath patterns", () => {
     for (const bad of ["", " .env", ".env ", "#secret"]) {
-      const builder = new MountBuilder("/data").bind("/host").deny([bad]);
+      const builder = new MountBuilder("/data").bind("/host").hidePath([bad]);
       expect(() => builder.build(), JSON.stringify(bad)).toThrow(InvalidConfigError);
     }
   });
 
-  it("rejects a path deny pattern on a writable mount", () => {
-    const builder = new MountBuilder("/data").bind("/host").deny(["sub/secret"]);
+  it("rejects a path hidePath pattern on a writable mount", () => {
+    const builder = new MountBuilder("/data").bind("/host").hidePath(["sub/secret"]);
     expect(() => builder.build()).toThrow(InvalidConfigError);
   });
 
-  it("matches the shared deny fixture dispositions", () => {
-    const cases = denyFixtureCases();
+  it("matches the shared hidePath fixture dispositions", () => {
+    const cases = hide_pathFixtureCases();
     expect(cases.length).toBeGreaterThan(0);
 
     for (const c of cases) {
@@ -422,7 +422,7 @@ describe("MountBuilder", () => {
       if (c.readonly) {
         builder.readonly();
       }
-      builder.deny([c.pattern]);
+      builder.hidePath([c.pattern]);
 
       const label = JSON.stringify(c);
       if (c.expect === "accept") {
@@ -436,11 +436,11 @@ describe("MountBuilder", () => {
   });
 });
 
-function denyFixtureCases(): Array<{ pattern: string; readonly: boolean; expect: string }> {
+function hide_pathFixtureCases(): Array<{ pattern: string; readonly: boolean; expect: string }> {
   // Anchor to the workspace root (the nearest ancestor Cargo.toml declaring
   // `[workspace]`) so a nested checkout with its own copy cannot be picked up
   // and the fixture path has a single definition.
-  const relative = "packages/microsandbox-types/rust/tests/fixtures/deny/patterns.json";
+  const relative = "packages/microsandbox-types/rust/tests/fixtures/hide_path/patterns.json";
   let dir = dirname(fileURLToPath(import.meta.url));
   for (;;) {
     const manifest = resolve(dir, "Cargo.toml");

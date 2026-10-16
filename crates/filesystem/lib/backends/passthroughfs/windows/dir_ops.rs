@@ -97,14 +97,14 @@ impl PassthroughFs {
                 .map_err(|_| linux_error(LINUX_EINVAL))?;
             validate_component(name)?;
 
-            let deny_is_dir = if self.deny.has_dir_only_patterns() {
+            let hide_path_is_dir = if self.hide_path.has_dir_only_patterns() {
                 // Fail closed: unknown type is treated as a directory so a
                 // dir-only rule still hides the entry.
                 entry.file_type().map(|t| t.is_dir()).unwrap_or(true)
             } else {
                 false
             };
-            if self.deny_matches_name(inode, name, deny_is_dir) {
+            if self.hide_path_matches_name(inode, name, hide_path_is_dir) {
                 continue;
             }
 

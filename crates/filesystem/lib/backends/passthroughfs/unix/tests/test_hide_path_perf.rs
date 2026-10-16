@@ -1,13 +1,13 @@
-//! Micro benchmarks for bind-mount deny-list overhead.
+//! Micro benchmarks for bind-mount hide_path-list overhead.
 //!
-//! The deny check runs in the host-side passthrough backend, not in the guest
+//! The hide-path check runs in the host-side passthrough backend, not in the guest
 //! VM, so it can be measured directly against an in-process [`PassthroughFs`]
 //! without booting a sandbox.
 //!
 //! To keep the comparison fair, **one directory tree is created once** and
 //! reused by every scenario, and the whole tree is warmed before measuring so
 //! the first scenario does not inherit the cold caches left by tree creation.
-//! Every scenario is measured against a **deny-free baseline on the same tree,
+//! Every scenario is measured against a **hide_path-free baseline on the same tree,
 //! interleaved within each round** — each pair is timed in both orders and the
 //! ratios/deltas are averaged, so machine-state drift and first/second-measurement
 //! bias cancel out.
@@ -27,9 +27,9 @@
 //!
 //! ```bash
 //! cargo test --release -p microsandbox-filesystem --lib \
-//!     -- --ignored deny_pattern_kind_perf_variance --nocapture
+//!     -- --ignored hide_path_pattern_kind_perf_variance --nocapture
 //! RUNS=20 cargo test --release -p microsandbox-filesystem --lib \
-//!     -- --ignored deny_pattern_kind_perf_variance --nocapture
+//!     -- --ignored hide_path_pattern_kind_perf_variance --nocapture
 //! ```
 //!
 //! A single-run table is also available for a quick look without the run-to-run
@@ -37,45 +37,45 @@
 //!
 //! ```bash
 //! cargo test --release -p microsandbox-filesystem --lib \
-//!     -- --ignored deny_pattern_kind_perf_comparison --nocapture
+//!     -- --ignored hide_path_pattern_kind_perf_comparison --nocapture
 //! ```
 //!
 //! # What it measures
 //!
-//! - `pass lookup/op`: a single `lookup` of a name that *passes* the deny
-//!   check (the common case; a passing lookup still pays the full deny check).
-//! - `deny lookup/op`: a single `lookup` of a name the deny list hides, which
+//! - `pass lookup/op`: a single `lookup` of a name that *passes* the hide_path
+//!   check (the common case; a passing lookup still pays the full hide-path check).
+//! - `hide_path lookup/op`: a single `lookup` of a name the hide-path list hides, which
 //!   returns `ENOENT` and short-circuits before the underlying file is opened.
-//!   This isolates the cost of the deny check itself. Absent for the baseline.
+//!   This isolates the cost of the hide-path check itself. Absent for the baseline.
 //! - `readdir pass`: a full listing of `data`, whose entries are mostly *not*
-//!   denied (the normal case; the deny check runs but rarely matches).
-//! - `readdir deny`: a full listing of a dedicated deny-heavy directory whose
+//!   denied (the normal case; the hide-path check runs but rarely matches).
+//! - `readdir hide_path`: a full listing of a dedicated hide_path-heavy directory whose
 //!   entries are mostly *denied* (the "hide a subtree" case).
 //!
-//! The baseline `deny` cases are skipped, since they are not sensible; the
-//! baseline does not have a deny list.
+//! The baseline `hide_path` cases are skipped, since they are not sensible; the
+//! baseline does not have a hide-path list.
 //!
 //! A single `readdir` call always blends passing and denied entries — unlike a
-//! `lookup`, which is pass-or-deny — so `readdir` is reported at two deny
+//! `lookup`, which is pass-or-hide_path — so `readdir` is reported at two hide_path
 //! *densities* rather than a binary split. Dir-only patterns match a single
-//! literal name, so no deny-heavy directory is a natural case for them; their
+//! literal name, so no hide_path-heavy directory is a natural case for them; their
 //! `readdir` cost is the per-entry `is_dir` determination, which `readdir pass`
-//! already captures. They are skipped for `readdir deny`.
+//! already captures. They are skipped for `readdir hide_path`.
 //!
 //! The `x` columns in the single-run output are the ratio to the shared
-//! deny-free baseline (`deny lookup` is normalized against the baseline `pass
+//! hide_path-free baseline (`hide_path lookup` is normalized against the baseline `pass
 //! lookup`). The `ns/entry` columns report `(scenario − baseline) /
 //! FILES_PER_DIR` for readdir — the extra time per listed entry relative to no
-//! deny.
+//! hide_path.
 //!
 //! # Interpreting the results
 //!
 //! - Lookup overhead is usually small: every lookup already pays an
-//!   open/stat/close, so the extra deny work is a minor fraction.
-//! - `readdir` is where per-entry deny cost shows up most (it touches every
+//!   open/stat/close, so the extra hide_path work is a minor fraction.
+//! - `readdir` is where per-entry hide_path cost shows up most (it touches every
 //!   entry), and path patterns are typically the most expensive because they
 //!   reconstruct each entry's mount-relative path. This is most visible in
-//!   `readdir deny`, where every entry matches and path reconstruction
+//!   `readdir hide_path`, where every entry matches and path reconstruction
 //!   dominates.
 //!
 //! The absolute numbers are machine-dependent; compare the relative `x` ratios
@@ -93,7 +93,7 @@ use super::*;
 //--------------------------------------------------------------------------------------------------
 
 /// Number of files created in the shared directory tree. Large enough for
-/// per-entry deny overhead to accumulate and be measurable.
+/// per-entry hide_path overhead to accumulate and be measurable.
 const FILES_PER_DIR: usize = 1000;
 /// Number of `lookup` / `readdir` repetitions per scenario, per round.
 const REPETITIONS: usize = 25;
@@ -104,12 +104,12 @@ const ROUNDS: usize = 5;
 // Tests
 //--------------------------------------------------------------------------------------------------
 
-/// Print a comparison of lookup/readdir cost across deny pattern kinds in a
+/// Print a comparison of lookup/readdir cost across hide-path pattern kinds in a
 /// single run. Not a correctness test; run explicitly with `-- --ignored` in a
 /// release build.
 #[test]
 #[ignore]
-fn deny_pattern_kind_perf_comparison() {
+fn hide_path_pattern_kind_perf_comparison() {
     let tmp = tempfile::tempdir().unwrap();
     let (scenarios, rows) = measure_tree(tmp.path());
     print_table(&scenarios, &rows);
@@ -121,7 +121,7 @@ fn deny_pattern_kind_perf_comparison() {
 /// test; run explicitly with `-- --ignored` in a release build.
 #[test]
 #[ignore]
-fn deny_pattern_kind_perf_variance() {
+fn hide_path_pattern_kind_perf_variance() {
     let runs: usize = std::env::var("RUNS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -145,27 +145,27 @@ fn deny_pattern_kind_perf_variance() {
 // Types
 //--------------------------------------------------------------------------------------------------
 
-/// How to populate a deny-heavy directory so the scenario's patterns deny most
+/// How to populate a hide_path-heavy directory so the scenario's patterns hide_path most
 /// of its entries, while the directory itself stays servable (so it can be
 /// looked up and listed).
 #[derive(Clone, Copy)]
-enum DenyHeavyKind {
+enum HidePathHeavyKind {
     /// Fill with `*.log` files (matched by a `*.log` name-only pattern).
     Logs,
     /// Fill with `*.secret` files (matched by a `data/**/*.secret` path pattern).
     Secrets,
 }
 
-/// A single benchmark scenario: a deny config plus the operation targets that
+/// A single benchmark scenario: a hide_path config plus the operation targets that
 /// make that config's overhead visible.
 struct Scenario {
     label: &'static str,
     patterns: &'static [&'static str],
-    /// A name, as a direct child of `data`, that the deny list hides.
+    /// A name, as a direct child of `data`, that the hide-path list hides.
     denied: Option<&'static [u8]>,
-    /// `(subdirectory of `data`, kind)` to build a deny-heavy readdir, or
-    /// `None` when a deny-heavy directory is not a natural case.
-    deny_heavy: Option<(&'static str, DenyHeavyKind)>,
+    /// `(subdirectory of `data`, kind)` to build a hide_path-heavy readdir, or
+    /// `None` when a hide_path-heavy directory is not a natural case.
+    hide_path_heavy: Option<(&'static str, HidePathHeavyKind)>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -222,30 +222,30 @@ struct Measured {
     /// Median per-round ratio of scenario pass lookup to baseline pass lookup.
     pass_lookup_x: f64,
     /// Scenario denied lookup time for one burst (ZERO if the scenario has none).
-    deny_lookup: Duration,
+    hide_path_lookup: Duration,
     /// Median per-round ratio of denied lookup to baseline pass lookup.
-    deny_lookup_x: f64,
+    hide_path_lookup_x: f64,
     /// Scenario pass-heavy readdir time for one burst.
     readdir: Duration,
     /// Median per-round ratio of scenario readdir to baseline readdir.
     readdir_x: f64,
     /// Median per-round extra ns per entry vs baseline readdir.
     readdir_ns_per_entry: f64,
-    /// Scenario deny-heavy readdir time for one burst (ZERO if none).
-    deny_readdir: Duration,
-    /// Median per-round ratio of deny-heavy readdir to baseline readdir.
-    deny_readdir_x: f64,
+    /// Scenario hide_path-heavy readdir time for one burst (ZERO if none).
+    hide_path_readdir: Duration,
+    /// Median per-round ratio of hide_path-heavy readdir to baseline readdir.
+    hide_path_readdir_x: f64,
     /// Median per-round extra ns per entry vs baseline readdir.
-    deny_ns_per_entry: f64,
+    hide_path_ns_per_entry: f64,
 }
 
-/// Build a [`PassthroughFs`] over `root` with the given deny patterns.
+/// Build a [`PassthroughFs`] over `root` with the given hide-path patterns.
 fn build_fs(root: &Path, patterns: &[&str]) -> PassthroughFs {
     let cfg = PassthroughConfig {
         root_dir: root.to_path_buf(),
-        deny: patterns.iter().map(|p| p.to_string()).collect(),
-        // A path deny pattern (`data/**/*.secret`) is rejected on a writable
-        // mount, so every scenario, including the deny-free baseline, must share
+        hide_path: patterns.iter().map(|p| p.to_string()).collect(),
+        // A path hide-path pattern (`data/**/*.secret`) is rejected on a writable
+        // mount, so every scenario, including the hide_path-free baseline, must share
         // the same read-only mount or the path scenario panics in `new` and the
         // benchmark cannot compare mounts.
         readonly: true,
@@ -264,25 +264,25 @@ fn scenarios() -> [Scenario; 4] {
             label: "baseline",
             patterns: &[],
             denied: None,
-            deny_heavy: None,
+            hide_path_heavy: None,
         },
         Scenario {
             label: "name-only",
             patterns: &[".env", "*.log"],
             denied: Some(b".env".as_slice()),
-            deny_heavy: Some(("logs", DenyHeavyKind::Logs)),
+            hide_path_heavy: Some(("logs", HidePathHeavyKind::Logs)),
         },
         Scenario {
             label: "dir-only",
             patterns: &["node_modules/"],
             denied: Some(b"node_modules".as_slice()),
-            deny_heavy: None,
+            hide_path_heavy: None,
         },
         Scenario {
             label: "path",
             patterns: &["data/**/*.secret"],
             denied: Some(b"x.secret".as_slice()),
-            deny_heavy: Some(("zone", DenyHeavyKind::Secrets)),
+            hide_path_heavy: Some(("zone", HidePathHeavyKind::Secrets)),
         },
     ]
 }
@@ -293,7 +293,7 @@ fn measure_tree(root: &Path) -> ([Scenario; 4], Vec<Measured>) {
     // Warm the kernel's page/dentry caches over the whole tree before any
     // measurement. Without this the first scenario to run (the baseline) pays
     // the cold caches left by `build_tree`, while later scenarios run warm,
-    // making the no-deny baseline look slower than every deny scenario.
+    // making the no-hide_path baseline look slower than every hide_path scenario.
     build_tree(root);
     warm_tree(root);
 
@@ -302,14 +302,14 @@ fn measure_tree(root: &Path) -> ([Scenario; 4], Vec<Measured>) {
     (scenarios, rows)
 }
 
-/// Measure a scenario over the shared tree by alternating it with a deny-free
+/// Measure a scenario over the shared tree by alternating it with a hide_path-free
 /// baseline on the *same* tree, so both share identical machine/cache state
 /// within each round and any drift cancels out. Across `ROUNDS` rounds the
 /// median per-round ratio/delta is reported.
 ///
-/// A denied/deny-heavy case is skipped (returning [`Duration::ZERO`] and a `0.0`
+/// A denied/hide_path-heavy case is skipped (returning [`Duration::ZERO`] and a `0.0`
 /// ratio) when the scenario has no denied name (baseline) or no natural
-/// deny-heavy directory (dir-only).
+/// hide_path-heavy directory (dir-only).
 fn measure(root: &Path, scenario: &Scenario) -> Measured {
     let fs = build_fs(root, scenario.patterns);
     let base = build_fs(root, &[]);
@@ -323,13 +323,13 @@ fn measure(root: &Path, scenario: &Scenario) -> Measured {
     let base_dir_inode = lookup(&base, &ctx, ROOT_INODE, b"data").unwrap().inode;
 
     // Deny-heavy directory inode (child of `data`), when the scenario has one.
-    let deny_heavy_inode = match scenario.deny_heavy {
+    let hide_path_heavy_inode = match scenario.hide_path_heavy {
         Some((name, _)) => Some(lookup(&fs, &ctx, dir_inode, name.as_bytes()).unwrap().inode),
         None => None,
     };
 
-    // Look up a file that passes the deny check (the common case), so each
-    // iteration pays the full deny check without short-circuiting.
+    // Look up a file that passes the hide-path check (the common case), so each
+    // iteration pays the full hide-path check without short-circuiting.
     let pass_name = CString::new(format!("file-{:04}.txt", FILES_PER_DIR - 1)).unwrap();
     let denied_name = scenario.denied.map(|d| CString::new(d).unwrap());
 
@@ -342,22 +342,24 @@ fn measure(root: &Path, scenario: &Scenario) -> Measured {
             let h = opendir(f, &ctx, ino).unwrap();
             let _ = f.readdir(ctx, ino, h, 1 << 20, 0).unwrap();
         }
-        if let Some(deny_heavy_inode) = deny_heavy_inode {
-            let h = opendir(&fs, &ctx, deny_heavy_inode).unwrap();
-            let _ = fs.readdir(ctx, deny_heavy_inode, h, 1 << 20, 0).unwrap();
+        if let Some(hide_path_heavy_inode) = hide_path_heavy_inode {
+            let h = opendir(&fs, &ctx, hide_path_heavy_inode).unwrap();
+            let _ = fs
+                .readdir(ctx, hide_path_heavy_inode, h, 1 << 20, 0)
+                .unwrap();
         }
     }
 
     let mut pass_lookup_xs = Vec::with_capacity(ROUNDS);
-    let mut deny_lookup_xs = Vec::with_capacity(ROUNDS);
+    let mut hide_path_lookup_xs = Vec::with_capacity(ROUNDS);
     let mut readdir_xs = Vec::with_capacity(ROUNDS);
     let mut readdir_deltas = Vec::with_capacity(ROUNDS);
-    let mut deny_readdir_xs = Vec::with_capacity(ROUNDS);
-    let mut deny_readdir_deltas = Vec::with_capacity(ROUNDS);
+    let mut hide_path_readdir_xs = Vec::with_capacity(ROUNDS);
+    let mut hide_path_readdir_deltas = Vec::with_capacity(ROUNDS);
     let mut pass_lookups = Vec::with_capacity(ROUNDS);
-    let mut deny_lookups = Vec::with_capacity(ROUNDS);
+    let mut hide_path_lookups = Vec::with_capacity(ROUNDS);
     let mut readdirs = Vec::with_capacity(ROUNDS);
-    let mut deny_readdirs = Vec::with_capacity(ROUNDS);
+    let mut hide_path_readdirs = Vec::with_capacity(ROUNDS);
 
     for _ in 0..ROUNDS {
         // Pass lookup, measured in BOTH orders within the round and averaged,
@@ -378,13 +380,13 @@ fn measure(root: &Path, scenario: &Scenario) -> Measured {
         pass_lookups.push(scenario_lookup);
         pass_lookup_xs.push(ratio);
 
-        // Denied lookup: the deny check matches and short-circuits to ENOENT
-        // without touching the underlying file, isolating the cost of the deny
+        // Denied lookup: the hide-path check matches and short-circuits to ENOENT
+        // without touching the underlying file, isolating the cost of the hide_path
         // check itself. Assert the name is actually denied.
         if let Some(denied_name) = &denied_name {
-            let deny_lookup = deny_lookup_burst(&fs, ctx, dir_inode, denied_name);
-            deny_lookups.push(deny_lookup);
-            deny_lookup_xs.push(deny_lookup.as_secs_f64() / base_lookup.as_secs_f64());
+            let hide_path_lookup = hide_path_lookup_burst(&fs, ctx, dir_inode, denied_name);
+            hide_path_lookups.push(hide_path_lookup);
+            hide_path_lookup_xs.push(hide_path_lookup.as_secs_f64() / base_lookup.as_secs_f64());
         }
 
         // Pass-heavy readdir over `data`, measured in both orders within the
@@ -409,26 +411,26 @@ fn measure(root: &Path, scenario: &Scenario) -> Measured {
         readdir_xs.push(ratio);
         readdir_deltas.push(delta);
 
-        // Deny-heavy readdir over the deny-heavy directory. Assert it is
-        // actually deny-heavy (omits most entries). Measured in BOTH orders
+        // Deny-heavy readdir over the hide_path-heavy directory. Assert it is
+        // actually hide_path-heavy (omits most entries). Measured in BOTH orders
         // relative to the baseline `data` readdir within the round and averaged,
         // mirroring the pass metrics, so first/second-measurement bias cancels.
-        if let Some(deny_heavy_inode) = deny_heavy_inode {
+        if let Some(hide_path_heavy_inode) = hide_path_heavy_inode {
             let (sc_a, ba_a) = (
-                deny_readdir_burst(&fs, ctx, deny_heavy_inode),
+                hide_path_readdir_burst(&fs, ctx, hide_path_heavy_inode),
                 readdir_burst(&base, ctx, base_dir_inode),
             );
             let (ba_b, sc_b) = (
                 readdir_burst(&base, ctx, base_dir_inode),
-                deny_readdir_burst(&fs, ctx, deny_heavy_inode),
+                hide_path_readdir_burst(&fs, ctx, hide_path_heavy_inode),
             );
-            let deny_readdir = (sc_a + sc_b) / 2;
+            let hide_path_readdir = (sc_a + sc_b) / 2;
             let ratio = ((sc_a.as_secs_f64() / ba_a.as_secs_f64())
                 * (sc_b.as_secs_f64() / ba_b.as_secs_f64()))
             .sqrt();
-            deny_readdirs.push(deny_readdir);
-            deny_readdir_xs.push(ratio);
-            deny_readdir_deltas.push(
+            hide_path_readdirs.push(hide_path_readdir);
+            hide_path_readdir_xs.push(ratio);
+            hide_path_readdir_deltas.push(
                 (((sc_a.as_secs_f64() - ba_a.as_secs_f64())
                     + (sc_b.as_secs_f64() - ba_b.as_secs_f64()))
                     / 2.0)
@@ -439,33 +441,39 @@ fn measure(root: &Path, scenario: &Scenario) -> Measured {
 
     pass_lookups.sort();
     pass_lookup_xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    deny_lookups.sort();
-    deny_lookup_xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    hide_path_lookups.sort();
+    hide_path_lookup_xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     readdirs.sort();
     readdir_xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     readdir_deltas.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    deny_readdirs.sort();
-    deny_readdir_xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    deny_readdir_deltas.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    hide_path_readdirs.sort();
+    hide_path_readdir_xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    hide_path_readdir_deltas.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let mid = ROUNDS / 2;
 
-    let deny_lookup = deny_lookups.get(mid).copied().unwrap_or(Duration::ZERO);
-    let deny_lookup_x = deny_lookup_xs.get(mid).copied().unwrap_or(0.0);
-    let deny_readdir = deny_readdirs.get(mid).copied().unwrap_or(Duration::ZERO);
-    let deny_readdir_x = deny_readdir_xs.get(mid).copied().unwrap_or(0.0);
-    let deny_ns_per_entry = deny_readdir_deltas.get(mid).copied().unwrap_or(0.0) * 1e9;
+    let hide_path_lookup = hide_path_lookups
+        .get(mid)
+        .copied()
+        .unwrap_or(Duration::ZERO);
+    let hide_path_lookup_x = hide_path_lookup_xs.get(mid).copied().unwrap_or(0.0);
+    let hide_path_readdir = hide_path_readdirs
+        .get(mid)
+        .copied()
+        .unwrap_or(Duration::ZERO);
+    let hide_path_readdir_x = hide_path_readdir_xs.get(mid).copied().unwrap_or(0.0);
+    let hide_path_ns_per_entry = hide_path_readdir_deltas.get(mid).copied().unwrap_or(0.0) * 1e9;
 
     Measured {
         pass_lookup: pass_lookups[mid],
         pass_lookup_x: pass_lookup_xs[mid],
-        deny_lookup,
-        deny_lookup_x,
+        hide_path_lookup,
+        hide_path_lookup_x,
         readdir: readdirs[mid],
         readdir_x: readdir_xs[mid],
         readdir_ns_per_entry: readdir_deltas[mid] * 1e9,
-        deny_readdir,
-        deny_readdir_x,
-        deny_ns_per_entry,
+        hide_path_readdir,
+        hide_path_readdir_x,
+        hide_path_ns_per_entry,
     }
 }
 
@@ -474,10 +482,10 @@ fn measure(root: &Path, scenario: &Scenario) -> Measured {
 //--------------------------------------------------------------------------------------------------
 
 /// Print the full single-run comparison table used by
-/// [`deny_pattern_kind_perf_comparison`].
+/// [`hide_path_pattern_kind_perf_comparison`].
 fn print_table(scenarios: &[Scenario], rows: &[Measured]) {
     println!(
-        "\n=== deny pattern-kind overhead (FILES_PER_DIR = {FILES_PER_DIR}, \
+        "\n=== hide-path pattern-kind overhead (FILES_PER_DIR = {FILES_PER_DIR}, \
          REPETITIONS = {REPETITIONS}, ROUNDS = {ROUNDS}, interleaved same-tree baseline, median) ==="
     );
     println!(
@@ -485,12 +493,12 @@ fn print_table(scenarios: &[Scenario], rows: &[Measured]) {
         "scenario",
         "pass look",
         "x",
-        "deny look",
+        "hide_path look",
         "x",
         "readdir pass",
         "x",
         "ns/ent",
-        "readdir deny",
+        "readdir hide_path",
         "x",
         "ns/ent"
     );
@@ -500,36 +508,38 @@ fn print_table(scenarios: &[Scenario], rows: &[Measured]) {
             scenario.label,
             m.pass_lookup.as_nanos() as f64 / REPETITIONS as f64,
             m.pass_lookup_x,
-            m.deny_lookup.as_nanos() as f64 / REPETITIONS as f64,
-            m.deny_lookup_x,
+            m.hide_path_lookup.as_nanos() as f64 / REPETITIONS as f64,
+            m.hide_path_lookup_x,
             m.readdir.as_nanos() as f64 / REPETITIONS as f64,
             m.readdir_x,
             m.readdir_ns_per_entry,
-            m.deny_readdir.as_nanos() as f64 / REPETITIONS as f64,
-            m.deny_readdir_x,
-            m.deny_ns_per_entry,
+            m.hide_path_readdir.as_nanos() as f64 / REPETITIONS as f64,
+            m.hide_path_readdir_x,
+            m.hide_path_ns_per_entry,
         );
     }
     println!();
 }
 
-/// Print the reviewer-facing headline matrix: one row per deny-pattern kind,
+/// Print the reviewer-facing headline matrix: one row per hide_path-pattern kind,
 /// one column per operation, showing the median `x` ratio (relative to the
-/// deny-free baseline) across runs with the run-to-run spread as a percentage
+/// hide_path-free baseline) across runs with the run-to-run spread as a percentage
 /// in parentheses. A short "scenarios" explanation precedes the matrix so a
-/// reviewer new to the deny feature can read it without the source. The `x`
+/// reviewer new to the hide_path feature can read it without the source. The `x`
 /// ratios are the machine-independent signal; `ns/entry` figures are too noisy
 /// run-to-run to headline and are deliberately omitted. A blank cell means the
 /// operation is not a natural case for that scenario.
 fn print_variance(runs: usize, scenarios: &[Scenario], row_sets: &[Vec<Measured>]) {
-    println!("\n=== deny pattern-kind overhead: median ratio vs baseline over {runs} runs ===");
     println!(
-        "method: one shared tree, warmed; each op timed interleaved with the deny-free \
+        "\n=== hide-path pattern-kind overhead: median ratio vs baseline over {runs} runs ==="
+    );
+    println!(
+        "method: one shared tree, warmed; each op timed interleaved with the hide_path-free \
          baseline in both orders within each of {ROUNDS} rounds; ratios are the median \
          across runs; span% is (max-min)/median run-to-run spread."
     );
     println!("\nScenarios:");
-    println!("{:<12} {:<28}", "name", "deny patterns");
+    println!("{:<12} {:<28}", "name", "hide-path patterns");
     for scenario in scenarios.iter() {
         let patterns = if scenario.patterns.is_empty() {
             "(none)".to_string()
@@ -540,24 +550,28 @@ fn print_variance(runs: usize, scenarios: &[Scenario], row_sets: &[Vec<Measured>
     }
     println!(
         "\n{:<26} {:>13} {:>13} {:>13} {:>15}",
-        "operation per scenario", "pass lookup", "deny lookup", "readdir", "readdir (deny)"
+        "operation per scenario",
+        "pass lookup",
+        "hide_path lookup",
+        "readdir",
+        "readdir (hide_path)"
     );
     for (i, scenario) in scenarios.iter().enumerate() {
         println!(
             "{:<26} {:>13} {:>13} {:>13} {:>15}",
             scenario.label,
             cell(&median_span(i, row_sets, |m| m.pass_lookup_x)),
-            cell(&median_span(i, row_sets, |m| m.deny_lookup_x)),
+            cell(&median_span(i, row_sets, |m| m.hide_path_lookup_x)),
             cell(&median_span(i, row_sets, |m| m.readdir_x)),
-            cell(&median_span(i, row_sets, |m| m.deny_readdir_x)),
+            cell(&median_span(i, row_sets, |m| m.hide_path_readdir_x)),
         );
     }
     println!();
     println!(
-        "Read each cell as `ratio x (span%)`: how many times slower than the deny-free \
+        "Read each cell as `ratio x (span%)`: how many times slower than the hide_path-free \
          baseline, with the run-to-run spread as a percentage of that ratio. A ratio below \
-         1.0 on a denied lookup means the deny check short-circuits before the file is \
-         opened. `readdir (deny)` is a listing of a deny-heavy directory (mostly denied \
+         1.0 on a denied lookup means the hide-path check short-circuits before the file is \
+         opened. `readdir (hide_path)` is a listing of a hide_path-heavy directory (mostly denied \
          entries) — the \"hide a subtree\" case. A blank cell is a case that scenario does \
          not exercise. Prefer the ratios; absolute `ns/entry` figures are omitted here \
          because they are too noisy run-to-run to be trustworthy."
@@ -613,7 +627,7 @@ fn lookup_burst(fs: &PassthroughFs, ctx: Context, parent: u64, name: &CString) -
 }
 
 /// Time `REPETITIONS` denied lookups of `denied_name`, asserting each is ENOENT.
-fn deny_lookup_burst(
+fn hide_path_lookup_burst(
     fs: &PassthroughFs,
     ctx: Context,
     parent: u64,
@@ -641,16 +655,16 @@ fn readdir_burst(fs: &PassthroughFs, ctx: Context, inode: u64) -> Duration {
     t0.elapsed()
 }
 
-/// Time `REPETITIONS` listings of a deny-heavy directory, asserting each is
-/// actually deny-heavy (omits nearly all entries).
-fn deny_readdir_burst(fs: &PassthroughFs, ctx: Context, inode: u64) -> Duration {
+/// Time `REPETITIONS` listings of a hide_path-heavy directory, asserting each is
+/// actually hide_path-heavy (omits nearly all entries).
+fn hide_path_readdir_burst(fs: &PassthroughFs, ctx: Context, inode: u64) -> Duration {
     let t0 = Instant::now();
     for _ in 0..REPETITIONS {
         let h = opendir(fs, &ctx, inode).unwrap();
         let listed = fs.readdir(ctx, inode, h, 1 << 20, 0).unwrap();
         assert!(
             listed.len() <= 2,
-            "deny-heavy dir should be nearly empty, got {} entries",
+            "hide_path-heavy dir should be nearly empty, got {} entries",
             listed.len()
         );
     }

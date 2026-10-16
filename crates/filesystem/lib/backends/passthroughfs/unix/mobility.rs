@@ -693,10 +693,10 @@ fn validate_shape(state: &PassthroughState, readonly: bool, invalid_root: bool) 
     Ok(())
 }
 
-/// Refuse to restore a stored inode whose path the destination deny list hides.
+/// Refuse to restore a stored inode whose path the destination hide-path list hides.
 ///
 /// Denied names are never interned during normal operation, so a stored path
-/// can only match when the deny list grew after capture (or comes from a mount
+/// can only match when the hide-path list grew after capture (or comes from a mount
 /// with different patterns). Re-internering it would re-expose a path the caller
 /// asked to hide, so fail closed with an explicit error.
 fn reject_denied_restore_path(
@@ -704,41 +704,42 @@ fn reject_denied_restore_path(
     saved: &InodeState,
     pinned: &File,
 ) -> io::Result<()> {
-    if fs.deny.is_empty() || saved.components.is_empty() {
+    if fs.hide_path.is_empty() || saved.components.is_empty() {
         return Ok(());
     }
     let is_dir = pinned.metadata()?.file_type().is_dir();
-    let relative = crate::backends::passthroughfs::deny::join_path(&saved.components);
+    let relative = crate::backends::passthroughfs::hide_path::join_path(&saved.components);
     // Case folding is a property of each directory the path crosses, not of the
     // mount root. The pinned fd is the entry itself and cannot reveal a folded
     // parent, so reopen the containing directory (and, for a path pattern, every
     // ancestor) instead of using the mount-level setting. Otherwise a saved handle
     // could be re-interned for a path that live lookup hides.
     let parent = &saved.components[..saved.components.len() - 1];
-    let case_insensitive = if fs.deny.needs_path_reconstruction() {
-        deny_path_case_insensitive_for_components(fs, parent)
+    let case_insensitive = if fs.hide_path.needs_path_reconstruction() {
+        hide_path_pattern_case_insensitive_for_components(fs, parent)
     } else {
         // Reopen the containing directory to read its casefold flag. A
         // searchable-but-unreadable parent (mode `0111`) rejects `O_RDONLY` with
         // `EACCES`, yet the path is still valid and the existing restore walk
         // reaches it through `O_PATH`. If the directory cannot be probed, match
-        // the folded (case-insensitive) variant so the deny check stays
+        // the folded (case-insensitive) variant so the hide-path check stays
         // conservative instead of aborting an otherwise restorable snapshot.
         match open_components(fs, parent, directory_open_flags() | libc::O_NOFOLLOW) {
             Ok(parent_fd) => {
-                let case_insensitive = fs.deny_case_insensitive_from_fd(parent_fd);
+                let case_insensitive = fs.hide_path_case_insensitive_from_fd(parent_fd);
                 unsafe { libc::close(parent_fd) };
                 case_insensitive
             }
             Err(_) => true,
         }
     };
-    if fs
-        .deny
-        .matches_path_with_case(relative.as_os_str().as_bytes(), is_dir, case_insensitive)
-    {
+    if fs.hide_path.matches_path_with_case(
+        relative.as_os_str().as_bytes(),
+        is_dir,
+        case_insensitive,
+    ) {
         return Err(invalid_state(
-            "restored passthrough inode is hidden by the mount deny list",
+            "restored passthrough inode is hidden by the mount hide-path list",
         ));
     }
     Ok(())
@@ -747,19 +748,19 @@ fn reject_denied_restore_path(
 /// Case behavior for matching a path pattern against entries in the directory
 /// with the given mount-relative components.
 ///
-/// Mirrors [`PassthroughFs::deny_path_case_insensitive`] for restore, where the
+/// Mirrors [`PassthroughFs::hide_path_pattern_case_insensitive`] for restore, where the
 /// destination inode table is not yet populated: reopen each directory the path
 /// crosses and fold if any of them does. A probe failure over-matches so restore
 /// stays fail-closed.
 #[cfg(target_os = "linux")]
-fn deny_path_case_insensitive_for_components(
+fn hide_path_pattern_case_insensitive_for_components(
     fs: &PassthroughFs,
     dir_components: &[Vec<u8>],
 ) -> bool {
-    if fs.deny.is_empty() {
+    if fs.hide_path.is_empty() {
         return false;
     }
-    if fs.deny.default_case_insensitive() {
+    if fs.hide_path.default_case_insensitive() {
         return true;
     }
     for end in 0..=dir_components.len() {
@@ -770,7 +771,7 @@ fn deny_path_case_insensitive_for_components(
         ) else {
             return true;
         };
-        let folds = fs.deny_case_insensitive_from_fd(fd);
+        let folds = fs.hide_path_case_insensitive_from_fd(fd);
         unsafe { libc::close(fd) };
         if folds {
             return true;
@@ -781,11 +782,11 @@ fn deny_path_case_insensitive_for_components(
 
 /// Case behavior for matching a path pattern against entries in a directory.
 #[cfg(not(target_os = "linux"))]
-fn deny_path_case_insensitive_for_components(
+fn hide_path_pattern_case_insensitive_for_components(
     fs: &PassthroughFs,
     _dir_components: &[Vec<u8>],
 ) -> bool {
-    fs.deny.default_case_insensitive()
+    fs.hide_path.default_case_insensitive()
 }
 
 fn rebuild(
@@ -854,20 +855,20 @@ fn rebuild(
         let fd = open_components(fs, components, directory_open_flags())?;
         let file = unsafe { File::from_raw_fd(fd) };
         verify_reopened(&file, saved.inode, verified)?;
-        let case_insensitive = if fs.deny.needs_path_reconstruction() {
-            deny_path_case_insensitive_for_components(fs, components)
+        let case_insensitive = if fs.hide_path.needs_path_reconstruction() {
+            hide_path_pattern_case_insensitive_for_components(fs, components)
         } else {
-            fs.deny_case_insensitive_from_fd(file.as_raw_fd())
+            fs.hide_path_case_insensitive_from_fd(file.as_raw_fd())
         };
         let snapshot = saved.entries.as_ref().map(|entries| DirSnapshot {
             entries: entries
                 .iter()
                 // A restored snapshot bypasses live lookup and readdir filtering,
-                // so the destination deny list must be re-applied here. Otherwise
+                // so the destination hide-path list must be re-applied here. Otherwise
                 // a name that was visible at capture but is hidden at the
                 // destination would be served from the cached listing.
                 .filter(|entry| {
-                    !fs.deny_matches_name_in_dir(
+                    !fs.hide_path_matches_name_in_dir(
                         Some(components.as_slice()),
                         &entry.name,
                         entry.file_type == platform::DIRENT_DIR,
@@ -991,7 +992,7 @@ fn inode_data_from_fd(
             anchor_children: std::sync::atomic::AtomicU64::new(anchor_children),
             retained_fd: Mutex::new(None),
             case_insensitive: std::sync::atomic::AtomicU8::new(
-                crate::backends::passthroughfs::deny::CASE_UNKNOWN,
+                crate::backends::passthroughfs::hide_path::CASE_UNKNOWN,
             ),
         }),
     ))
@@ -1259,7 +1260,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_refuses_a_path_the_destination_deny_list_hides() {
+    fn restore_refuses_a_path_the_destination_hide_path_list_hides() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("secret"), b"x").unwrap();
         let source = backend(root.path());
@@ -1267,13 +1268,13 @@ mod tests {
         source.lookup(context(), 1, c"secret").unwrap();
         let encoded = capture(&source).unwrap();
 
-        // Restoring into a mount whose deny list now hides the stored path must
+        // Restoring into a mount whose hide-path list now hides the stored path must
         // fail closed instead of re-interning the hidden name.
         let destination = PassthroughFs::new(super::super::PassthroughConfig {
             root_dir: root.path().to_path_buf(),
             inject_init: false,
             stat_virtualization: StatVirtualization::Off,
-            deny: vec!["secret".to_string()],
+            hide_path: vec!["secret".to_string()],
             ..Default::default()
         })
         .unwrap();
@@ -1281,7 +1282,9 @@ mod tests {
 
         let error = restore(&destination, &encoded).unwrap_err();
         assert!(
-            error.to_string().contains("hidden by the mount deny list"),
+            error
+                .to_string()
+                .contains("hidden by the mount hide-path list"),
             "{error}"
         );
     }
@@ -1313,12 +1316,12 @@ mod tests {
         source.lookup(context(), sub_inode, c"keep").unwrap();
         let encoded = capture(&source).unwrap();
 
-        // The deny pattern does not match `sub/keep`, so the restore must succeed.
+        // The hide-path pattern does not match `sub/keep`, so the restore must succeed.
         let destination = PassthroughFs::new(super::super::PassthroughConfig {
             root_dir: root.path().to_path_buf(),
             inject_init: false,
             stat_virtualization: StatVirtualization::Off,
-            deny: vec!["secret".to_string()],
+            hide_path: vec!["secret".to_string()],
             ..Default::default()
         })
         .unwrap();

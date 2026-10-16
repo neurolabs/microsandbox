@@ -224,7 +224,9 @@ pub(crate) fn do_lookup(fs: &PassthroughFs, parent: u64, name: &CStr) -> io::Res
     // from the opened object and denies there (see `do_lookup_linux` and
     // `do_lookup_macos`); checking a separate stat here would let a concurrent
     // file-to-directory replacement skip the rule.
-    if !fs.deny.has_dir_only_patterns() && fs.deny_matches_name(parent, name.to_bytes(), false) {
+    if !fs.hide_path.has_dir_only_patterns()
+        && fs.hide_path_matches_name(parent, name.to_bytes(), false)
+    {
         return Err(platform::enoent());
     }
 
@@ -282,13 +284,13 @@ fn do_lookup_linux(
 
     let st = platform::statx_to_stat64(&stx);
 
-    // Directory-only deny patterns must be evaluated against the type of the
+    // Directory-only hide-path patterns must be evaluated against the type of the
     // object the handle actually references, not a separate stat. The `statx`
     // above is on the opened `O_PATH` fd, so the decision and the returned entry
     // cannot disagree even under concurrent host replacement.
-    if fs.deny.has_dir_only_patterns() {
+    if fs.hide_path.has_dir_only_patterns() {
         let is_dir = platform::mode_file_type(st.st_mode) == platform::MODE_DIR;
-        if fs.deny_matches_name(parent, name.to_bytes(), is_dir) {
+        if fs.hide_path_matches_name(parent, name.to_bytes(), is_dir) {
             unsafe { libc::close(fd) };
             return Err(platform::enoent());
         }
@@ -333,7 +335,7 @@ fn do_lookup_linux(
         anchor_children: std::sync::atomic::AtomicU64::new(0),
         retained_fd: std::sync::Mutex::new(None),
         case_insensitive: std::sync::atomic::AtomicU8::new(
-            crate::backends::passthroughfs::deny::CASE_UNKNOWN,
+            crate::backends::passthroughfs::hide_path::CASE_UNKNOWN,
         ),
     });
     inodes.insert(inode_num, alt_key, data.clone());
@@ -365,12 +367,12 @@ fn do_lookup_macos(
 ) -> io::Result<Entry> {
     let st = platform::fstatat_nofollow(parent_fd, name)?;
 
-    // Directory-only deny patterns are evaluated against the object this single
+    // Directory-only hide-path patterns are evaluated against the object this single
     // stat (and the `/.vol` open below, which references the same device+inode)
     // resolves, so the decision and the returned entry cannot disagree.
-    if fs.deny.has_dir_only_patterns() {
+    if fs.hide_path.has_dir_only_patterns() {
         let is_dir = platform::mode_file_type(st.st_mode) == platform::MODE_DIR;
-        if fs.deny_matches_name(parent, name.to_bytes(), is_dir) {
+        if fs.hide_path_matches_name(parent, name.to_bytes(), is_dir) {
             return Err(platform::enoent());
         }
     }

@@ -35,7 +35,7 @@ pub struct PassthroughFsBuilder {
     inject_init: bool,
     bind_identity_map: Option<BindIdentityMapHandle>,
     quota_bytes: Option<u64>,
-    deny: Vec<String>,
+    hide_path: Vec<String>,
     max_state_bytes: usize,
 }
 
@@ -59,7 +59,7 @@ impl PassthroughFsBuilder {
             inject_init: true,
             bind_identity_map: None,
             quota_bytes: None,
-            deny: Vec::new(),
+            hide_path: Vec::new(),
             max_state_bytes: msb_krun::DEFAULT_MAX_FS_BACKEND_STATE_BYTES,
         }
     }
@@ -147,8 +147,8 @@ impl PassthroughFsBuilder {
     /// read-only mount; [`Self::build`] refuses them when the mount is
     /// writable, because a writable mount can rename an ancestor directory to
     /// launder the denied location.
-    pub fn deny(mut self, patterns: impl IntoIterator<Item = String>) -> Self {
-        self.deny.extend(patterns);
+    pub fn hide_path(mut self, patterns: impl IntoIterator<Item = String>) -> Self {
+        self.hide_path.extend(patterns);
         self
     }
 
@@ -189,7 +189,7 @@ impl PassthroughFsBuilder {
             bind_identity_map: self.bind_identity_map,
             quota_bytes: self.quota_bytes,
             quota_root: None,
-            deny: self.deny,
+            hide_path: self.hide_path,
         };
 
         PassthroughFs::new(cfg)

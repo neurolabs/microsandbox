@@ -473,12 +473,12 @@ impl LaunchContract {
         // reject unsupported intent before replacement as well as at launch.
         for mount in &config.spec.mounts {
             // Deny lists ship only with the current machine-protocol runtime; a
-            // v0.6.x runtime would reject the `deny=` mount option, so refuse
+            // v0.6.x runtime would reject the `hide-path=` mount option, so refuse
             // with an upgrade-required error instead of a generic parse failure.
-            if let VolumeMount::Bind { deny, .. } = mount
-                && !deny.is_empty()
+            if let VolumeMount::Bind { hide_path, .. } = mount
+                && !hide_path.is_empty()
             {
-                return unsupported("bind mount deny lists");
+                return unsupported("bind mount hide-path lists");
             }
             if self.patch < 16
                 && let VolumeMount::Bind { host, .. } = mount
@@ -882,17 +882,17 @@ mod tests {
     }
 
     #[test]
-    fn launch_rejects_bind_deny_for_legacy_runtime() {
+    fn launch_rejects_bind_hide_path_for_legacy_runtime() {
         let mut config = SandboxConfig::default();
         config.spec.mounts = vec![
             crate::sandbox::MountBuilder::new("/data")
                 .bind("/host/data")
-                .deny([".env"])
+                .hide_path([".env"])
                 .build()
                 .unwrap(),
         ];
 
-        // A v0.6.x runtime does not accept the `deny=` mount option; the SDK must
+        // A v0.6.x runtime does not accept the `hide-path=` mount option; the SDK must
         // refuse with an upgrade-required error rather than a generic parse error.
         let legacy = LaunchContract {
             patch: 18,
@@ -903,11 +903,11 @@ mod tests {
                 .validate_launch_intent(&config)
                 .unwrap_err()
                 .to_string()
-                .contains("bind mount deny lists"),
-            "legacy runtime must reject deny lists"
+                .contains("bind mount hide-path lists"),
+            "legacy runtime must reject hide-path lists"
         );
 
-        // The current machine-protocol runtime supports deny.
+        // The current machine-protocol runtime supports hide_path.
         LaunchContract {
             patch: 18,
             machine: true,

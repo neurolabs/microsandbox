@@ -1,7 +1,7 @@
 # Released v0.6.x configuration fixtures
 
-These fixtures back the cross-version claim of the bind-mount deny downgrade guard
-(`crates/migration/lib/m20261012_000001_bind_mount_deny_config.rs`). Same-version
+These fixtures back the cross-version claim of the bind-mount hide_path downgrade guard
+(`crates/migration/lib/m20261012_000001_bind_mount_hide_path_config.rs`). Same-version
 in-memory round trips cannot prove that a real released persisted format reaches
 the guard, so the guard test opens a fixture captured from a released line.
 
@@ -20,7 +20,7 @@ the guard, so the guard test opens a fixture captured from a released line.
   `packages/microsandbox-types/rust/lib/domain.rs` at tag `v0.6.0` (peeled commit
   `efaab0ec14e57b93e385244cbbd831950618a028`): `resources.cpus`/`memory_mib`
   without `max_cpus`, `image.Oci`, `pull_policy: "IfMissing"`, and no
-  `deployment_profile`. It carries no `deny` field anywhere.
+  `deployment_profile`. It carries no `hide_path` field anywhere.
 - **Limitation:** this is the released **format**, not a runtime-captured SQLite
   database image. No released v0.6.x tag in this repository contains a captured
   sandbox database or serialized sandbox config; the tags ship code and docs only,
@@ -29,6 +29,6 @@ the guard, so the guard test opens a fixture captured from a released line.
   tag source rather than derived from the `crates/db/lib/compat/v0_6_5/` rewrap
   code.
 
-The guard test asserts that this deny-free released configuration downgrades
+The guard test asserts that this hide-path-free released configuration downgrades
 cleanly across the marker, and that the same released configuration extended with
-a bind `deny` list refuses the downgrade.
+a bind `hide_path` list refuses the downgrade.

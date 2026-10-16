@@ -1,4 +1,4 @@
-//! macOS-specific deny-list path-pattern regression tests.
+//! macOS-specific hide_path-list path-pattern regression tests.
 //!
 //! These exercise the `/.vol/<dev>/<ino>` + `F_GETPATH` parent-path
 //! resolution path, which is macOS-only. They are gated to macOS because the
@@ -10,9 +10,9 @@ use super::*;
 
 /// A nested path pattern hides the matching path on macOS.
 #[test]
-fn test_macos_deny_path_pattern_lookup() {
+fn test_macos_hide_path_path_pattern_lookup() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["sub/.env".to_string()],
+        hide_path: vec!["sub/.env".to_string()],
         readonly: true,
         ..cfg
     });
@@ -28,9 +28,9 @@ fn test_macos_deny_path_pattern_lookup() {
 
 /// A recursive path pattern hides nested matches on macOS.
 #[test]
-fn test_macos_deny_recursive_path_pattern() {
+fn test_macos_hide_path_recursive_path_pattern() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["**/env.secret".to_string()],
+        hide_path: vec!["**/env.secret".to_string()],
         readonly: true,
         ..cfg
     });
@@ -47,12 +47,12 @@ fn test_macos_deny_recursive_path_pattern() {
 /// accepts it. Path patterns are location-based and a writable mount can
 /// launder them by renaming an ancestor directory.
 #[test]
-fn test_macos_deny_path_pattern_create() {
+fn test_macos_hide_path_path_pattern_create() {
     let tmp = tempfile::tempdir().unwrap();
 
     let writable = PassthroughFs::new(PassthroughConfig {
         root_dir: tmp.path().to_path_buf(),
-        deny: vec!["sub/.secret".to_string()],
+        hide_path: vec!["sub/.secret".to_string()],
         ..Default::default()
     });
     assert!(
@@ -62,7 +62,7 @@ fn test_macos_deny_path_pattern_create() {
 
     let readonly = PassthroughFs::new(PassthroughConfig {
         root_dir: tmp.path().to_path_buf(),
-        deny: vec!["sub/.secret".to_string()],
+        hide_path: vec!["sub/.secret".to_string()],
         readonly: true,
         ..Default::default()
     });

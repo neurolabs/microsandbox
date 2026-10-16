@@ -1043,41 +1043,41 @@ func TestMountNamedPropagatesPolicies(t *testing.T) {
 	}
 }
 
-func TestMountBindPropagatesDeny(t *testing.T) {
-	m := Mount.Bind("/host/data", MountOptions{Deny: []string{".env", "sub/secret"}})
+func TestMountBindPropagatesHidePath(t *testing.T) {
+	m := Mount.Bind("/host/data", MountOptions{HidePath: []string{".env", "sub/secret"}})
 	if m.Kind() != MountKindBind {
 		t.Errorf("Kind: got %d, want bind", m.Kind())
 	}
-	if len(m.Deny) != 2 || m.Deny[0] != ".env" || m.Deny[1] != "sub/secret" {
-		t.Errorf("Deny: got %v, want [.env sub/secret]", m.Deny)
+	if len(m.HidePath) != 2 || m.HidePath[0] != ".env" || m.HidePath[1] != "sub/secret" {
+		t.Errorf("HidePath: got %v, want [.env sub/secret]", m.HidePath)
 	}
 }
 
-func TestMountBindCarriesReservedDenyPatternsForBoundaryRejection(t *testing.T) {
+func TestMountBindCarriesReservedHidePathPatternsForBoundaryRejection(t *testing.T) {
 	// Go does not duplicate the shared validator; reserved patterns must reach
 	// the native boundary verbatim so it can reject them (leading '#', empty,
 	// wire separators).
-	m := Mount.Bind("/host/data", MountOptions{Deny: []string{"#secret", "", "a,b"}})
-	if len(m.Deny) != 3 || m.Deny[0] != "#secret" || m.Deny[1] != "" || m.Deny[2] != "a,b" {
-		t.Errorf("Deny: got %v, want [#secret  a,b]", m.Deny)
+	m := Mount.Bind("/host/data", MountOptions{HidePath: []string{"#secret", "", "a,b"}})
+	if len(m.HidePath) != 3 || m.HidePath[0] != "#secret" || m.HidePath[1] != "" || m.HidePath[2] != "a,b" {
+		t.Errorf("HidePath: got %v, want [#secret  a,b]", m.HidePath)
 	}
 }
 
-func TestMountNonBindFactoriesCarryDenyForRejection(t *testing.T) {
-	// Named must carry Deny through to the native layer so it is rejected
+func TestMountNonBindFactoriesCarryHidePathForRejection(t *testing.T) {
+	// Named must carry HidePath through to the native layer so it is rejected
 	// loudly at apply time instead of silently dropped.
-	nm := Mount.Named("vol", MountOptions{Deny: []string{".env"}})
-	if len(nm.Deny) != 1 || nm.Deny[0] != ".env" {
-		t.Errorf("Named Deny: got %v, want [.env]", nm.Deny)
+	nm := Mount.Named("vol", MountOptions{HidePath: []string{".env"}})
+	if len(nm.HidePath) != 1 || nm.HidePath[0] != ".env" {
+		t.Errorf("Named HidePath: got %v, want [.env]", nm.HidePath)
 	}
-	// Tmpfs/Disk take separate options types with no Deny field.
+	// Tmpfs/Disk take separate options types with no HidePath field.
 	tm := Mount.Tmpfs(TmpfsOptions{SizeMiB: 128})
-	if len(tm.Deny) != 0 {
-		t.Errorf("Tmpfs Deny: got %v, want empty", tm.Deny)
+	if len(tm.HidePath) != 0 {
+		t.Errorf("Tmpfs HidePath: got %v, want empty", tm.HidePath)
 	}
 	d := Mount.Disk("/host/img", DiskOptions{Format: "raw"})
-	if len(d.Deny) != 0 {
-		t.Errorf("Disk Deny: got %v, want empty", d.Deny)
+	if len(d.HidePath) != 0 {
+		t.Errorf("Disk HidePath: got %v, want empty", d.HidePath)
 	}
 }
 

@@ -705,7 +705,7 @@ jobs:
           shared-key: filesystem-backend-crosscheck
 
       # `--no-default-features` avoids the `embed-binaries` OUT_DIR payload, which
-      # is not available in this cross-check; the deny code is not feature-gated,
+      # is not available in this cross-check; the hide-path code is not feature-gated,
       # so this still compiles and covers the C1 windows-backend break.
       - name: Check macOS filesystem backend
         run: cargo +stable check --no-default-features -p microsandbox-filesystem --target aarch64-apple-darwin

@@ -17,10 +17,10 @@ impl PassthroughFs {
         umask: u32,
     ) -> io::Result<(Entry, Option<u64>, OpenOptions)> {
         self.require_writable()?;
-        // Validate the name before the deny check so a non-UTF-8 (invalid)
+        // Validate the name before the hide-path check so a non-UTF-8 (invalid)
         // name fails with EINVAL rather than EACCES, matching lookup.
         let path = self.child_path(parent, name)?;
-        if self.deny_matches_name(parent, name, false) {
+        if self.hide_path_matches_name(parent, name, false) {
             return Err(linux_error(LINUX_EACCES));
         }
         let parent_path = path.parent().ok_or_else(|| linux_error(LINUX_EINVAL))?;
@@ -81,10 +81,10 @@ impl PassthroughFs {
         umask: u32,
     ) -> io::Result<Entry> {
         self.require_writable()?;
-        // Validate the name before the deny check so a non-UTF-8 (invalid)
+        // Validate the name before the hide-path check so a non-UTF-8 (invalid)
         // name fails with EINVAL rather than EACCES, matching lookup.
         let path = self.child_path(parent, name)?;
-        if self.deny_matches_name(parent, name, false) {
+        if self.hide_path_matches_name(parent, name, false) {
             return Err(linux_error(LINUX_EACCES));
         }
         let parent_path = path.parent().ok_or_else(|| linux_error(LINUX_EINVAL))?;
@@ -133,10 +133,10 @@ impl PassthroughFs {
             return Err(linux_error(LINUX_EOPNOTSUPP));
         }
 
-        // Validate the name before the deny check so a non-UTF-8 (invalid)
+        // Validate the name before the hide-path check so a non-UTF-8 (invalid)
         // name fails with EINVAL rather than EACCES, matching lookup.
         let path = self.child_path(parent, name)?;
-        if self.deny_matches_name(parent, name, false) {
+        if self.hide_path_matches_name(parent, name, false) {
             return Err(linux_error(LINUX_EACCES));
         }
 
@@ -206,10 +206,10 @@ impl PassthroughFs {
             return Err(linux_error(LINUX_EACCES));
         }
 
-        // Validate the name before the deny check so a non-UTF-8 (invalid)
+        // Validate the name before the hide-path check so a non-UTF-8 (invalid)
         // name fails with EINVAL rather than EACCES, matching lookup.
         let new_path = self.child_path(newparent, newname)?;
-        if self.deny_matches_name(newparent, newname, false) {
+        if self.hide_path_matches_name(newparent, newname, false) {
             return Err(linux_error(LINUX_EACCES));
         }
 

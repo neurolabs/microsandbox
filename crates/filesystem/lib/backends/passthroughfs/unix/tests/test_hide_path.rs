@@ -1,4 +1,4 @@
-//! Tests for the bind-mount deny-list enforcement.
+//! Tests for the bind-mount hide_path-list enforcement.
 
 use super::*;
 
@@ -8,9 +8,9 @@ use super::*;
 
 /// A denied basename is invisible via lookup.
 #[test]
-fn test_deny_basename_lookup() {
+fn test_hide_path_basename_lookup() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec![".env".to_string()],
+        hide_path: vec![".env".to_string()],
         ..cfg
     });
     sb.host_create_file(".env", b"secret");
@@ -36,14 +36,14 @@ fn test_deny_basename_lookup() {
 /// case-sensitive temp dir: default APFS/HFS+ (macOS) and FAT are
 /// case-insensitive, so a hard-coded expectation fails on those hosts.
 #[test]
-fn test_deny_case_variant_matches_host_case_capability() {
+fn test_hide_path_case_variant_matches_host_case_capability() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec![".env".to_string()],
+        hide_path: vec![".env".to_string()],
         ..cfg
     });
     sb.host_create_file(".ENV", b"case variant");
 
-    if sb.fs.deny.default_case_insensitive() {
+    if sb.fs.hide_path.default_case_insensitive() {
         // The mount folds case, so `.ENV` and `.env` are the same file and the
         // denied basename hides it.
         TestSandbox::assert_errno(sb.lookup_root(".ENV"), LINUX_ENOENT);
@@ -63,16 +63,16 @@ fn test_deny_case_variant_matches_host_case_capability() {
 /// A path pattern must match a differently-cased component whose containing
 /// directory folds case, even when a deeper directory is case-sensitive. On a
 /// case-sensitive mount root, `fold` carries `FS_CASEFOLD_FL`, so the guest
-/// resolves `fold/data` to `fold/Data`; a deny path `fold/data/secret` must still
+/// resolves `fold/data` to `fold/Data`; a hide_path path `fold/data/secret` must still
 /// hide the file once `fold`'s fold is known.
 ///
 /// Linux-only: the test seeds the per-directory `FS_CASEFOLD_FL` cache through
 /// `InodeData::case_insensitive`, which exists only on Linux.
 #[test]
 #[cfg(target_os = "linux")]
-fn test_deny_path_pattern_folds_with_ancestor_directory() {
+fn test_hide_path_path_pattern_folds_with_ancestor_directory() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["fold/data/secret".to_string()],
+        hide_path: vec!["fold/data/secret".to_string()],
         // A path pattern is only admitted on a read-only mount.
         readonly: true,
         ..cfg
@@ -93,7 +93,7 @@ fn test_deny_path_pattern_folds_with_ancestor_directory() {
     {
         let inodes = sb.fs.inodes.read().unwrap();
         inodes.get(&fold).unwrap().case_insensitive.store(
-            crate::backends::passthroughfs::deny::CASE_INSENSITIVE,
+            crate::backends::passthroughfs::hide_path::CASE_INSENSITIVE,
             std::sync::atomic::Ordering::Relaxed,
         );
     }
@@ -107,9 +107,9 @@ fn test_deny_path_pattern_folds_with_ancestor_directory() {
 /// A `.*` pattern must not strip the structural `.` and `..` entries from
 /// readdir, otherwise path walks break.
 #[test]
-fn test_deny_star_pattern_keeps_dot_and_dotdot() {
+fn test_hide_path_star_pattern_keeps_dot_and_dotdot() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec![".*".to_string()],
+        hide_path: vec![".*".to_string()],
         ..cfg
     });
     sb.host_create_file(".env", b"secret");
@@ -124,24 +124,24 @@ fn test_deny_star_pattern_keeps_dot_and_dotdot() {
     let names: Vec<&[u8]> = entries.iter().map(|e| &e.name[..]).collect();
     assert!(
         names.contains(&b".".as_slice()),
-        "readdir must still contain '.' under a '.*' deny pattern"
+        "readdir must still contain '.' under a '.*' hide-path pattern"
     );
     assert!(
         names.contains(&b"..".as_slice()),
-        "readdir must still contain '..' under a '.*' deny pattern"
+        "readdir must still contain '..' under a '.*' hide-path pattern"
     );
     assert!(
         !names.contains(&b".env".as_slice()),
-        ".env should be hidden by the '.*' deny pattern"
+        ".env should be hidden by the '.*' hide-path pattern"
     );
 }
 
 /// `lookup(".")` must resolve to the parent directory, not be denied by a
 /// `.*` or `*` pattern.
 #[test]
-fn test_deny_star_pattern_lookup_dot_succeeds() {
+fn test_hide_path_star_pattern_lookup_dot_succeeds() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec![".*".to_string()],
+        hide_path: vec![".*".to_string()],
         ..cfg
     });
     sb.host_create_dir("sub");
@@ -166,9 +166,9 @@ fn test_deny_star_pattern_lookup_dot_succeeds() {
 
 /// Creating a denied basename via FUSE returns EACCES.
 #[test]
-fn test_deny_create_rejected() {
+fn test_hide_path_create_rejected() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec![".secrets".to_string()],
+        hide_path: vec![".secrets".to_string()],
         ..cfg
     });
 
@@ -179,11 +179,11 @@ fn test_deny_create_rejected() {
     assert_ne!(entry.inode, 0);
 }
 
-/// Creating a hidden directory returns EACCES from the deny list.
+/// Creating a hidden directory returns EACCES from the hide-path list.
 #[test]
-fn test_deny_mkdir_rejected() {
+fn test_hide_path_mkdir_rejected() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec![".hidden_dir".to_string(), "no_create.txt".to_string()],
+        hide_path: vec![".hidden_dir".to_string(), "no_create.txt".to_string()],
         ..cfg
     });
 
@@ -200,9 +200,9 @@ fn test_deny_mkdir_rejected() {
 
 /// Renaming a denied source name away returns EACCES.
 #[test]
-fn test_deny_rename_from_denied_source() {
+fn test_hide_path_rename_from_denied_source() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec![".forbidden".to_string()],
+        hide_path: vec![".forbidden".to_string()],
         ..cfg
     });
 
@@ -225,9 +225,9 @@ fn test_deny_rename_from_denied_source() {
 
 /// Renaming into a denied target name returns EACCES.
 #[test]
-fn test_deny_rename_to_denied_target() {
+fn test_hide_path_rename_to_denied_target() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec![".forbidden".to_string()],
+        hide_path: vec![".forbidden".to_string()],
         ..cfg
     });
 
@@ -266,12 +266,12 @@ fn test_deny_rename_to_denied_target() {
 //--------------------------------------------------------------------------------------------------
 
 /// PROOF (H1): a readdir request whose `nodeid` disagrees with the handle's
-/// inode must not leak path-pattern-denied entries; the deny path must come from
+/// inode must not leak path-pattern-denied entries; the hide_path path must come from
 /// the handle's inode, not the request. Fails on the unpatched backend.
 #[test]
-fn test_deny_readdir_ignores_mismatched_request_inode() {
+fn test_hide_path_readdir_ignores_mismatched_request_inode() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["a/.env".to_string()],
+        hide_path: vec!["a/.env".to_string()],
         readonly: true,
         ..cfg
     });
@@ -286,7 +286,7 @@ fn test_deny_readdir_ignores_mismatched_request_inode() {
     let correct_entries = sb.fs.readdir(sb.ctx(), a, correct, 4096, 0).unwrap();
     assert!(
         !correct_entries.iter().any(|e| e.name == b".env"),
-        "deny path pattern must hide `.env` under the real directory"
+        "hide_path path pattern must hide `.env` under the real directory"
     );
 
     // Same directory handle, mismatched request nodeid: rejected (not leaked).
@@ -309,9 +309,9 @@ fn test_deny_readdir_ignores_mismatched_request_inode() {
 
 /// Denied entries are omitted from readdir.
 #[test]
-fn test_deny_readdir_omits_entries() {
+fn test_hide_path_readdir_omits_entries() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec![".env".to_string(), "*.log".to_string()],
+        hide_path: vec![".env".to_string(), "*.log".to_string()],
         ..cfg
     });
     sb.host_create_file(".env", b"hidden");
@@ -335,9 +335,9 @@ fn test_deny_readdir_omits_entries() {
 
 /// Denied entries are omitted from readdirplus too.
 #[test]
-fn test_deny_readdirplus_omits_entries() {
+fn test_hide_path_readdirplus_omits_entries() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec![".env".to_string(), "*.log".to_string()],
+        hide_path: vec![".env".to_string(), "*.log".to_string()],
         ..cfg
     });
     sb.host_create_file(".env", b"hidden");
@@ -368,9 +368,9 @@ fn test_deny_readdirplus_omits_entries() {
 
 /// Unlink of a denied name returns EACCES.
 #[test]
-fn test_deny_unlink_rejected() {
+fn test_hide_path_unlink_rejected() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec![".do-not-delete".to_string()],
+        hide_path: vec![".do-not-delete".to_string()],
         ..cfg
     });
 
@@ -384,9 +384,9 @@ fn test_deny_unlink_rejected() {
 
 /// Rmdir of a denied directory returns EACCES.
 #[test]
-fn test_deny_rmdir_rejected() {
+fn test_hide_path_rmdir_rejected() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec![".protected-dir".to_string()],
+        hide_path: vec![".protected-dir".to_string()],
         ..cfg
     });
 
@@ -404,16 +404,16 @@ fn test_deny_rmdir_rejected() {
 
 /// Non-denied names remain fully read-write.
 #[test]
-fn test_deny_normal_ops_unchanged() {
+fn test_hide_path_normal_ops_unchanged() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec![".env".to_string()],
+        hide_path: vec![".env".to_string()],
         ..cfg
     });
 
     // Create, write, read all work on non-denied names.
     let (entry, handle) = sb.fuse_create_root("writeable.txt").unwrap();
     let written = sb
-        .fuse_write(entry.inode, handle, b"hello deny", 0)
+        .fuse_write(entry.inode, handle, b"hello path", 0)
         .unwrap();
     assert_eq!(written, 10);
 
@@ -422,7 +422,7 @@ fn test_deny_normal_ops_unchanged() {
         .open(sb.ctx(), entry.inode, false, LINUX_O_RDWR)
         .unwrap();
     let data = sb.fuse_read(entry.inode, handle.unwrap(), 10, 0).unwrap();
-    assert_eq!(data, b"hello deny");
+    assert_eq!(data, b"hello path");
 
     // Unlink works on normal files.
     sb.fs
@@ -439,9 +439,9 @@ fn test_deny_normal_ops_unchanged() {
 
 /// A nested path pattern hides the matching path but not its siblings.
 #[test]
-fn test_deny_path_pattern_lookup() {
+fn test_hide_path_path_pattern_lookup() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["sub/.env".to_string()],
+        hide_path: vec!["sub/.env".to_string()],
         readonly: true,
         ..cfg
     });
@@ -463,9 +463,9 @@ fn test_deny_path_pattern_lookup() {
 
 /// A recursive path pattern hides nested matches at any depth.
 #[test]
-fn test_deny_recursive_path_pattern() {
+fn test_hide_path_recursive_path_pattern() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["**/env.secret".to_string()],
+        hide_path: vec!["**/env.secret".to_string()],
         readonly: true,
         ..cfg
     });
@@ -483,16 +483,16 @@ fn test_deny_recursive_path_pattern() {
 /// A path pattern on a writable mount is refused by the backend constructor.
 ///
 /// The per-operation create check for path patterns is therefore unreachable
-/// with a writable mount; the deny matcher itself is covered by the readonly
+/// with a writable mount; the hide_path matcher itself is covered by the readonly
 /// lookup and readdir tests. Here we pin that `PassthroughFs::new` (not just
 /// the builder) enforces the rule.
 #[test]
-fn test_deny_path_pattern_create() {
+fn test_hide_path_path_pattern_create() {
     let tmp = tempfile::tempdir().unwrap();
 
     let writable = PassthroughFs::new(PassthroughConfig {
         root_dir: tmp.path().to_path_buf(),
-        deny: vec![".sub/.secret".to_string()],
+        hide_path: vec![".sub/.secret".to_string()],
         ..Default::default()
     });
     assert!(
@@ -502,7 +502,7 @@ fn test_deny_path_pattern_create() {
 
     let readonly = PassthroughFs::new(PassthroughConfig {
         root_dir: tmp.path().to_path_buf(),
-        deny: vec![".sub/.secret".to_string()],
+        hide_path: vec![".sub/.secret".to_string()],
         readonly: true,
         ..Default::default()
     });
@@ -520,9 +520,9 @@ fn test_deny_path_pattern_create() {
 /// rejected at construction on a writable mount (see
 /// `builder_rejects_path_pattern_on_writable_mount`).
 #[test]
-fn test_deny_path_pattern_rename_onto_denied_path_is_rejected() {
+fn test_hide_path_path_pattern_rename_onto_denied_path_is_rejected() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["sub/.env".to_string()],
+        hide_path: vec!["sub/.env".to_string()],
         readonly: true,
         ..cfg
     });
@@ -552,9 +552,9 @@ fn test_deny_path_pattern_rename_onto_denied_path_is_rejected() {
 
 /// A dir-only pattern hides a directory on lookup.
 #[test]
-fn test_deny_dir_only_lookup_hides_directory() {
+fn test_hide_path_dir_only_lookup_hides_directory() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["node_modules/".to_string()],
+        hide_path: vec!["node_modules/".to_string()],
         ..cfg
     });
     sb.host_create_dir("node_modules");
@@ -567,9 +567,9 @@ fn test_deny_dir_only_lookup_hides_directory() {
 
 /// A dir-only pattern does not hide a same-named file on lookup.
 #[test]
-fn test_deny_dir_only_lookup_serves_same_named_file() {
+fn test_hide_path_dir_only_lookup_serves_same_named_file() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["node_modules/".to_string()],
+        hide_path: vec!["node_modules/".to_string()],
         ..cfg
     });
     sb.host_create_file("node_modules", b"not a dir");
@@ -583,9 +583,9 @@ fn test_deny_dir_only_lookup_serves_same_named_file() {
 /// path pattern it still hides the directory and spares a same-named file
 /// outside the pattern's path.
 #[test]
-fn test_deny_dir_only_path_pattern_lookup() {
+fn test_hide_path_dir_only_path_pattern_lookup() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["sub/node_modules/".to_string()],
+        hide_path: vec!["sub/node_modules/".to_string()],
         readonly: true,
         ..cfg
     });
@@ -604,9 +604,9 @@ fn test_deny_dir_only_path_pattern_lookup() {
 
 /// A dir-only pattern allows creating a same-named file but rejects mkdir.
 #[test]
-fn test_deny_dir_only_mkdir_rejected_but_file_create_allowed() {
+fn test_hide_path_dir_only_mkdir_rejected_but_file_create_allowed() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["node_modules/".to_string()],
+        hide_path: vec!["node_modules/".to_string()],
         ..cfg
     });
 
@@ -625,9 +625,9 @@ fn test_deny_dir_only_mkdir_rejected_but_file_create_allowed() {
 /// file: `node_modules/` matches directories only, so a file named
 /// `node_modules` stays visible.
 #[test]
-fn test_deny_dir_only_readdir_keeps_same_named_file() {
+fn test_hide_path_dir_only_readdir_keeps_same_named_file() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["node_modules/".to_string()],
+        hide_path: vec!["node_modules/".to_string()],
         ..cfg
     });
     sb.host_create_dir("node_modules");
@@ -668,9 +668,9 @@ fn test_deny_dir_only_readdir_keeps_same_named_file() {
 /// A dir-only pattern rejects renaming a directory to the denied name but
 /// allows renaming a same-named file there.
 #[test]
-fn test_deny_dir_only_rename_dir_rejected_file_allowed() {
+fn test_hide_path_dir_only_rename_dir_rejected_file_allowed() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["node_modules/".to_string()],
+        hide_path: vec!["node_modules/".to_string()],
         ..cfg
     });
 
@@ -709,9 +709,9 @@ fn test_deny_dir_only_rename_dir_rejected_file_allowed() {
 /// raw EISDIR the syscall would otherwise surface (which would leak the hidden
 /// entry's existence and type).
 #[test]
-fn test_deny_dir_only_rename_file_over_hidden_dir_rejected() {
+fn test_hide_path_dir_only_rename_file_over_hidden_dir_rejected() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["node_modules/".to_string()],
+        hide_path: vec!["node_modules/".to_string()],
         ..cfg
     });
 
@@ -735,9 +735,9 @@ fn test_deny_dir_only_rename_file_over_hidden_dir_rejected() {
 /// file exchanged with an allowed directory would land the directory at a
 /// dir-only-denied source name. The reverse direction must be rejected.
 #[test]
-fn test_deny_dir_only_rename_exchange_dir_onto_denied_name_rejected() {
+fn test_hide_path_dir_only_rename_exchange_dir_onto_denied_name_rejected() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["node_modules/".to_string()],
+        hide_path: vec!["node_modules/".to_string()],
         ..cfg
     });
 
@@ -767,9 +767,9 @@ fn test_deny_dir_only_rename_exchange_dir_onto_denied_name_rejected() {
 /// RENAME_EXCHANGE of two files keeps files on both sides, so a dir-only
 /// pattern does not apply even when one name matches it.
 #[test]
-fn test_deny_dir_only_rename_exchange_two_files_allowed() {
+fn test_hide_path_dir_only_rename_exchange_two_files_allowed() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["node_modules/".to_string()],
+        hide_path: vec!["node_modules/".to_string()],
         ..cfg
     });
 
@@ -796,9 +796,9 @@ fn test_deny_dir_only_rename_exchange_two_files_allowed() {
 /// checks: neither endpoint is denied, so the destination identity re-check
 /// must not block the swap.
 #[test]
-fn test_deny_dir_only_rename_exchange_two_dirs_allowed() {
+fn test_hide_path_dir_only_rename_exchange_two_dirs_allowed() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["node_modules/".to_string()],
+        hide_path: vec!["node_modules/".to_string()],
         ..cfg
     });
 
@@ -826,9 +826,9 @@ fn test_deny_dir_only_rename_exchange_two_dirs_allowed() {
 /// this is caught by the source-type check (`source_is_dir = true`) rather
 /// than leaking the hidden file's existence through a raw ENOTDIR.
 #[test]
-fn test_deny_rename_dir_over_hidden_file_rejected() {
+fn test_hide_path_rename_dir_over_hidden_file_rejected() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec![".env".to_string()],
+        hide_path: vec![".env".to_string()],
         ..cfg
     });
 
@@ -850,9 +850,9 @@ fn test_deny_rename_dir_over_hidden_file_rejected() {
 
 /// A dir-only pattern rejects rmdir of the denied directory.
 #[test]
-fn test_deny_dir_only_rmdir_rejected() {
+fn test_hide_path_dir_only_rmdir_rejected() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["node_modules/".to_string()],
+        hide_path: vec!["node_modules/".to_string()],
         ..cfg
     });
 
@@ -868,9 +868,9 @@ fn test_deny_dir_only_rmdir_rejected() {
 /// raw unlink returns EISDIR, revealing that a hidden name exists and is a
 /// directory (an existence/type oracle).
 #[test]
-fn test_deny_dir_only_unlink_dir_rejected_not_eisdir() {
+fn test_hide_path_dir_only_unlink_dir_rejected_not_eisdir() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["node_modules/".to_string()],
+        hide_path: vec!["node_modules/".to_string()],
         ..cfg
     });
 
@@ -887,9 +887,9 @@ fn test_deny_dir_only_unlink_dir_rejected_not_eisdir() {
 /// A dir-only pattern allows unlink of a same-named file (gitignore 'foo/'
 /// does not match files).
 #[test]
-fn test_deny_dir_only_unlink_same_named_file_allowed() {
+fn test_hide_path_dir_only_unlink_same_named_file_allowed() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["node_modules/".to_string()],
+        hide_path: vec!["node_modules/".to_string()],
         ..cfg
     });
 
@@ -902,17 +902,17 @@ fn test_deny_dir_only_unlink_same_named_file_allowed() {
 
 /// A path pattern must fail closed when the parent inode cannot be resolved.
 #[test]
-fn test_deny_path_pattern_fails_closed_on_unresolvable_parent() {
+fn test_hide_path_path_pattern_fails_closed_on_unresolvable_parent() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["sub/.env".to_string()],
+        hide_path: vec!["sub/.env".to_string()],
         readonly: true,
         ..cfg
     });
 
     // A bogus parent inode is absent from the inode table, so its path cannot
-    // be reconstructed. With active path patterns this must deny, never allow.
+    // be reconstructed. With active path patterns this must hide_path, never allow.
     assert!(
-        sb.fs.deny_matches_name(1_000_000, b"secret", false),
+        sb.fs.hide_path_matches_name(1_000_000, b"secret", false),
         "unresolvable parent under path patterns must fail closed"
     );
 }
@@ -930,7 +930,7 @@ fn builder_rejects_path_pattern_on_writable_mount() {
 
     let writable = PassthroughFs::builder()
         .root_dir(tmp.path())
-        .deny(["sub/.env".to_string()])
+        .hide_path(["sub/.env".to_string()])
         .build();
     assert!(
         writable.is_err(),
@@ -940,7 +940,7 @@ fn builder_rejects_path_pattern_on_writable_mount() {
     let readonly = PassthroughFs::builder()
         .root_dir(tmp.path())
         .readonly(true)
-        .deny(["sub/.env".to_string()])
+        .hide_path(["sub/.env".to_string()])
         .build();
     assert!(
         readonly.is_ok(),
@@ -950,16 +950,16 @@ fn builder_rejects_path_pattern_on_writable_mount() {
     // Name-only patterns stay valid on a writable mount.
     let name_only = PassthroughFs::builder()
         .root_dir(tmp.path())
-        .deny([".env".to_string(), "node_modules/".to_string()])
+        .hide_path([".env".to_string(), "node_modules/".to_string()])
         .build();
     assert!(name_only.is_ok(), "name-only patterns are always writable");
 }
 
 //--------------------------------------------------------------------------------------------------
-// Tests: rename deny decision helper (both Retry branches)
+// Tests: rename hide_path decision helper (both Retry branches)
 //--------------------------------------------------------------------------------------------------
 
-/// Directly exercises `decide_rename_deny`: a fresh source identity proceeds, a
+/// Directly exercises `decide_rename_hide_path`: a fresh source identity proceeds, a
 /// stale one retries, and a denied endpoint is denied. Covers the extraction's
 /// Proceed/Retry/Deny branches without needing a concurrent writer (or macOS).
 ///
@@ -969,15 +969,15 @@ fn builder_rejects_path_pattern_on_writable_mount() {
 /// call). Its predicate — `ExchangeDest::still_matches` — is asserted directly
 /// below and also covered by the unit tests in `remove_ops`.
 #[test]
-fn test_decide_rename_deny_proceeds_and_retries_on_stale_source() {
+fn test_decide_rename_hide_path_proceeds_and_retries_on_stale_source() {
     use super::super::inode;
     use super::super::remove_ops::{
-        ExchangeDest, RenameDecision, RenameEndpoint, decide_rename_deny,
+        ExchangeDest, RenameDecision, RenameEndpoint, decide_rename_hide_path,
     };
     use crate::backends::shared::platform;
 
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["sub/.env".to_string()],
+        hide_path: vec!["sub/.env".to_string()],
         readonly: true,
         ..cfg
     });
@@ -1006,19 +1006,19 @@ fn test_decide_rename_deny_proceeds_and_retries_on_stale_source() {
     // Fresh source identity -> proceed (`sub/.env` does not match `sub/keep`).
     let current = platform::fstat(keep_fd.raw()).unwrap();
     assert!(matches!(
-        decide_rename_deny(&sb.fs, old, new, 0, &current).unwrap(),
+        decide_rename_hide_path(&sb.fs, old, new, 0, &current).unwrap(),
         RenameDecision::Proceed
     ));
 
     // A stale captured identity (the parent directory's) -> retry.
     let stale = platform::fstat(sub_fd.raw()).unwrap();
     assert!(matches!(
-        decide_rename_deny(&sb.fs, old, new, 0, &stale).unwrap(),
+        decide_rename_hide_path(&sb.fs, old, new, 0, &stale).unwrap(),
         RenameDecision::Retry
     ));
 
     // A denied endpoint (the path pattern `sub/.env` matches `sub/.env`)
-    // -> deny, decided from the fresh source identity.
+    // -> hide_path, decided from the fresh source identity.
     let denied_name = TestSandbox::cstr(".env");
     let denied = RenameEndpoint {
         fd: &sub_fd,
@@ -1027,13 +1027,13 @@ fn test_decide_rename_deny_proceeds_and_retries_on_stale_source() {
     };
     let current = platform::fstat(keep_fd.raw()).unwrap();
     assert!(matches!(
-        decide_rename_deny(&sb.fs, denied, new, 0, &current).unwrap(),
+        decide_rename_hide_path(&sb.fs, denied, new, 0, &current).unwrap(),
         RenameDecision::Deny
     ));
 
-    // A denied destination is also a deny.
+    // A denied destination is also a hide_path.
     assert!(matches!(
-        decide_rename_deny(&sb.fs, old, denied, 0, &current).unwrap(),
+        decide_rename_hide_path(&sb.fs, old, denied, 0, &current).unwrap(),
         RenameDecision::Deny
     ));
 
@@ -1061,7 +1061,7 @@ fn test_decide_rename_deny_proceeds_and_retries_on_stale_source() {
 #[test]
 fn do_link_denies_dir_only_rule_using_source_type() {
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec!["node_modules/".to_string()],
+        hide_path: vec!["node_modules/".to_string()],
         ..cfg
     });
     sb.host_create_dir("src_dir");
@@ -1105,16 +1105,16 @@ fn do_link_denies_dir_only_rule_using_source_type() {
 
 /// A symlink whose target is denied does not expose the target.
 ///
-/// The link entry itself is served (deny matches the entry name, and `link` is
+/// The link entry itself is served (hide_path matches the entry name, and `link` is
 /// allowed), but following the link resolves the target name, which is a fresh
-/// lookup that deny rejects with `ENOENT`. The target's contents stay
+/// lookup that hide_path rejects with `ENOENT`. The target's contents stay
 /// unreachable; only the link entry's existence is observable, which is the
 /// same name-based limitation as any allowed name.
 #[test]
-fn test_deny_symlink_to_denied_target_does_not_expose_target() {
+fn test_hide_path_symlink_to_denied_target_does_not_expose_target() {
     use std::os::unix::fs::symlink;
     let sb = TestSandbox::with_config(|cfg| PassthroughConfig {
-        deny: vec![".env".to_string()],
+        hide_path: vec![".env".to_string()],
         ..cfg
     });
     sb.host_create_file(".env", b"secret");
@@ -1127,24 +1127,24 @@ fn test_deny_symlink_to_denied_target_does_not_expose_target() {
     let target = sb.fs.readlink(sb.ctx(), link.inode).unwrap();
     assert_eq!(target, b".env", "the link points at the denied target");
 
-    // Following the link is a fresh lookup of the target name, which deny
+    // Following the link is a fresh lookup of the target name, which hide_path
     // rejects, so the target's contents stay unreachable.
     TestSandbox::assert_errno(sb.lookup_root(".env"), LINUX_ENOENT);
 }
 
 //--------------------------------------------------------------------------------------------------
-// Tests: restored directory snapshots re-apply the destination deny list
+// Tests: restored directory snapshots re-apply the destination hide-path list
 //--------------------------------------------------------------------------------------------------
 
 /// A name visible when a directory listing was captured must not reappear through
-/// the restored snapshot once the destination deny list hides it.
+/// the restored snapshot once the destination hide-path list hides it.
 ///
 /// Restore re-interning a saved directory snapshot bypasses live lookup and
-/// readdir filtering, so the deny list must be re-applied while rebuilding the
+/// readdir filtering, so the hide-path list must be re-applied while rebuilding the
 /// snapshot. The denied file is never looked up, so it has no restored inode:
 /// only the directory-snapshot re-filter can hide it.
 #[test]
-fn restored_directory_snapshot_drops_names_hidden_by_destination_deny() {
+fn restored_directory_snapshot_drops_names_hidden_by_destination_hide_path() {
     use super::super::mobility::{capture, restore};
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1176,7 +1176,7 @@ fn restored_directory_snapshot_drops_names_hidden_by_destination_deny() {
 
     let destination = PassthroughFs::new(PassthroughConfig {
         root_dir: tmp.path().to_path_buf(),
-        deny: vec![".env".to_string()],
+        hide_path: vec![".env".to_string()],
         ..Default::default()
     })
     .unwrap();

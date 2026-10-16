@@ -2479,7 +2479,10 @@ fn resolve_file_mounts(
     let mut file_mounts = HashMap::new();
     for mount in &config.spec.mounts {
         let VolumeMount::Bind {
-            host, guest, deny, ..
+            host,
+            guest,
+            hide_path,
+            ..
         } = mount
         else {
             continue;
@@ -2493,7 +2496,7 @@ fn resolve_file_mounts(
             // A missing or type-changed export must retain its captured transport,
             // never be reclassified from a file facade into a directory share.
             if let Some(filename) = &binding.filename {
-                reject_deny_on_file_bind(guest, deny)?;
+                reject_hide_path_on_file_bind(guest, hide_path)?;
                 file_mounts.insert(guest.clone(), (filename.clone(), binding.mount.tag.clone()));
             }
             continue;
@@ -2502,7 +2505,7 @@ fn resolve_file_mounts(
             continue;
         }
 
-        reject_deny_on_file_bind(guest, deny)?;
+        reject_hide_path_on_file_bind(guest, hide_path)?;
         let filename = host
             .file_name()
             .and_then(OsStr::to_str)
@@ -2518,18 +2521,18 @@ fn resolve_file_mounts(
     Ok(file_mounts)
 }
 
-/// Reject a deny list on a bind that resolves to a single host file.
+/// Reject a hide-path list on a bind that resolves to a single host file.
 ///
 /// File binds use the single-file backend, which exposes exactly one entry and
-/// has no namespace to filter, so a deny rule would be silently ignored.
+/// has no namespace to filter, so a hide-path rule would be silently ignored.
 /// Refuse it rather than start the sandbox with weaker protection than the
 /// caller asked for.
-fn reject_deny_on_file_bind(guest: &str, deny: &[String]) -> MicrosandboxResult<()> {
-    if deny.is_empty() {
+fn reject_hide_path_on_file_bind(guest: &str, hide_path: &[String]) -> MicrosandboxResult<()> {
+    if hide_path.is_empty() {
         return Ok(());
     }
     Err(MicrosandboxError::InvalidConfig(format!(
-        "deny patterns are not supported for a host file bind at {guest:?}; mount its parent directory to hide entries by pattern"
+        "hide-path patterns are not supported for a host file bind at {guest:?}; mount its parent directory to hide entries by pattern"
     )))
 }
 
@@ -2544,7 +2547,7 @@ fn push_dir_mount_arg(
     host_permissions: HostPermissions,
     follow_root_symlinks: bool,
     quota_mib: Option<u32>,
-    deny: &[String],
+    hide_path: &[String],
 ) {
     let tag = guest_mount_tag(guest);
     push_dir_mount_arg_with_tag(
@@ -2556,7 +2559,7 @@ fn push_dir_mount_arg(
         host_permissions,
         follow_root_symlinks,
         quota_mib,
-        deny,
+        hide_path,
     );
 }
 
@@ -2571,7 +2574,7 @@ fn push_dir_mount_arg_with_tag(
     host_permissions: HostPermissions,
     follow_root_symlinks: bool,
     quota_mib: Option<u32>,
-    deny: &[String],
+    hide_path: &[String],
 ) {
     let mut arg = format!("{tag}:{host_display}");
     let mut opts = mount_option_tokens(options);
@@ -2586,12 +2589,12 @@ fn push_dir_mount_arg_with_tag(
     if let Some(mib) = quota_mib {
         opts.push(format!("quota={mib}"));
     }
-    for p in deny {
-        // Emit the pattern verbatim. `validate_deny_pattern` rejects leading or
+    for p in hide_path {
+        // Emit the pattern verbatim. `validate_hide_path_pattern` rejects leading or
         // trailing whitespace because the runtime trims option tokens; trimming
         // here would silently reinterpret a value like `" !secret"` as the
         // allow rule `!secret`.
-        opts.push(format!("deny={p}"));
+        opts.push(format!("hide-path={p}"));
     }
     append_option_block(&mut arg, opts);
     mounts.push(arg);
@@ -3083,7 +3086,7 @@ fn machine_cli_args(
                 host_permissions,
                 follow_root_symlinks,
                 quota_mib,
-                deny,
+                hide_path,
                 ..
             } => {
                 if let Some((filename, tag)) = file_mounts.get(guest) {
@@ -3121,7 +3124,7 @@ fn machine_cli_args(
                         *host_permissions,
                         *follow_root_symlinks,
                         Some(quota),
-                        deny,
+                        hide_path,
                     );
                     launch.bootstrap.dir_mounts.push(BootstrapDirMount {
                         tag: guest_mount_tag(guest),
@@ -5446,7 +5449,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_file_mounts_rejects_deny_on_file_bind() {
+    async fn resolve_file_mounts_rejects_hide_path_on_file_bind() {
         let dir = tempdir().unwrap();
         let host_file = dir.path().join("secret.txt");
         std::fs::write(&host_file, b"secret").unwrap();
@@ -5454,7 +5457,7 @@ mod tests {
         let config = SandboxBuilder::new("test")
             .image("/tmp/rootfs")
             .volume("/guest/secret.txt", |m| {
-                m.bind(host_file.as_path()).deny([".env"])
+                m.bind(host_file.as_path()).hide_path([".env"])
             })
             .build()
             .await
@@ -5463,7 +5466,7 @@ mod tests {
         let err = resolve_file_mounts(&config).unwrap_err();
         assert!(
             err.to_string()
-                .contains("deny patterns are not supported for a host file bind"),
+                .contains("hide-path patterns are not supported for a host file bind"),
             "unexpected error: {err}"
         );
     }
@@ -5640,13 +5643,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sandbox_cli_args_bind_mount_deny_renders_arg_only() {
+    async fn test_sandbox_cli_args_bind_mount_hide_path_renders_arg_only() {
         let config = SandboxBuilder::new("test")
             .image("/tmp/rootfs")
             .volume("/data", |m| {
                 // `sub/secret` is a path pattern, which is only valid on a
                 // read-only mount; the mount stays writable elsewhere.
-                m.bind("/host/data").readonly().deny([".env", "sub/secret"])
+                m.bind("/host/data")
+                    .readonly()
+                    .hide_path([".env", "sub/secret"])
             })
             .build()
             .await
@@ -5655,14 +5660,14 @@ mod tests {
         let rendered = render_args(&config);
         let data_tag = super::guest_mount_tag("/data");
         let expected = format!(
-            "{data_tag}:/host/data:ro,quota={},deny=.env,deny=sub/secret",
+            "{data_tag}:/host/data:ro,quota={},hide-path=.env,hide-path=sub/secret",
             crate::sandbox::config::DEFAULT_BIND_QUOTA_MIB
         );
         assert!(
             rendered
                 .windows(2)
                 .any(|pair| pair[0] == "--mount" && pair[1] == expected),
-            "missing deny --mount arg in {rendered:?}"
+            "missing hide_path --mount arg in {rendered:?}"
         );
 
         // Deny rides only in the --mount arg, never the agentd env spec.
@@ -5672,8 +5677,8 @@ mod tests {
             .cloned()
             .unwrap_or_default();
         assert!(
-            !dir_mounts.contains("deny"),
-            "MSB_DIR_MOUNTS must not carry deny, got {dir_mounts:?}"
+            !dir_mounts.contains("hide-path"),
+            "MSB_DIR_MOUNTS must not carry hide_path, got {dir_mounts:?}"
         );
     }
 

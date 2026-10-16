@@ -68,7 +68,7 @@ struct FileSnapshotMetadata<'a> {
     user: Option<String>,
     /// Guest paths of source mounts whose host-side backing this snapshot does not carry.
     external_mounts: Vec<String>,
-    /// Captured host-side deny policy for each host-backed bind mount.
+    /// Captured host-side hide-path policy for each host-backed bind mount.
     mount_policies: Vec<ExternalMountPolicy>,
 }
 
@@ -1003,9 +1003,9 @@ async fn capture_full_snapshot(
         manifest.set_guest_clock(sandbox_config.spec.runtime.guest_clock.unwrap_or_default())?;
         manifest.set_owned_volumes(closure.checkpoint().owned_volumes.clone())?;
         // A full snapshot resolves external mounts from the checkpoint closure, not
-        // from the manifest, so the guest paths stay unrecorded. The deny policy must
+        // from the manifest, so the guest paths stay unrecorded. The hide-path policy must
         // still be captured: restore compares it even when the mapping comes from the
-        // closure, so without it a destination bind with a dropped deny list would
+        // closure, so without it a destination bind with a dropped hide-path list would
         // silently re-expose a hidden path.
         manifest
             .set_external_mount_policies(captured_mount_policies(&sandbox_config.spec.mounts)?)?;
@@ -1368,18 +1368,18 @@ fn uncaptured_mount_paths(mounts: &[VolumeMount]) -> MicrosandboxResult<Vec<Stri
     Ok(guest_paths)
 }
 
-/// Captured host-side deny policy of every bind mount that carries one.
+/// Captured host-side hide-path policy of every bind mount that carries one.
 ///
-/// Only host-backed bind mounts have a deny list; a bind with an empty list
+/// Only host-backed bind mounts have a hide-path list; a bind with an empty list
 /// contributes no entry, so a snapshot that denies nothing keeps its released
 /// bytes and an older reader stays compatible.
 fn captured_mount_policies(mounts: &[VolumeMount]) -> MicrosandboxResult<Vec<ExternalMountPolicy>> {
     let mut policies = Vec::new();
     for mount in mounts {
-        let VolumeMount::Bind { deny, .. } = mount else {
+        let VolumeMount::Bind { hide_path, .. } = mount else {
             continue;
         };
-        if deny.is_empty() {
+        if hide_path.is_empty() {
             continue;
         }
 
@@ -1388,7 +1388,7 @@ fn captured_mount_policies(mounts: &[VolumeMount]) -> MicrosandboxResult<Vec<Ext
 
         policies.push(ExternalMountPolicy {
             guest_path: mount.guest().to_string(),
-            deny: deny.clone(),
+            hide_path: hide_path.clone(),
         });
     }
 
@@ -3095,9 +3095,9 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_manifest_records_bind_deny_policy() {
+    fn snapshot_manifest_records_bind_hide_path_policy() {
         let config = SandboxBuilder::new("source")
-            .volume("/data", |m| m.bind("/host/data").deny([".env"]))
+            .volume("/data", |m| m.bind("/host/data").hide_path([".env"]))
             .volume("/plain", |m| m.bind("/host/plain"))
             .config
             .into_config();
@@ -3108,7 +3108,7 @@ mod tests {
             policies,
             [ExternalMountPolicy {
                 guest_path: "/data".into(),
-                deny: vec![".env".into()],
+                hide_path: vec![".env".into()],
             }]
         );
     }

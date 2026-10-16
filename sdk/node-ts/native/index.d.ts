@@ -491,7 +491,7 @@ export declare class MountBuilder {
    * A path pattern (`sub/secret`) requires a read-only mount, since a writable
    * guest could rename an ancestor directory to bypass it.
    */
-  deny(patterns: Array<string>): this
+  hidePath(patterns: Array<string>): this
   /**
    * Set the guest stat virtualization policy.
    *
@@ -2969,7 +2969,7 @@ export interface VolumeMount {
   ownedKind?: string
   sizeMib?: number
   quotaMib?: number
-  deny?: Array<string>
+  hidePath?: Array<string>
   format?: string
   fstype?: string
   /**

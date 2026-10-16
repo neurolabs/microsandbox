@@ -75,7 +75,7 @@ impl DynFileSystem for PassthroughFs {
         valid: SetattrValid,
     ) -> io::Result<(stat64, Duration)> {
         // A path-backed inode can be replaced on the host after lookup. Re-apply
-        // the directory-only deny rule before mutating attributes through the
+        // the directory-only hide-path rule before mutating attributes through the
         // stale path, so a hidden replacement directory is not exposed or
         // modified. `opendir` and `child_path` already re-check the same way.
         self.reject_dir_only_denied_live_path(inode)?;
@@ -123,10 +123,10 @@ impl DynFileSystem for PassthroughFs {
         _extensions: Extensions,
     ) -> io::Result<Entry> {
         self.require_writable()?;
-        // Validate the name before the deny check so a non-UTF-8 (invalid)
+        // Validate the name before the hide-path check so a non-UTF-8 (invalid)
         // name fails with EINVAL rather than EACCES, matching lookup.
         let path = self.child_path(parent, name)?;
-        if self.deny_matches_name(parent, name, true) {
+        if self.hide_path_matches_name(parent, name, true) {
             return Err(linux_error(LINUX_EACCES));
         }
         let parent_path = path.parent().ok_or_else(|| linux_error(LINUX_EINVAL))?;
@@ -155,7 +155,7 @@ impl DynFileSystem for PassthroughFs {
 
     fn unlink(&self, _ctx: Context, parent: u64, name: &CStr) -> io::Result<()> {
         self.require_writable()?;
-        // Validate the name before the deny check so a non-UTF-8 (invalid)
+        // Validate the name before the hide-path check so a non-UTF-8 (invalid)
         // name fails with EINVAL rather than EACCES, matching lookup.
         let path = self.child_path(parent, name)?;
         // Name-only and path-only rules do not depend on the target's type, so
@@ -163,18 +163,18 @@ impl DynFileSystem for PassthroughFs {
         // returns EACCES whether it exists or not, never ENOENT, and a denied
         // reparse point returns EACCES rather than ELOOP: no error reveals the
         // hidden entry's existence or type.
-        if self.deny_matches_name(parent, name, false) {
+        if self.hide_path_matches_name(parent, name, false) {
             return Err(linux_error(LINUX_EACCES));
         }
         // Only a directory-only pattern (`node_modules/`) needs the entry's
         // type. Read metadata only when one is present; an unresolved type is
         // treated as a directory so the rule still hides the name.
-        if self.deny.has_dir_only_patterns() {
+        if self.hide_path.has_dir_only_patterns() {
             let is_dir = self
                 .safe_metadata(&path)
                 .map(|metadata| metadata.file_type().is_dir())
                 .unwrap_or(true);
-            if self.deny_matches_name(parent, name, is_dir) {
+            if self.hide_path_matches_name(parent, name, is_dir) {
                 return Err(linux_error(LINUX_EACCES));
             }
         }
@@ -188,10 +188,10 @@ impl DynFileSystem for PassthroughFs {
 
     fn rmdir(&self, _ctx: Context, parent: u64, name: &CStr) -> io::Result<()> {
         self.require_writable()?;
-        // Validate the name before the deny check so a non-UTF-8 (invalid)
+        // Validate the name before the hide-path check so a non-UTF-8 (invalid)
         // name fails with EINVAL rather than EACCES, matching lookup.
         let path = self.child_path(parent, name)?;
-        if self.deny_matches_name(parent, name, true) {
+        if self.hide_path_matches_name(parent, name, true) {
             return Err(linux_error(LINUX_EACCES));
         }
         let metadata = self.safe_metadata(&path)?;
@@ -221,11 +221,11 @@ impl DynFileSystem for PassthroughFs {
             return Err(linux_error(LINUX_EOPNOTSUPP));
         }
 
-        // Validate both names before the deny check so a non-UTF-8 (invalid)
+        // Validate both names before the hide-path check so a non-UTF-8 (invalid)
         // name fails with EINVAL rather than EACCES, matching lookup.
         let old_path = self.child_path(olddir, oldname)?;
         let new_path = self.child_path(newdir, newname)?;
-        // The source type can change between the deny checks and the move when
+        // The source type can change between the hide-path checks and the move when
         // an external writer (host process, or a second mount on the same host
         // directory) bypasses the single-threaded virtio-fs worker that
         // serializes guest requests. A directory swapped in for a file would
@@ -242,18 +242,18 @@ impl DynFileSystem for PassthroughFs {
             }
 
             // A rename replaces the destination with the source's type, so the
-            // destination's effective type is the source's; use it for both deny
+            // destination's effective type is the source's; use it for both hide_path
             // checks so a dir-only pattern like `node_modules/` rejects renaming
             // a directory to that name while still allowing a same-named file.
             let source_meta = self.safe_metadata(&old_path)?;
-            let source_is_dir = if self.deny.has_dir_only_patterns() {
+            let source_is_dir = if self.hide_path.has_dir_only_patterns() {
                 source_meta.file_type().is_dir()
             } else {
                 false
             };
 
-            if self.deny_matches_name(olddir, oldname, source_is_dir)
-                || self.deny_matches_name(newdir, newname, source_is_dir)
+            if self.hide_path_matches_name(olddir, oldname, source_is_dir)
+                || self.hide_path_matches_name(newdir, newname, source_is_dir)
             {
                 return Err(linux_error(LINUX_EACCES));
             }
@@ -261,12 +261,12 @@ impl DynFileSystem for PassthroughFs {
             // A rename whose destination already exists as a *directory* denied
             // by a dir-only pattern would otherwise surface a raw EISDIR/ENOTDIR
             // and leak the hidden entry's existence and type. Reject it explicitly.
-            if self.deny.has_dir_only_patterns() {
+            if self.hide_path.has_dir_only_patterns() {
                 let dest_is_dir = self
                     .safe_metadata(&new_path)
                     .map(|m| m.file_type().is_dir())
                     .unwrap_or(false);
-                if dest_is_dir && self.deny_matches_name(newdir, newname, true) {
+                if dest_is_dir && self.hide_path_matches_name(newdir, newname, true) {
                     return Err(linux_error(LINUX_EACCES));
                 }
             }
@@ -277,7 +277,7 @@ impl DynFileSystem for PassthroughFs {
             // is legitimately renamable while a directory is denied. The stale-type
             // risk is therefore only real when a directory could land at a
             // dir-only-denied *destination* after a file was decided; the
-            // source-side collision is already enforced by the deny check above (a
+            // source-side collision is already enforced by the hide-path check above (a
             // denied directory is rejected outright). Refuse just that destination
             // case, and only when the source was decided to be a file (the decision
             // a swap could invalidate). `is_dir` only affects matching under
@@ -303,8 +303,8 @@ impl DynFileSystem for PassthroughFs {
             let after_identity = metadata_identity(&after_meta);
             let after_is_dir = after_meta.file_type().is_dir();
             let dir_denied = !source_is_dir
-                && self.deny.has_dir_only_patterns()
-                && self.deny_matches_name(newdir, newname, true);
+                && self.hide_path.has_dir_only_patterns()
+                && self.hide_path_matches_name(newdir, newname, true);
             match (metadata_identity(&source_meta), after_identity) {
                 (Some(before), Some(after)) if before != after => continue,
                 (None, _) | (_, None) if dir_denied && after_is_dir => {
@@ -585,13 +585,13 @@ impl DynFileSystem for PassthroughFs {
             return Err(linux_error(LINUX_ENOTDIR));
         }
         // Windows inodes are path-backed, so `opendir` re-resolves the live path.
-        // Re-apply the directory-only deny rule: a host writer could have replaced
+        // Re-apply the directory-only hide-path rule: a host writer could have replaced
         // an allowed file at a dir-only-denied name with a directory after lookup
         // vouched for it, and opening it would expose the hidden contents. The
         // mount root is never denied.
         if inode != ROOT_INODE
-            && self.deny.has_dir_only_patterns()
-            && self.deny_matches_path(&data.path(), true)
+            && self.hide_path.has_dir_only_patterns()
+            && self.hide_path_matches_path(&data.path(), true)
         {
             return Err(linux_error(LINUX_ENOENT));
         }

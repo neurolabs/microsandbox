@@ -1,6 +1,6 @@
-//! Shared cross-SDK deny-pattern disposition fixture.
+//! Shared cross-SDK hide_path-pattern disposition fixture.
 //!
-//! `microsandbox_types::fixtures::DENY_FIXTURE_JSON` embeds the single source of
+//! `microsandbox_types::fixtures::HIDE_PATH_FIXTURE_JSON` embeds the single source of
 //! the pattern -> disposition matrix. Every language SDK loads it and asserts
 //! that its own validation path produces the same `accept`/`reject` disposition,
 //! so a pattern accepted by one SDK is accepted (or refused) by all of them.
@@ -11,10 +11,10 @@ use serde::Deserialize;
 // Types
 //--------------------------------------------------------------------------------------------------
 
-/// One row of the shared deny-pattern fixture.
+/// One row of the shared hide_path-pattern fixture.
 #[derive(Debug, Deserialize)]
 struct Case {
-    /// The `deny` pattern under test.
+    /// The `hide_path` pattern under test.
     pattern: String,
     /// Whether the mount carrying the pattern is read-only.
     readonly: bool,
@@ -26,10 +26,10 @@ struct Case {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
-/// Load the shared deny-pattern fixture.
+/// Load the shared hide_path-pattern fixture.
 fn fixture_cases() -> Vec<Case> {
-    serde_json::from_str(microsandbox_types::fixtures::DENY_FIXTURE_JSON)
-        .expect("parse shared deny fixture")
+    serde_json::from_str(microsandbox_types::fixtures::HIDE_PATH_FIXTURE_JSON)
+        .expect("parse shared hide_path fixture")
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -37,12 +37,13 @@ fn fixture_cases() -> Vec<Case> {
 //--------------------------------------------------------------------------------------------------
 
 #[test]
-fn deny_pattern_fixture_dispositions_match_shared_validator() {
+fn hide_path_pattern_fixture_dispositions_match_shared_validator() {
     let cases = fixture_cases();
     assert!(!cases.is_empty(), "fixture must not be empty");
 
     for case in cases {
-        let result = microsandbox_types::validate_deny_list(&[case.pattern.clone()], case.readonly);
+        let result =
+            microsandbox_types::validate_hide_path_list(&[case.pattern.clone()], case.readonly);
         match case.expect.as_str() {
             "accept" => assert!(
                 result.is_ok(),

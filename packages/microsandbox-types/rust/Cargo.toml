@@ -18,7 +18,7 @@ required-features = ["ts"]
 
 [features]
 default = []
-# Expose the cross-language test fixtures (e.g. the deny-pattern disposition
+# Expose the cross-language test fixtures (e.g. the hide-path pattern disposition
 # matrix) as `microsandbox_types::fixtures`. Off by default so the embedded
 # payload never reaches a normal runtime or SDK build.
 test-support = []
