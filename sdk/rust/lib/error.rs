@@ -217,11 +217,11 @@ pub enum MicrosandboxError {
     #[error("control client error: {0}")]
     ControlClient(#[source] std::sync::Arc<microsandbox_control_client::ControlClientError>),
 
-    /// The run or active configuration changed after a live control operation.
-    /// The live operation may have applied; callers must inspect fresh state
-    /// before deciding whether to submit a new modification.
+    /// The run or active configuration changed while saving a modification.
+    /// Earlier live operations may have applied; callers must inspect fresh
+    /// state before deciding whether to retry.
     #[error(
-        "runtime or active configuration changed while recording a live control result; the live change may already have applied"
+        "sandbox state changed while saving a modification; inspect its current state before retrying because earlier live changes may have applied"
     )]
     ControlStateChanged,
 
@@ -371,6 +371,16 @@ pub enum MicrosandboxError {
         op: Operation,
         /// Why the operation is unavailable, and what to do instead.
         reason: UnsupportedReason,
+    },
+
+    /// A modification did not complete as asked: it may be saved without being in effect on the
+    /// running sandbox, or its result is unknown. Only Cloud returns it; `cause` never holds a
+    /// secret value.
+    #[error("the change did not complete as asked: {cause}")]
+    ModificationNotConfirmed {
+        /// What is known about the change: what failed, whether it was saved, and whether
+        /// sending the same change again retries it.
+        cause: String,
     },
 
     /// A custom error message.
@@ -875,6 +885,21 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "timed out after 360s waiting for sandbox \"cloud-sandbox\" to stop; the accepted stop may still complete"
+        );
+    }
+
+    #[test]
+    fn modification_not_confirmed_shows_the_cause_as_given() {
+        let error = MicrosandboxError::ModificationNotConfirmed {
+            cause: "the change was saved, but the running sandbox does not hold the secret; it \
+                    applies at the next start"
+                .into(),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "the change did not complete as asked: the change was saved, but the running sandbox \
+             does not hold the secret; it applies at the next start"
         );
     }
 }

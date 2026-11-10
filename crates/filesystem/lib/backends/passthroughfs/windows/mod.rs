@@ -286,7 +286,7 @@ impl PassthroughFs {
         }
         let Ok(parent_data) = self.inode(parent) else {
             // Fail closed: an unresolvable parent under active path patterns
-            // must hide_path, never allow.
+            // must hide, never allow.
             return true;
         };
 
@@ -902,18 +902,6 @@ fn host_error(error: io::Error) -> io::Error {
 
 fn linux_error(errno: i32) -> io::Error {
     io::Error::from_raw_os_error(errno)
-}
-
-/// A stable per-volume file identity, when the filesystem exposes one.
-///
-/// Combines the volume serial number and the volume-unique file index. Returns
-/// `None` when the filesystem does not report a file index (so callers can skip
-/// identity-based race checks rather than fail).
-fn metadata_identity(metadata: &std::fs::Metadata) -> Option<(u32, u64)> {
-    match (metadata.volume_serial_number(), metadata.file_index()) {
-        (Some(volume), Some(index)) => Some((volume, index)),
-        _ => None,
-    }
 }
 
 //--------------------------------------------------------------------------------------------------

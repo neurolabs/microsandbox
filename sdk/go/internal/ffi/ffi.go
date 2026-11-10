@@ -129,6 +129,7 @@ typedef char *(*msb_sandbox_stop_gracefully_fn)(uint64_t cancel_id, uint64_t han
 typedef char *(*msb_sandbox_request_stop_fn)(uint64_t cancel_id, uint64_t handle, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_sandbox_restore_warnings_fn)(uint64_t cancel_id, uint64_t handle, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_sandbox_pause_fn)(uint64_t cancel_id, uint64_t handle, uint8_t *buf, size_t buf_len);
+typedef bool (*msb_hide_path_supported_fn)(void);
 typedef char *(*msb_sandbox_pause_with_guest_flush_fn)(uint64_t cancel_id, uint64_t handle, const char *source, const char *expected_id, const char *policy, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_sandbox_branch_fn)(uint64_t cancel_id, uint64_t handle, const char *source, const char *child, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_sandbox_branch_with_options_fn)(uint64_t cancel_id, uint64_t handle, const char *source, const char *child, bool record_integrity, uint8_t *buf, size_t buf_len);
@@ -310,6 +311,7 @@ static msb_sandbox_request_stop_fn ptr_msb_sandbox_request_stop = NULL;
 static msb_sandbox_restore_warnings_fn ptr_msb_sandbox_restore_warnings = NULL;
 static msb_sandbox_pause_fn ptr_msb_sandbox_pause = NULL;
 static msb_sandbox_pause_with_guest_flush_fn ptr_msb_sandbox_pause_with_guest_flush = NULL;
+static msb_hide_path_supported_fn ptr_msb_hide_path_supported = NULL;
 static msb_sandbox_branch_fn ptr_msb_sandbox_branch = NULL;
 static msb_sandbox_branch_with_options_fn ptr_msb_sandbox_branch_with_options = NULL;
 static msb_sandbox_branch_with_options_fn ptr_msb_sandbox_branch_many = NULL;
@@ -446,6 +448,10 @@ bool has_port_modification(void) {
     return lib_handle && dlsym(lib_handle, "msb_supports_port_modification") != NULL;
 }
 
+bool has_secret_policy_modification(void) {
+    return lib_handle && dlsym(lib_handle, "msb_supports_secret_policy_modification") != NULL;
+}
+
 // load_error holds a static error string on dlopen/dlsym failure.
 // Not freed by callers — it lives for the process lifetime.
 static char load_error[1024] = {0};
@@ -516,6 +522,7 @@ const char *load_microsandbox(const char *path) {
 	RESOLVE_OPTIONAL(msb_sandbox_restore_warnings);
 	RESOLVE(msb_sandbox_pause);
 	RESOLVE_OPTIONAL(msb_sandbox_pause_with_guest_flush);
+	RESOLVE_OPTIONAL(msb_hide_path_supported);
 	RESOLVE(msb_sandbox_branch);
 	RESOLVE_OPTIONAL(msb_sandbox_branch_with_options);
 	RESOLVE_OPTIONAL(msb_sandbox_branch_many);
@@ -764,6 +771,7 @@ char *call_msb_sandbox_branch(uint64_t cancel_id, uint64_t handle, const char *s
 }
 bool has_branch_integrity(void) { return ptr_msb_sandbox_branch_with_options != NULL; }
 bool has_guest_flush(void) { return ptr_msb_sandbox_pause_with_guest_flush != NULL; }
+bool has_hide_path(void) { return ptr_msb_hide_path_supported != NULL; }
 char *call_msb_sandbox_pause_with_guest_flush(uint64_t cancel_id, uint64_t handle, const char *source, const char *expected_id, const char *policy, uint8_t *buf, size_t buf_len) {
 	return ptr_msb_sandbox_pause_with_guest_flush ? ptr_msb_sandbox_pause_with_guest_flush(cancel_id, handle, source, expected_id, policy, buf, buf_len) : NULL;
 }
@@ -1260,6 +1268,10 @@ func ensureLoaded() error {
 // KindBufferTooSmall; streaming is a follow-up.
 const defaultBufSize = 1 << 20
 
+// storageDiagnosisMaxBufSize bounds a whole-home report, including its trailing NUL.
+// Larger inventories must be inspected as smaller named subsets.
+const storageDiagnosisMaxBufSize = 32 << 20
+
 // fsStreamBufSize is the output buffer used for fs read-stream Recv calls.
 // The protocol's FS_CHUNK_SIZE is 3 MiB; after base64 inflation (~33%) plus
 // the {"chunk_b64":"..."} JSON wrapper, each Recv response can reach ~4.1
@@ -1306,37 +1318,38 @@ func (e *Error) Error() string { return e.Message }
 
 // Error kind strings. Keep in sync with sdk/go/native/src/lib.rs FfiError::kind.
 const (
-	KindSandboxNotFound        = "sandbox_not_found"
-	KindSandboxAlreadyExists   = "sandbox_already_exists"
-	KindSandboxReplaced        = "sandbox_replaced"
-	KindSandboxStopTimedOut    = "sandbox_stop_timed_out"
-	KindSandboxStillRunning    = "sandbox_still_running"
-	KindVolumeNotFound         = "volume_not_found"
-	KindVolumeAlreadyExists    = "volume_already_exists"
-	KindExecTimeout            = "exec_timeout"
-	KindStopTimeout            = "stop_timeout"
-	KindNoDefaultCommand       = "no_default_command"
-	KindInvalidConfig          = "invalid_config"
-	KindInvalidArgument        = "invalid_argument"
-	KindInvalidHandle          = "invalid_handle"
-	KindBufferTooSmall         = "buffer_too_small"
-	KindCancelled              = "cancelled"
-	KindInternal               = "internal"
-	KindFilesystem             = "filesystem"
-	KindImageNotFound          = "image_not_found"
-	KindImageInUse             = "image_in_use"
-	KindSnapshotNotFound       = "snapshot_not_found"
-	KindSnapshotAlreadyExists  = "snapshot_already_exists"
-	KindSnapshotSandboxRunning = "snapshot_sandbox_running"
-	KindSnapshotImageMissing   = "snapshot_image_missing"
-	KindSnapshotIntegrity      = "snapshot_integrity"
-	KindSnapshotMigration      = "snapshot_migration"
-	KindSnapshotSourceRecovery = "snapshot_source_recovery"
-	KindPatchFailed            = "patch_failed"
-	KindMetricsDisabled        = "metrics_disabled"
-	KindMetricsUnavailable     = "metrics_unavailable"
-	KindUnsupportedOperation   = "unsupported_operation"
-	KindIO                     = "io"
+	KindSandboxNotFound          = "sandbox_not_found"
+	KindSandboxAlreadyExists     = "sandbox_already_exists"
+	KindSandboxReplaced          = "sandbox_replaced"
+	KindSandboxStopTimedOut      = "sandbox_stop_timed_out"
+	KindSandboxStillRunning      = "sandbox_still_running"
+	KindVolumeNotFound           = "volume_not_found"
+	KindVolumeAlreadyExists      = "volume_already_exists"
+	KindExecTimeout              = "exec_timeout"
+	KindStopTimeout              = "stop_timeout"
+	KindNoDefaultCommand         = "no_default_command"
+	KindInvalidConfig            = "invalid_config"
+	KindInvalidArgument          = "invalid_argument"
+	KindInvalidHandle            = "invalid_handle"
+	KindBufferTooSmall           = "buffer_too_small"
+	KindCancelled                = "cancelled"
+	KindInternal                 = "internal"
+	KindFilesystem               = "filesystem"
+	KindImageNotFound            = "image_not_found"
+	KindImageInUse               = "image_in_use"
+	KindSnapshotNotFound         = "snapshot_not_found"
+	KindSnapshotAlreadyExists    = "snapshot_already_exists"
+	KindSnapshotSandboxRunning   = "snapshot_sandbox_running"
+	KindSnapshotImageMissing     = "snapshot_image_missing"
+	KindSnapshotIntegrity        = "snapshot_integrity"
+	KindSnapshotMigration        = "snapshot_migration"
+	KindSnapshotSourceRecovery   = "snapshot_source_recovery"
+	KindPatchFailed              = "patch_failed"
+	KindMetricsDisabled          = "metrics_disabled"
+	KindMetricsUnavailable       = "metrics_unavailable"
+	KindUnsupportedOperation     = "unsupported_operation"
+	KindModificationNotConfirmed = "modification_not_confirmed"
+	KindIO                       = "io"
 )
 
 // Sandbox is an opaque handle to a Rust-side sandbox. Call Close to release.
@@ -1763,6 +1776,7 @@ type CreateOptions struct {
 	MaxCPUs              uint8                `json:"max_cpus,omitempty"`
 	CPUPlacement         string               `json:"cpu_placement,omitempty"`
 	PlacementProfile     string               `json:"placement_profile,omitempty"`
+	NestedVirt           *bool                `json:"nested_virt,omitempty"`
 	THP                  string               `json:"thp,omitempty"`
 	Workdir              string               `json:"workdir,omitempty"`
 	Shell                string               `json:"shell,omitempty"`
@@ -1786,6 +1800,9 @@ type CreateOptions struct {
 	MaxDurationSecs      uint64               `json:"max_duration_secs,omitempty"`
 	IdleTimeoutSecs      uint64               `json:"idle_timeout_secs,omitempty"`
 	RegistryAuth         *RegistryAuthOptions `json:"registry_auth,omitempty"`
+	// RegistryAnonymous pulls without credentials. Mutually exclusive with
+	// RegistryAuth; libraries that predate it reject the request.
+	RegistryAnonymous bool `json:"registry_anonymous,omitempty"`
 	// RegistryInsecure pulls over plain HTTP instead of HTTPS.
 	RegistryInsecure bool `json:"registry_insecure,omitempty"`
 	// RegistryCACerts holds PEM-encoded CA root certificate bundles trusted
@@ -1844,7 +1861,7 @@ type MountSpec struct {
 	Nodev              bool     `json:"nodev,omitempty"`
 	SizeMiB            uint32   `json:"size_mib,omitempty"`
 	QuotaMiB           uint32   `json:"quota_mib,omitempty"`
-	HidePath               []string `json:"hide_path,omitempty"`
+	HidePath           []string `json:"hide_path,omitempty"`
 	StatVirtualization string   `json:"stat_virtualization,omitempty"`
 	HostPermissions    string   `json:"host_permissions,omitempty"`
 	OverrideUid        *uint32  `json:"override_uid,omitempty"`
@@ -2083,6 +2100,9 @@ func createSandbox(ctx context.Context, name string, opts CreateOptions, connect
 	if err := ensureLoaded(); err != nil {
 		return nil, err
 	}
+	if err := checkHidePath(opts.Volumes); err != nil {
+		return nil, err
+	}
 
 	optsJSON, err := json.Marshal(opts)
 	if err != nil {
@@ -2125,6 +2145,9 @@ func RestoreSandbox(ctx context.Context, name string, opts RestoreOptions) (*San
 	}
 	if !bool(C.has_sandbox_restore()) {
 		return nil, &Error{Kind: KindUnsupportedOperation, Message: "native SDK does not support Sandbox restore; update the native SDK"}
+	}
+	if err := checkHidePath(opts.Volumes); err != nil {
+		return nil, err
 	}
 
 	optsJSON, err := json.Marshal(opts)
@@ -2839,6 +2862,9 @@ func BranchManyByName(ctx context.Context, handle uint64, source, identity strin
 	if err := checkGuestFlush(flush, false); err != nil {
 		return nil, err
 	}
+	if err := checkHidePath(volumes); err != nil {
+		return nil, err
+	}
 	if names == nil {
 		names = []string{}
 	}
@@ -2955,6 +2981,24 @@ func validateGuestFlushSupport(policy string, diskOnly, supported bool) error {
 	}
 	if (diskOnly || (policy != "" && policy != "auto")) && !supported {
 		return &Error{Kind: KindUnsupportedOperation, Message: "native SDK does not support guest flush policies; update the native SDK"}
+	}
+	return nil
+}
+
+// checkHidePath prevents older native libraries from silently ignoring hide_path,
+// which would mount the paths the caller asked to hide.
+func checkHidePath(volumes map[string]MountSpec) error {
+	return validateHidePathSupport(volumes, bool(C.has_hide_path()))
+}
+
+func validateHidePathSupport(volumes map[string]MountSpec, supported bool) error {
+	if supported {
+		return nil
+	}
+	for _, spec := range volumes {
+		if len(spec.HidePath) > 0 {
+			return &Error{Kind: KindUnsupportedOperation, Message: "native SDK does not support bind-mount hide_path; update the native SDK"}
+		}
 	}
 	return nil
 }
@@ -5974,9 +6018,39 @@ func RuntimeSetup(ctx context.Context, operation, configJSON, optionsJSON string
 	defer C.free(unsafe.Pointer(op))
 	defer C.free(unsafe.Pointer(config))
 	defer C.free(unsafe.Pointer(options))
-	return call(ctx, func(cancelID C.uint64_t, buf *C.uint8_t, bufLen C.size_t) *C.char {
-		return C.call_msb_runtime_setup(cancelID, op, config, options, buf, bufLen)
+	return runtimeSetupOutput(ctx, operation, func(size int) (string, error) {
+		return callBuf(ctx, size, func(cancelID C.uint64_t, buf *C.uint8_t, bufLen C.size_t) *C.char {
+			return C.call_msb_runtime_setup(cancelID, op, config, options, buf, bufLen)
+		})
 	})
+}
+
+func runtimeSetupOutput(ctx context.Context, operation string, invoke func(int) (string, error)) (string, error) {
+	for size := defaultBufSize; ; {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		output, err := invoke(size)
+		// Only diagnosis is read-only. Retrying install, ensure or recovery after an
+		// undersized response could repeat an already-completed mutation.
+		var native *Error
+		if operation != "diagnose_storage" || !errors.As(err, &native) || native.Kind != KindBufferTooSmall {
+			return output, err
+		}
+		var needed, available int
+		if _, parseErr := fmt.Sscanf(native.Message, "output buffer too small: need %d, have %d", &needed, &available); parseErr != nil || needed <= size || available != size {
+			return "", err
+		}
+		if needed > storageDiagnosisMaxBufSize || size == storageDiagnosisMaxBufSize {
+			return "", &Error{
+				Kind:    KindBufferTooSmall,
+				Message: "storage diagnosis exceeds the 32 MiB response limit; inspect smaller named subsets",
+			}
+		}
+		// Grow geometrically even if a concurrently changing inventory requests only
+		// one extra byte each time. The cap bounds both allocation and retry count.
+		size = min(storageDiagnosisMaxBufSize, max(needed, size*2))
+	}
 }
 
 // Jobs invokes the optional managed-job ABI without changing existing library requirements.
@@ -6006,6 +6080,18 @@ func RequirePortModification() error {
 	}
 	if !bool(C.has_port_modification()) {
 		return fmt.Errorf("published-port modification requires an updated native library")
+	}
+	return nil
+}
+
+// RequireSecretPolicyModification rejects secret policy edits that an older
+// library would skip.
+func RequireSecretPolicyModification() error {
+	if err := ensureLoaded(); err != nil {
+		return err
+	}
+	if !bool(C.has_secret_policy_modification()) {
+		return fmt.Errorf("secret policy modification requires an updated native library")
 	}
 	return nil
 }

@@ -65,6 +65,11 @@ char *msb_sandbox_create(uint64_t cancel_id,
  */
 bool msb_supports_port_modification(void);
 
+/**
+ * Capability marker for secret policy modification in the Go bindings.
+ */
+bool msb_supports_secret_policy_modification(void);
+
 char *msb_sandbox_lookup(uint64_t cancel_id,
                          const char *name,
                          unsigned char *buf,
@@ -751,6 +756,15 @@ char *msb_volume_fs_op(uint64_t cancel_id,
                        const char *args_json,
                        unsigned char *buf,
                        uintptr_t buf_len);
+
+/**
+ * Capability marker: this library enforces `hide_path` on bind mounts.
+ *
+ * Older libraries ignore the unknown `hide_path` JSON field and would mount the
+ * paths unhidden, so the Go SDK refuses a hide-path list unless this symbol
+ * resolves. Its presence is the signal; it is never called.
+ */
+bool msb_hide_path_supported(void);
 
 /**
  * Returns the upstream `microsandbox` crate version this FFI was built against.

@@ -127,11 +127,10 @@ pub(crate) fn require_guest_mounts(
 ///
 /// Only bind mounts carry a hide-path list; a destination that remaps a captured bind
 /// to a non-bind or drops one of its patterns would re-expose a path the source
-/// hid. A stricter (superset) hide-path list is accepted, but a gitignore negation
-/// (`!name`) re-exposes a name, so a negation the capture did not contain is a
-/// weakening even when every captured positive pattern is still present.
-/// Reordering matters too because gitignore is last-match-wins, so the captured
-/// patterns must appear in the destination as an order-preserving subsequence.
+/// hid. Gitignore rules are last-match-wins, so inserting a positive pattern
+/// anywhere only hides more, while any added negation (`!name`) can re-expose a
+/// name. The destination is therefore accepted only when it is the captured list,
+/// in order, with zero or more positive patterns inserted.
 /// `None` means the capture predates policy recording and is treated as unknown,
 /// never as an empty list.
 fn reject_weakened_hide_path(
@@ -153,22 +152,7 @@ fn reject_weakened_hide_path(
             VolumeMount::Bind { hide_path, .. } => hide_path,
             _ => &[],
         };
-        // Gitignore rules are last-match-wins, so a destination that keeps the
-        // captured patterns but reorders them can still expose a name an earlier
-        // rule hid (e.g. captured ["*", "!*.txt", "secret.txt"] versus destination
-        // ["*", "secret.txt", "!*.txt"]). Require the captured list to be an
-        // order-preserving subsequence of the destination: this rejects drops and
-        // reorders while still allowing extra positive patterns (which only hide
-        // more).
-        let mut remaining = destination_hide_path.iter();
-        let preserves_order = policy
-            .hide_path
-            .iter()
-            .all(|pattern| remaining.by_ref().any(|candidate| candidate == pattern));
-        let introduces_negation = destination_hide_path
-            .iter()
-            .any(|pattern| pattern.starts_with('!') && !policy.hide_path.contains(pattern));
-        if !preserves_order || introduces_negation {
+        if !extends_with_positive_patterns(&policy.hide_path, destination_hide_path) {
             return Err(MicrosandboxError::InvalidConfig(format!(
                 "restore would weaken bind-mount hide-path policy at {}; re-declare the hide-path list",
                 policy.guest_path
@@ -177,6 +161,23 @@ fn reject_weakened_hide_path(
     }
 
     Ok(())
+}
+
+/// Whether `destination` is `captured` in order with only positive patterns inserted.
+///
+/// Consuming each captured pattern at its earliest occurrence is optimal, so a
+/// destination negation that is not the next captured pattern can never be one of
+/// the captured rules.
+fn extends_with_positive_patterns(captured: &[String], destination: &[String]) -> bool {
+    let mut captured = captured.iter().peekable();
+    for pattern in destination {
+        if captured.peek() == Some(&pattern) {
+            captured.next();
+        } else if pattern.starts_with('!') {
+            return false;
+        }
+    }
+    captured.peek().is_none()
 }
 
 /// Refuse a branch child whose explicit mounts drop or weaken a source bind's hide-path list.
@@ -858,6 +859,51 @@ mod tests {
             error.contains("weaken bind-mount hide-path policy at /data"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn restore_rejects_repeated_captured_negation_that_reopens_a_later_rule() {
+        // `!*.txt` already occurs in the capture, but a second copy appended after
+        // `secret.txt` is the last match for it and re-exposes it.
+        let mut config = SandboxBuilder::new("restore")
+            .volume("/data", |m| {
+                m.bind("/tmp/d")
+                    .hide_path(["*", "!*.txt", "secret.txt", "!*.txt"])
+            })
+            .config
+            .into_config();
+        config.restore_resources.require_complete = true;
+        let captured = vec![ExternalMountPolicy {
+            guest_path: "/data".into(),
+            hide_path: vec!["*".into(), "!*.txt".into(), "secret.txt".into()],
+        }];
+
+        let refusal = require_guest_mounts(&config, vec!["/data".into()], Some(captured))
+            .expect_err("a repeated negation after a captured rule must be refused");
+        let error = refusal.to_string();
+
+        assert!(
+            error.contains("weaken bind-mount hide-path policy at /data"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn restore_accepts_positive_pattern_inserted_between_captured_rules() {
+        let mut config = SandboxBuilder::new("restore")
+            .volume("/data", |m| {
+                m.bind("/tmp/d")
+                    .hide_path(["*", "notes.txt", "!*.txt", "secret.txt"])
+            })
+            .config
+            .into_config();
+        config.restore_resources.require_complete = true;
+        let captured = vec![ExternalMountPolicy {
+            guest_path: "/data".into(),
+            hide_path: vec!["*".into(), "!*.txt".into(), "secret.txt".into()],
+        }];
+
+        require_guest_mounts(&config, vec!["/data".into()], Some(captured)).unwrap();
     }
 
     #[test]

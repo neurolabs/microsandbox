@@ -1,7 +1,7 @@
 # Released v0.6.x configuration fixtures
 
 These fixtures back the cross-version claim of the bind-mount hide_path downgrade guard
-(`crates/migration/lib/m20261012_000001_bind_mount_hide_path_config.rs`). Same-version
+(`crates/migration/lib/m20261110_000001_bind_mount_hide_path_config.rs`). Same-version
 in-memory round trips cannot prove that a real released persisted format reaches
 the guard, so the guard test opens a fixture captured from a released line.
 

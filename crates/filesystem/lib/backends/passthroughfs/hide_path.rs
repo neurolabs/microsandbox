@@ -397,7 +397,7 @@ impl HidePathList {
     fn case_match(&self, bytes: &[u8], is_dir: bool, case_insensitive: bool) -> CaseMatch {
         let matcher = if case_insensitive {
             // A casefold directory on a case-sensitive mount cannot safely fold
-            // a non-ASCII pattern (`matcher_insensitive` is `None`); hide_path it
+            // a non-ASCII pattern (`matcher_insensitive` is `None`); hide it
             // rather than under-match.
             match &self.matcher_insensitive {
                 Some(matcher) => matcher,
@@ -413,7 +413,7 @@ impl HidePathList {
                 Match::None => CaseMatch::Nothing,
             },
             // A name that cannot be decoded into a path (non-Unix invalid
-            // UTF-8) can never be matched; hide_path it rather than let it bypass the
+            // UTF-8) can never be matched; hide it rather than let it bypass the
             // hide-path list. Fail closed.
             None => CaseMatch::Ignore,
         }
@@ -776,7 +776,7 @@ mod tests {
     fn casefold_directory_with_non_ascii_pattern_fails_closed() {
         // `ignore` folds ASCII-only, so a non-ASCII pattern cannot be matched
         // case-insensitively. On a case-sensitive mount such a pattern is valid,
-        // but a casefold directory must hide_path rather than fall back to an
+        // but a casefold directory must hide rather than fall back to an
         // under-matching insensitive matcher.
         let list = HidePathList::build(&["café".to_string()], false).unwrap();
 
@@ -795,12 +795,11 @@ mod tests {
         // must therefore either reject it or truly fold it; silently accepting
         // and then under-matching is the bug this pins.
         let owned = vec!["café".to_string()];
-        match HidePathList::build(&owned, true) {
-            Ok(list) => assert!(
+        if let Ok(list) = HidePathList::build(&owned, true) {
+            assert!(
                 list.matches_basename("CAFE\u{301}".as_bytes(), false),
                 "a case-insensitive build must fold café to CAFÉ or reject it"
-            ),
-            Err(_) => {}
+            )
         }
 
         // On a case-sensitive mount the pattern is byte-exact and stays valid.

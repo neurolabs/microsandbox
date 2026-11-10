@@ -140,7 +140,7 @@ pub fn validate_hide_path_pattern(pattern: &str) -> TypesResult<()> {
     // matcher and enforce nothing.
     if pattern == "." || pattern == ".." {
         return Err(TypesError::invalid_config(format!(
-            "hide-path pattern must not be '.' or '..'; hide_path a named entry instead \
+            "hide-path pattern must not be '.' or '..'; hide a named entry instead \
              (e.g. 'secret' or 'secret/'), not the current or parent directory: {pattern:?}"
         )));
     }

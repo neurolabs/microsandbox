@@ -246,6 +246,7 @@ impl DynFileSystem for PassthroughFs {
             // checks so a dir-only pattern like `node_modules/` rejects renaming
             // a directory to that name while still allowing a same-named file.
             let source_meta = self.safe_metadata(&old_path)?;
+            let source_identity = self.path_identity(&old_path).ok().flatten();
             let source_is_dir = if self.hide_path.has_dir_only_patterns() {
                 source_meta.file_type().is_dir()
             } else {
@@ -300,12 +301,12 @@ impl DynFileSystem for PassthroughFs {
             // rename-conditional-on-inode operation exists and the same window
             // cannot be closed at all (upstream virtiofsd accepts the same race).
             let after_meta = self.safe_metadata(&old_path)?;
-            let after_identity = metadata_identity(&after_meta);
+            let after_identity = self.path_identity(&old_path).ok().flatten();
             let after_is_dir = after_meta.file_type().is_dir();
             let dir_denied = !source_is_dir
                 && self.hide_path.has_dir_only_patterns()
                 && self.hide_path_matches_name(newdir, newname, true);
-            match (metadata_identity(&source_meta), after_identity) {
+            match (source_identity, after_identity) {
                 (Some(before), Some(after)) if before != after => continue,
                 (None, _) | (_, None) if dir_denied && after_is_dir => {
                     return Err(linux_error(LINUX_EBUSY));

@@ -323,10 +323,9 @@ fn measure(root: &Path, scenario: &Scenario) -> Measured {
     let base_dir_inode = lookup(&base, &ctx, ROOT_INODE, b"data").unwrap().inode;
 
     // Deny-heavy directory inode (child of `data`), when the scenario has one.
-    let hide_path_heavy_inode = match scenario.hide_path_heavy {
-        Some((name, _)) => Some(lookup(&fs, &ctx, dir_inode, name.as_bytes()).unwrap().inode),
-        None => None,
-    };
+    let hide_path_heavy_inode = scenario
+        .hide_path_heavy
+        .map(|(name, _)| lookup(&fs, &ctx, dir_inode, name.as_bytes()).unwrap().inode);
 
     // Look up a file that passes the hide-path check (the common case), so each
     // iteration pays the full hide-path check without short-circuiting.

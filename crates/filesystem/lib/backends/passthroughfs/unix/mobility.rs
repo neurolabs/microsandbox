@@ -316,7 +316,7 @@ pub(super) fn restore(fs: &PassthroughFs, bytes: &[u8]) -> io::Result<()> {
     }
 
     *fs.inodes.write().unwrap() = prepared.inodes;
-    *fs.handles.write().unwrap() = prepared.files;
+    *fs.handles.write().unwrap() = prepared.files.into();
     *fs.dir_handles.write().unwrap() = prepared.dirs;
     fs.next_inode.store(prepared.next_inode, Ordering::Release);
     fs.next_handle
@@ -1275,6 +1275,38 @@ mod tests {
             inject_init: false,
             stat_virtualization: StatVirtualization::Off,
             hide_path: vec!["secret".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        destination.init(FsOptions::empty()).unwrap();
+
+        let error = restore(&destination, &encoded).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("hidden by the mount hide-path list"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn restore_refuses_a_path_below_a_directory_the_destination_hides() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("secret")).unwrap();
+        std::fs::write(root.path().join("secret/data"), b"x").unwrap();
+        let source = backend(root.path());
+        source.init(FsOptions::empty()).unwrap();
+        let secret = source.lookup(context(), 1, c"secret").unwrap().inode;
+        source.lookup(context(), secret, c"data").unwrap();
+        // Drop the directory's own entry so only `secret/data` is stored.
+        source.forget(context(), secret, 1);
+        let encoded = capture(&source).unwrap();
+
+        let destination = PassthroughFs::new(super::super::PassthroughConfig {
+            root_dir: root.path().to_path_buf(),
+            inject_init: false,
+            stat_virtualization: StatVirtualization::Off,
+            hide_path: vec!["secret/".to_string()],
             ..Default::default()
         })
         .unwrap();

@@ -874,6 +874,10 @@ fn validate_shape(
 /// asked to hide, so fail closed with an explicit error. Mirrors the Unix
 /// `reject_denied_restore_path`; the empty component list is the mount root,
 /// which is never denied.
+///
+/// Path-backed inodes do not require their parent in the stored state, so every
+/// ancestor is checked as a directory too: a live lookup never reaches an entry
+/// below a hidden directory, and a stored `secret/data` is refused by `secret/`.
 fn reject_denied_restore_path(
     fs: &PassthroughFs,
     components: &[Vec<u16>],
@@ -881,6 +885,14 @@ fn reject_denied_restore_path(
 ) -> io::Result<()> {
     if fs.hide_path.is_empty() || components.is_empty() {
         return Ok(());
+    }
+    for end in 1..components.len() {
+        let ancestor = path_from_components(fs, &components[..end])?;
+        if fs.hide_path_matches_path(&ancestor, true) {
+            return Err(invalid_state(
+                "restored passthrough inode is hidden by the mount hide-path list",
+            ));
+        }
     }
     let is_dir = fs.safe_metadata(path)?.file_type().is_dir();
     if fs.hide_path_matches_path(path, is_dir) {
