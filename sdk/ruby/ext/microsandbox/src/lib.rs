@@ -1,4 +1,5 @@
 mod jobs;
+mod storage;
 
 use std::{
     ffi::c_void,
@@ -21,9 +22,7 @@ use microsandbox_core::{
     AgentClientError, BackendKind, MicrosandboxError, MicrosandboxResult, Operation,
     PublishedSnapshotArtifact, SnapshotArtifactKind, SnapshotSourceRecoveryError,
     UnsupportedReason,
-    backend::{
-        CloudBackend, LocalBackend, default_backend, resolve_default_backend, set_default_backend,
-    },
+    backend::{CloudBackend, LocalBackend, resolve_default_backend, set_default_backend},
     image::{Image, ImageHandle},
     logs::{LogEntry, LogOptions, LogSource},
     sandbox::{
@@ -619,6 +618,7 @@ fn apply_secret_options(
 enum RubyOutboundProxyConfig {
     HttpConnect {
         address: String,
+        credentials: Option<(String, SecretSource)>,
     },
     Socks4 {
         address: String,
@@ -632,9 +632,14 @@ enum RubyOutboundProxyConfig {
 
 fn apply_outbound_proxy(builder: SandboxBuilder, proxy: &RubyOutboundProxy) -> SandboxBuilder {
     match proxy.inner.borrow().clone() {
-        RubyOutboundProxyConfig::HttpConnect { address } => {
-            builder.proxy(|proxy| proxy.http_connect(address))
-        }
+        RubyOutboundProxyConfig::HttpConnect {
+            address,
+            credentials: Some((username, password)),
+        } => builder.proxy(|proxy| proxy.http_connect(address).credentials(username, password)),
+        RubyOutboundProxyConfig::HttpConnect {
+            address,
+            credentials: None,
+        } => builder.proxy(|proxy| proxy.http_connect(address)),
         RubyOutboundProxyConfig::Socks4 {
             address,
             user_id: Some(user_id),
@@ -776,6 +781,7 @@ fn apply_builder_options(
         "max_cpus",
         "memory",
         "max_memory",
+        "nested_virt",
         "detached",
         "workdir",
         "shell",
@@ -815,6 +821,9 @@ fn apply_builder_options(
     }
     if let Some(v) = keyword::<u32>(kwargs, "memory")? {
         builder = builder.memory(v);
+    }
+    if let Some(enabled) = keyword::<bool>(kwargs, "nested_virt")? {
+        builder = builder.nested_virt(enabled);
     }
     if let Some(v) = keyword::<u32>(kwargs, "max_memory")? {
         builder = builder.max_memory(v);
@@ -1127,6 +1136,9 @@ impl RubySandboxBuilder {
     }
     fn memory(this: typed_data::Obj<Self>, v: u32) -> Result<(), Error> {
         put_builder(&this, |b| b.memory(v))
+    }
+    fn nested_virt(this: typed_data::Obj<Self>, enabled: bool) -> Result<(), Error> {
+        put_builder(&this, |b| b.nested_virt(enabled))
     }
     fn max_memory(this: typed_data::Obj<Self>, v: u32) -> Result<(), Error> {
         put_builder(&this, |b| b.max_memory(v))
@@ -2089,12 +2101,10 @@ fn set_runtime_libkrunfw_path(path: String) {
     microsandbox_core::config::set_sdk_libkrunfw_path(path);
 }
 
-fn default_backend_kind_str() -> String {
-    match default_backend().kind() {
-        BackendKind::Local => "local",
-        BackendKind::Cloud => "cloud",
-    }
-    .to_owned()
+fn default_backend_kind_str(ruby: &Ruby) -> Result<String, Error> {
+    let info =
+        microsandbox_core::default_backend_info().map_err(|error| core_error(ruby, error))?;
+    Ok(info.kind.as_str().to_owned())
 }
 
 fn remember_backend_selection(ruby: &Ruby, selection: BackendSelection) -> Result<(), Error> {
@@ -2151,7 +2161,10 @@ fn outbound_proxy_socks4(address: String) -> RubyOutboundProxy {
 
 fn outbound_proxy_http_connect(address: String) -> RubyOutboundProxy {
     RubyOutboundProxy {
-        inner: std::cell::RefCell::new(RubyOutboundProxyConfig::HttpConnect { address }),
+        inner: std::cell::RefCell::new(RubyOutboundProxyConfig::HttpConnect {
+            address,
+            credentials: None,
+        }),
     }
 }
 
@@ -2206,13 +2219,10 @@ impl RubyOutboundProxy {
         match &mut *this.inner.borrow_mut() {
             RubyOutboundProxyConfig::Socks4 { .. } => Err(argument_error(
                 ruby,
-                "credentials are only supported for SOCKS5 proxies",
+                "credentials are only supported for SOCKS5 and HTTP CONNECT proxies",
             )),
-            RubyOutboundProxyConfig::HttpConnect { .. } => Err(argument_error(
-                ruby,
-                "credentials are only supported for SOCKS5 proxies",
-            )),
-            RubyOutboundProxyConfig::Socks5 { credentials, .. } => {
+            RubyOutboundProxyConfig::HttpConnect { credentials, .. }
+            | RubyOutboundProxyConfig::Socks5 { credentials, .. } => {
                 *credentials = Some((username, password.inner.clone()));
                 Ok(())
             }
@@ -2704,6 +2714,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let module = ruby.define_module("Microsandbox")?;
     module.define_error("Error", ruby.exception_standard_error())?;
     module.define_module_function("version", function!(version, 0))?;
+    storage::register(module)?;
     module.define_module_function("installed?", function!(installed, 0))?;
     module.define_module_function("install", function!(install, 0))?;
     module.define_module_function("set_runtime_msb_path", function!(set_runtime_msb_path, 1))?;
@@ -2850,6 +2861,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     builder.define_method("cpus!", method!(RubySandboxBuilder::cpus, 1))?;
     builder.define_method("max_cpus!", method!(RubySandboxBuilder::max_cpus, 1))?;
     builder.define_method("memory!", method!(RubySandboxBuilder::memory, 1))?;
+    builder.define_method("nested_virt!", method!(RubySandboxBuilder::nested_virt, 1))?;
     builder.define_method("max_memory!", method!(RubySandboxBuilder::max_memory, 1))?;
     builder.define_method("env!", method!(RubySandboxBuilder::env, 2))?;
     builder.define_method("label!", method!(RubySandboxBuilder::label, 2))?;

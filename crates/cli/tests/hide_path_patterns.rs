@@ -25,8 +25,10 @@ fn hide_path_pattern_fixture_dispositions_match_shared_validator() {
     assert!(!cases.is_empty(), "fixture must not be empty");
 
     for case in cases {
-        let result =
-            microsandbox_types::validate_hide_path_list(&[case.pattern.clone()], case.readonly);
+        let result = microsandbox_types::validate_hide_path_list(
+            std::slice::from_ref(&case.pattern),
+            case.readonly,
+        );
         match case.expect.as_str() {
             "accept" => assert!(
                 result.is_ok(),

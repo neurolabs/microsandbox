@@ -51,3 +51,4 @@ utoipa = { version = "6", optional = true, features = ["chrono"] }
 zeroize.workspace = true
 
 [dev-dependencies]
+microsandbox-utils.workspace = true

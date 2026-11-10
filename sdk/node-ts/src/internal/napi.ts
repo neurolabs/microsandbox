@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import type { NetworkConfig } from "../network-config.js";
+import type { NetworkConfig, SecretSubstitution } from "../network-config.js";
 import type { NetworkPolicy } from "../policy/types.js";
 import { msbPath } from "./resolve-binary.js";
 
@@ -22,6 +22,7 @@ export const napi = native;
 
 export interface NativeBindings {
   readonly supportsPortModification?: () => boolean;
+  readonly supportsSecretPolicyModification?: () => boolean;
   readonly setPackagedMsbPath: (path: string) => void;
   readonly setRuntimeMsbPath?: (path: string) => void;
   readonly setRuntimeLibkrunfwPath?: (path: string) => void;
@@ -88,6 +89,7 @@ export interface NativeBindings {
     outputPath: string,
     format?: string,
   ) => Promise<void>;
+  readonly diagnoseStorage?: (configJson: string, selectionJson: string) => Promise<string>;
   readonly resolveRuntimeVersion: (executable: string) => Promise<string | null>;
   readonly resolveRuntime: (configJson: string) => string;
   readonly isRuntimeInstalled: (configJson: string) => boolean;
@@ -157,6 +159,7 @@ export interface NapiSandboxPage {
 }
 
 export interface NapiSandboxStatic {
+  recoverStorage?(name: string, optionsJson: string): Promise<string>;
   start(name: string): Promise<NapiSandbox>;
   startDetached(name: string): Promise<NapiSandbox>;
   get(name: string): Promise<NapiSandboxHandle>;
@@ -198,6 +201,8 @@ export interface NapiSandboxBuilderSetters {
   placementProfile(profile: string): this;
   memory(mib: number): this;
   maxMemory(mib: number): this;
+  /** Enable or disable nested virtualization for local sandboxes. */
+  nestedVirt(enabled: boolean): this;
   thp(policy: "always" | "madvise" | "never"): this;
   logLevel(level: string): this;
   quietLogs(): this;
@@ -478,6 +483,10 @@ export interface NapiSecretModifySpec {
   store?: string;
   placeholder?: string;
   allowedHosts?: string[];
+  substitution?: SecretSubstitution;
+  violationAction?: string;
+  requireTlsIdentity?: boolean;
+  allowPlaceholderFor?: string[];
 }
 
 /** Native shape returned by `Sandbox.logs()` / `SandboxHandle.logs()`. */
@@ -1173,7 +1182,10 @@ export interface NapiOutboundProxyBuilder {
 }
 
 export interface NapiHttpConnectProxyBuilder {
-  readonly __httpConnectProxy?: never;
+  credentials(
+    username: string,
+    password: { kind: "env"; var: string },
+  ): this;
 }
 
 export interface NapiSocks4ProxyBuilder {

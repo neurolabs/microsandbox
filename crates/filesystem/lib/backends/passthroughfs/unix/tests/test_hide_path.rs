@@ -121,7 +121,7 @@ fn test_hide_path_star_pattern_keeps_dot_and_dotdot() {
         .readdir(sb.ctx(), ROOT_INODE, handle, 4096, 0)
         .unwrap();
 
-    let names: Vec<&[u8]> = entries.iter().map(|e| &e.name[..]).collect();
+    let names: Vec<&[u8]> = entries.iter().map(|e| e.name).collect();
     assert!(
         names.contains(&b".".as_slice()),
         "readdir must still contain '.' under a '.*' hide-path pattern"
@@ -300,7 +300,7 @@ fn test_hide_path_readdir_ignores_mismatched_request_inode() {
         Ok(leaked) => {
             let leaked_names: Vec<String> = leaked
                 .iter()
-                .map(|e| String::from_utf8_lossy(&e.name).into_owned())
+                .map(|e| String::from_utf8_lossy(e.name).into_owned())
                 .collect();
             panic!("readdir leaked entries via a mismatched nodeid: {leaked_names:?}");
         }
@@ -642,7 +642,7 @@ fn test_hide_path_dir_only_readdir_keeps_same_named_file() {
         .fs
         .readdir(sb.ctx(), ROOT_INODE, handle, 4096, 0)
         .unwrap();
-    let names: Vec<&[u8]> = entries.iter().map(|e| &e.name[..]).collect();
+    let names: Vec<&[u8]> = entries.iter().map(|e| e.name).collect();
 
     assert!(
         !names.contains(&b"node_modules".as_slice()),
@@ -658,7 +658,7 @@ fn test_hide_path_dir_only_readdir_keeps_same_named_file() {
         .fs
         .readdir(sb.ctx(), sub.inode, sub_handle, 4096, 0)
         .unwrap();
-    let sub_names: Vec<&[u8]> = sub_entries.iter().map(|e| &e.name[..]).collect();
+    let sub_names: Vec<&[u8]> = sub_entries.iter().map(|e| e.name).collect();
     assert!(
         sub_names.contains(&b"node_modules".as_slice()),
         "a file named node_modules must not be hidden by 'node_modules/'"
@@ -1184,7 +1184,7 @@ fn restored_directory_snapshot_drops_names_hidden_by_destination_hide_path() {
     restore(&destination, &encoded).unwrap();
 
     let restored = destination.readdir(ctx, sub, handle, 4096, 0).unwrap();
-    let names: Vec<&[u8]> = restored.iter().map(|entry| &entry.name[..]).collect();
+    let names: Vec<&[u8]> = restored.iter().map(|entry| entry.name).collect();
 
     assert!(
         !names.contains(&b".env".as_slice()),

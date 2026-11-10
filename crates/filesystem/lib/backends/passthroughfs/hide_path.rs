@@ -795,12 +795,11 @@ mod tests {
         // must therefore either reject it or truly fold it; silently accepting
         // and then under-matching is the bug this pins.
         let owned = vec!["café".to_string()];
-        match HidePathList::build(&owned, true) {
-            Ok(list) => assert!(
+        if let Ok(list) = HidePathList::build(&owned, true) {
+            assert!(
                 list.matches_basename("CAFE\u{301}".as_bytes(), false),
                 "a case-insensitive build must fold café to CAFÉ or reject it"
-            ),
-            Err(_) => {}
+            )
         }
 
         // On a case-sensitive mount the pattern is byte-exact and stays valid.
